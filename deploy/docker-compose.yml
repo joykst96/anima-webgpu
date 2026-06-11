@@ -1,0 +1,12 @@
+services:
+  anima-web:
+    image: nginx:alpine
+    container_name: anima-baepo
+    restart: unless-stopped
+    ports:
+      - "8480:80"          # cloudflared ingress가 바라볼 포트
+    volumes:
+      - ./index.html:/usr/share/nginx/html/index.html:ro
+      - ./out:/usr/share/nginx/html/out:ro
+      - ./tokenizers:/usr/share/nginx/html/tokenizers:ro
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro

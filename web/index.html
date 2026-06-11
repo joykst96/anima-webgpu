@@ -1,0 +1,639 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>Anima WebGPU — 브라우저 로컬 이미지 생성</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #181b22; --border: #2a2e38;
+    --text: #e6e8ee; --dim: #8b91a0; --accent: #7aa2f7; --ok: #9ece6a; --err: #f7768e;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 "Segoe UI", "Malgun Gothic", sans-serif;
+  }
+  .wrap { max-width: 1100px; margin: 0 auto; padding: 24px 16px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--dim); font-size: 13px; margin-bottom: 20px; }
+  .grid { display: grid; grid-template-columns: 420px 1fr; gap: 16px; }
+  @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
+  .panel h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--dim); margin: 0 0 12px; }
+  label { display: block; font-size: 12px; color: var(--dim); margin: 10px 0 4px; }
+  textarea, input, select {
+    width: 100%; background: #11141a; color: var(--text);
+    border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; font: inherit;
+  }
+  textarea { resize: vertical; min-height: 64px; }
+  .row { display: flex; gap: 10px; }
+  .row > div { flex: 1; }
+  button {
+    width: 100%; margin-top: 14px; padding: 11px; border: 0; border-radius: 8px;
+    background: var(--accent); color: #0b0e14; font-weight: 600; font-size: 14px; cursor: pointer;
+  }
+  button:disabled { background: #3a4154; color: #767e92; cursor: not-allowed; }
+  button.secondary { background: #2a2e38; color: var(--text); }
+  .bar { height: 6px; background: #11141a; border-radius: 3px; overflow: hidden; margin-top: 6px; }
+  .bar > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .15s; }
+  #log {
+    margin-top: 12px; max-height: 180px; overflow-y: auto; font: 12px/1.6 Consolas, monospace;
+    background: #11141a; border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px;
+    white-space: pre-wrap;
+  }
+  #log .ok { color: var(--ok); } #log .err { color: var(--err); } #log .dim { color: var(--dim); }
+  #canvas { width: 100%; border-radius: 8px; background: #11141a; display: block; }
+  .stats { color: var(--dim); font-size: 12px; margin-top: 8px; }
+  details { margin-top: 10px; }
+  summary { cursor: pointer; color: var(--dim); font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Anima — 브라우저 로컬 생성</h1>
+  <div class="sub">모든 연산이 이 기기의 GPU(WebGPU)에서 실행됩니다. 프롬프트는 서버로 전송되지 않습니다.</div>
+
+  <div class="grid">
+    <div>
+      <div class="panel">
+        <h2>1. 모델 로드</h2>
+        <div id="gpuInfo" class="stats">WebGPU 확인 중...</div>
+        <label>모델</label>
+        <select id="modelSel">
+          <option value="anima">Anima (베이스 · 30스텝 · CFG 5)</option>
+          <option value="turbo" selected>Anima + Turbo v0.2 (8스텝 · CFG 1)</option>
+        </select>
+        <button id="btnLoad">모델 로드 (최초 1회 다운로드, 이후 캐시)</button>
+        <button id="btnClearCache" class="secondary">캐시 비우기</button>
+        <div class="bar"><i id="loadBar"></i></div>
+        <div id="loadStat" class="stats"></div>
+      </div>
+
+      <div class="panel" style="margin-top:16px">
+        <h2>2. 생성</h2>
+        <label>프롬프트</label>
+        <textarea id="prompt">masterpiece, best quality, score_7, safe</textarea>
+        <label>네거티브 프롬프트</label>
+        <textarea id="negative">worst quality, low quality, score_1, score_2, score_3, artist name</textarea>
+        <div class="row">
+          <div><label>가로 (px, 16배수)</label><input id="width" type="number" value="1024" step="16" min="512" max="1536"></div>
+          <div><label>세로 (px, 16배수)</label><input id="height" type="number" value="1024" step="16" min="512" max="1536"></div>
+        </div>
+        <div class="row">
+          <div><label>스텝</label><input id="steps" type="number" value="30" min="1" max="60"></div>
+          <div><label>CFG</label><input id="cfg" type="number" value="4.0" step="0.5" min="1"></div>
+          <div><label>시드 (-1 랜덤)</label><input id="seed" type="number" value="-1"></div>
+        </div>
+        <div class="row">
+          <div><label>샘플러</label>
+            <select id="sampler"><option value="er_sde">er_sde</option><option value="euler">euler</option></select></div>
+          <div><label>스케줄러</label>
+            <select id="scheduler"><option value="simple">simple</option><option value="normal">normal</option></select></div>
+        </div>
+        <button id="btnGen" disabled>생성</button>
+        <div class="bar"><i id="genBar"></i></div>
+        <div id="genStat" class="stats"></div>
+      </div>
+
+      <div id="log"></div>
+    </div>
+
+    <div class="panel">
+      <h2>결과</h2>
+      <canvas id="canvas" width="1024" height="1024"></canvas>
+      <button id="btnSave" class="secondary" disabled>PNG 저장</button>
+      <div class="stats">
+        모든 연산은 방문자 기기의 GPU에서 실행되며, 프롬프트와 생성 결과는 서버로 전송되지 않습니다.
+      </div>
+      <div class="stats" style="margin-top:14px; padding-top:12px; border-top:1px solid var(--border); font-size:11px; line-height:1.7">
+        This page distributes a <b>modified</b> version of the Anima model (ONNX conversion,
+        int8 weight quantization, and Turbo LoRA merge). This is an unofficial project and is
+        not endorsed, approved, or validated by CircleStone Labs.<br>
+        “The CircleStone Model is licensed by CircleStone Labs LLC under the
+        <a href="https://huggingface.co/circlestone-labs/Anima/blob/main/LICENSE.md" style="color:var(--accent)">CircleStone
+        Non-Commercial License</a>. Copyright CircleStone Labs LLC.
+        IN NO EVENT SHALL CIRCLESTONE LABS LLC BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+        LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF
+        OR IN CONNECTION WITH USE OF THIS MODEL.”<br>
+        Rights to use the model and derivatives are granted directly by CircleStone Labs LLC
+        to you under the above license (non-commercial use only). Built on NVIDIA Cosmos
+        (NVIDIA Open Model License). Text encoder: Qwen3-0.6B-Base (Apache 2.0).
+      </div>
+    </div>
+  </div>
+</div>
+
+<script type="module">
+import * as ort from 'https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.webgpu.min.mjs';
+import { AutoTokenizer, env as hfEnv } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers';
+
+ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/';
+hfEnv.allowLocalModels = true;
+hfEnv.localModelPath = 'tokenizers/';   // prepare_tokenizers.py 산출물 위치
+
+const TOK_FALLBACK = { qwen3: 'Qwen/Qwen3-0.6B-Base', t5: 'Xenova/flan-t5-small' };
+async function loadTokenizer(id) {
+  try { return await AutoTokenizer.from_pretrained(id); }
+  catch (e) {
+    const fb = TOK_FALLBACK[id];
+    if (!fb) throw e;
+    log(`  (로컬 토크나이저 '${id}' 없음 → HF '${fb}' 폴백)`, 'dim');
+    return await AutoTokenizer.from_pretrained(fb);
+  }
+}
+
+// ── 배포 구성: 경로/모델 설정은 여기서 수정 ──
+const PATHS = {
+  te:      'out/text_encoder/qwen3_06b_s.onnx',
+  adapter: 'out/adapter/anima_llm_adapter.onnx',
+  vae:     'out/vae/qwen_image_vae_decoder_dyn32.onnx',
+};
+const MODELS = {
+  anima: { label: 'Anima',            dit: 'out/dit/anima_dit_dyn32_q8s.onnx',
+           steps: 30, cfg: 5.0, sampler: 'er_sde', scheduler: 'simple' },
+  turbo: { label: 'Anima+Turbo v0.2', dit: 'out/dit/anima_dit_turbo32_q8s.onnx',
+           steps: 8,  cfg: 1.0, sampler: 'euler',  scheduler: 'simple' },
+};
+
+const SHIFT = 3.0, CTX_LEN = 512, CTX_DIM = 1024, LAT_C = 16;
+
+const $ = id => document.getElementById(id);
+const log = (msg, cls = '') => {
+  const el = $('log');
+  el.innerHTML += `<span class="${cls}">${msg}</span>\n`;
+  el.scrollTop = el.scrollHeight;
+};
+
+// ───────── fp16 ↔ fp32 ─────────
+// 최신 ORT Web은 브라우저가 네이티브 Float16Array를 지원하면 fp16 텐서 .data를
+// 비트패턴(Uint16Array)이 아닌 Float16Array(실제 float)로 반환한다. 양쪽 모두 대응.
+const HAS_F16 = typeof Float16Array !== 'undefined';
+
+function toF32(data) {
+  if (HAS_F16 && data instanceof Float16Array) return Float32Array.from(data);
+  if (data instanceof Float32Array) return data;
+  return f16ToF32(data);  // Uint16Array 비트패턴
+}
+
+function makeF16Tensor(f32, dims) {
+  const payload = HAS_F16 ? new Float16Array(f32) : f32ToF16(f32);
+  return new ort.Tensor('float16', payload, dims);
+}
+
+function f16ToF32(u16) {
+  const out = new Float32Array(u16.length);
+  for (let i = 0; i < u16.length; i++) {
+    const h = u16[i], s = (h & 0x8000) << 16, e = (h >> 10) & 0x1f, m = h & 0x3ff;
+    let bits;
+    if (e === 0) bits = m === 0 ? s : (() => { // subnormal
+      let mm = m, ee = -1; do { mm <<= 1; ee++; } while (!(mm & 0x400));
+      return s | ((127 - 15 - ee) << 23) | ((mm & 0x3ff) << 13);
+    })();
+    else if (e === 31) bits = s | 0x7f800000 | (m << 13);
+    else bits = s | ((e - 15 + 127) << 23) | (m << 13);
+    out[i] = new Float32Array(new Uint32Array([bits]).buffer)[0];
+  }
+  return out;
+}
+const _f32buf = new Float32Array(1), _u32buf = new Uint32Array(_f32buf.buffer);
+function f32ToF16(f32) {
+  const out = new Uint16Array(f32.length);
+  for (let i = 0; i < f32.length; i++) {
+    _f32buf[0] = f32[i];
+    const x = _u32buf[0], s = (x >>> 16) & 0x8000;
+    const e = (x >>> 23) & 0xff;
+    let m = x & 0x7fffff;
+    if (e === 255) { out[i] = s | 0x7c00 | (m ? 0x200 : 0); continue; }  // inf/nan
+    const he = e - 127 + 15;                       // fp16 지수로 리바이어스
+    if (he >= 31) out[i] = s | 0x7c00;             // overflow → inf
+    else if (he <= 0) {                            // subnormal/underflow
+      if (he < -10) out[i] = s;
+      else {
+        m = (m | 0x800000) >> (1 - he);            // implicit 1 복원 후 시프트
+        out[i] = s | ((m + 0x1000) >> 13);         // round-to-nearest
+      }
+    } else {
+      out[i] = (s | (he << 10) | (m >> 13)) + ((m >> 12) & 1);  // round
+    }
+  }
+  return out;
+}
+
+// ───────── 시드 RNG + 가우시안 ─────────
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return () => {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function gaussianFill(arr, rand) {
+  for (let i = 0; i < arr.length; i += 2) {
+    const u1 = Math.max(rand(), 1e-12), u2 = rand();
+    const r = Math.sqrt(-2 * Math.log(u1)), th = 2 * Math.PI * u2;
+    arr[i] = r * Math.cos(th);
+    if (i + 1 < arr.length) arr[i + 1] = r * Math.sin(th);
+  }
+}
+
+// ───────── 스케줄러 (run_pipeline.py 포팅) ─────────
+const shiftSigma = t => SHIFT * t / (1 + (SHIFT - 1) * t);
+function simpleSchedule(steps) {
+  const table = Array.from({ length: 1000 }, (_, j) => shiftSigma((j + 1) / 1000));
+  const ss = table.length / steps, sigs = [];
+  for (let x = 0; x < steps; x++) sigs.push(table[table.length - 1 - Math.floor(x * ss)]);
+  sigs.push(0); return sigs;
+}
+function normalSchedule(steps) {
+  const sigs = [];
+  for (let i = 0; i <= steps; i++) sigs.push(shiftSigma(1 - i / steps));
+  return sigs;
+}
+
+// ───────── 샘플러 (run_pipeline.py 포팅) ─────────
+async function sampleEuler(denoise, x, sigmas, rand, onStep) {
+  for (let i = 0; i < sigmas.length - 1; i++) {
+    const s = sigmas[i], sn = sigmas[i + 1];
+    const den = await denoise(x, s);
+    if (sn === 0) x.set(den);
+    else for (let k = 0; k < x.length; k++) x[k] += (sn - s) * (x[k] - den[k]) / s;
+    onStep(i, s, sn);
+  }
+  return x;
+}
+
+async function sampleErSde(denoise, x, sigmas, rand, onStep, sNoise = 1.0, maxStage = 3) {
+  sigmas = sigmas.slice();
+  if (sigmas[0] >= 1.0) sigmas[0] = shiftSigma(1 - 1e-4);  // logit 발산 방지
+  const ns = l => l * (Math.exp(Math.pow(l, 0.3)) + 10);
+  const lam = sigmas.map(s => s / (1 - s));                 // CONST: λ = σ/(1-σ)
+  const NI = 200;
+  let oldDen = null, oldDenD = null;
+  const noise = new Float32Array(x.length);
+
+  for (let i = 0; i < sigmas.length - 1; i++) {
+    const den = await denoise(x, sigmas[i]);
+    const stage = Math.min(maxStage, i + 1);
+    if (sigmas[i + 1] === 0) { x.set(den); }
+    else {
+      const ls = lam[i], lt = lam[i + 1];
+      const aS = sigmas[i] / ls, aT = sigmas[i + 1] / lt;   // = 1-σ
+      const rA = aT / aS, r = ns(lt) / ns(ls);
+      const c1 = rA * r, c2 = aT * (1 - r);
+      for (let k = 0; k < x.length; k++) x[k] = c1 * x[k] + c2 * den[k];
+
+      if (stage >= 2) {
+        const dt = lt - ls, step = -dt / NI;
+        let sInt = 0, sUInt = 0;
+        for (let p = 0; p < NI; p++) {
+          const pos = lt + p * step, sp = ns(pos);
+          sInt += 1 / sp; sUInt += (pos - ls) / sp;
+        }
+        sInt *= step; sUInt *= step;
+        const dCoef = 1 / (ls - lam[i - 1]);
+        const c3 = aT * (dt + sInt * ns(lt));
+        const denD = new Float32Array(x.length);
+        for (let k = 0; k < x.length; k++) {
+          denD[k] = (den[k] - oldDen[k]) * dCoef;
+          x[k] += c3 * denD[k];
+        }
+        if (stage >= 3) {
+          const uCoef = 1 / ((ls - lam[i - 2]) / 2);
+          const c4 = aT * (dt * dt / 2 + sUInt * ns(lt));
+          for (let k = 0; k < x.length; k++)
+            x[k] += c4 * (denD[k] - oldDenD[k]) * uCoef;
+        }
+        oldDenD = denD;
+      }
+      if (sNoise > 0) {
+        const v = Math.max(lt * lt - ls * ls * r * r, 0);
+        const c5 = aT * sNoise * Math.sqrt(v);
+        gaussianFill(noise, rand);
+        for (let k = 0; k < x.length; k++) x[k] += c5 * noise[k];
+      }
+    }
+    oldDen = den;
+    onStep(i, sigmas[i], sigmas[i + 1]);
+  }
+  return x;
+}
+
+// ───────── 모델 로드 ─────────
+let sess = {}, tok = {};
+
+async function fetchWithProgress(url, onProgress) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`${url} → HTTP ${res.status}`);
+  const total = +res.headers.get('Content-Length') || 0;
+  const reader = res.body.getReader(), chunks = [];
+  let got = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value); got += value.length;
+    if (total) onProgress(got / total);
+  }
+  const buf = new Uint8Array(got);
+  let off = 0;
+  for (const c of chunks) { buf.set(c, off); off += c.length; }
+  return buf;
+}
+
+// ───────── OPFS 캐시 ─────────
+// 가중치를 디스크(Origin Private File System)에 저장 → 재방문 시 다운로드 0.
+// 검증: 서버 Content-Length와 캐시 파일 크기 대조 (불일치 시 재다운로드).
+let opfsDir = null;
+async function getOpfs() {
+  if (opfsDir !== null) return opfsDir;
+  try {
+    const root = await navigator.storage.getDirectory();
+    opfsDir = await root.getDirectoryHandle('anima-cache', { create: true });
+  } catch { opfsDir = false; }  // 미지원/거부 → 캐시 없이 동작
+  return opfsDir;
+}
+const cacheName = url => url.replace(/[^a-zA-Z0-9._-]/g, '_');
+
+async function cachedFetch(url, onProgress) {
+  const dir = await getOpfs();
+  if (!dir) return fetchWithProgress(url, onProgress);
+
+  const name = cacheName(url);
+  let expected = -1;
+  try {
+    const head = await fetch(url, { method: 'HEAD' });
+    if (head.ok) expected = +head.headers.get('Content-Length') || -1;
+  } catch { /* 오프라인 등 — 캐시가 있으면 그걸 신뢰 */ }
+
+  try {
+    const fh = await dir.getFileHandle(name);
+    const file = await fh.getFile();
+    if (file.size > 0 && (expected < 0 || file.size === expected)) {
+      const buf = new Uint8Array(await file.arrayBuffer());
+      onProgress(1);
+      log(`  (캐시 히트: ${(file.size / 2 ** 20).toFixed(0)}MB)`, 'ok');
+      return buf;
+    }
+  } catch { /* 캐시 없음 */ }
+
+  const buf = await fetchWithProgress(url, onProgress);
+  try {
+    const fh = await dir.getFileHandle(name, { create: true });
+    const w = await fh.createWritable();
+    await w.write(buf);
+    await w.close();
+  } catch (e) {
+    log(`  (캐시 저장 실패 — 무시하고 진행: ${e.message})`, 'dim');
+  }
+  return buf;
+}
+
+async function clearCache() {
+  const dir = await getOpfs();
+  if (!dir) { log('OPFS 미지원 환경', 'dim'); return; }
+  let n = 0;
+  for await (const key of dir.keys()) { await dir.removeEntry(key); n++; }
+  log(`캐시 ${n}개 파일 삭제됨`, 'ok');
+}
+
+async function loadSession(name, url, onProgress) {
+  log(`${name} 그래프 다운로드...`, 'dim');
+  const graph = await cachedFetch(url, f => onProgress(f * 0.05));
+  const opts = { executionProviders: ['webgpu'] };
+
+  // 1) 샤드 manifest 우선 (shard_onnx_data.py 산출물 — ArrayBuffer 2GB 상한 우회)
+  const maniRes = await fetch(url + '.manifest.json').catch(() => null);
+  if (maniRes && maniRes.ok) {
+    const mani = await maniRes.json();
+    const dir = url.slice(0, url.lastIndexOf('/') + 1);
+    const ext = [];
+    for (let i = 0; i < mani.shards.length; i++) {
+      const sName = mani.shards[i];
+      log(`${name} 샤드 ${i + 1}/${mani.shards.length} (${sName})...`, 'dim');
+      const data = await cachedFetch(dir + sName, f =>
+        onProgress(0.05 + ((i + f) / mani.shards.length) * 0.85));
+      ext.push({ path: sName, data });
+    }
+    opts.externalData = ext;
+  } else {
+    // 2) 단일 .data 폴백 (dynamo exporter 기본 산출물)
+    const dataUrl = url + '.data';
+    const probe = await fetch(dataUrl, { method: 'HEAD' }).catch(() => null);
+    if (probe && probe.ok) {
+      log(`${name} 가중치 다운로드 (${dataUrl.split('/').pop()})...`, 'dim');
+      const data = await cachedFetch(dataUrl, f => onProgress(0.05 + f * 0.85));
+      opts.externalData = [{ path: dataUrl.split('/').pop(), data }];
+    }
+  }
+  log(`${name} 컴파일 (셰이더 빌드)...`, 'dim');
+  const s = await ort.InferenceSession.create(graph, opts);
+  onProgress(1);
+  log(`${name} OK`, 'ok');
+  return s;
+}
+
+let sharedLoaded = false;
+const ditSessions = {};
+
+function applyModelSettings() {
+  const m = MODELS[$('modelSel').value];
+  $('steps').value = m.steps;
+  $('cfg').value = m.cfg;
+  $('sampler').value = m.sampler;
+  $('scheduler').value = m.scheduler;
+}
+
+function onModelChange() {
+  applyModelSettings();
+  const key = $('modelSel').value;
+  if (ditSessions[key]) {
+    sess.dit = ditSessions[key];
+    $('btnGen').disabled = false;
+    $('loadStat').textContent = `${MODELS[key].label} 준비됨`;
+  } else {
+    $('btnGen').disabled = true;
+    $('loadStat').textContent = `${MODELS[key].label} 가중치 필요 — 모델 로드 버튼 클릭`;
+  }
+}
+
+async function loadAll() {
+  $('btnLoad').disabled = true;
+  const t0 = performance.now();
+  try {
+    if (!tok.qwen) {
+      log('토크나이저 로드 중...', 'dim');
+      tok.qwen = await loadTokenizer('qwen3');
+      tok.t5 = await loadTokenizer('t5');
+      log('토크나이저 OK', 'ok');
+    }
+
+    const key = $('modelSel').value;
+    const items = [];
+    if (!sharedLoaded)
+      items.push(['te', PATHS.te], ['adapter', PATHS.adapter], ['vae', PATHS.vae]);
+    if (!ditSessions[key])
+      items.push([`dit:${key}`, MODELS[key].dit]);
+
+    for (let i = 0; i < items.length; i++) {
+      const [name, url] = items[i];
+      const s = await loadSession(name, url, f => {
+        $('loadBar').style.width = ((i + f) / items.length * 100) + '%';
+        $('loadStat').textContent = `${name} ${(f * 100) | 0}%`;
+      });
+      if (name.startsWith('dit:')) ditSessions[key] = s;
+      else sess[name] = s;
+    }
+    sharedLoaded = true;
+    sess.dit = ditSessions[key];
+    log(`로드 완료 (${((performance.now() - t0) / 1000).toFixed(1)}s)`, 'ok');
+    $('btnGen').disabled = false;
+    $('loadStat').textContent = `${MODELS[key].label} 준비됨`;
+  } catch (e) {
+    log('로드 실패: ' + e.message, 'err');
+    console.error(e);
+  }
+  $('btnLoad').disabled = false;
+}
+
+// ───────── 추론 ─────────
+async function encodePrompt(text) {
+  const q = tok.qwen(text);
+  const ids = q.input_ids.data, mask = q.attention_mask.data;       // BigInt64Array
+  const teOut = await sess.te.run({
+    input_ids: new ort.Tensor('int64', ids, [1, ids.length]),
+    attention_mask: new ort.Tensor('int64', mask, [1, mask.length]),
+  });
+  const hidden = teOut[Object.keys(teOut)[0]];                       // fp16 (1,S,1024)
+
+  let t5ids = tok.t5(text).input_ids.data;                           // BigInt64Array
+  if (t5ids.length > CTX_LEN) t5ids = t5ids.slice(0, CTX_LEN);
+  const adOut = await sess.adapter.run({
+    qwen_hidden_states: hidden,
+    t5_input_ids: new ort.Tensor('int64', t5ids, [1, t5ids.length]),
+  });
+  const ctx = adOut[Object.keys(adOut)[0]];                          // fp16 (1,S,1024)
+
+  const padded = HAS_F16 ? new Float16Array(CTX_LEN * CTX_DIM)
+                         : new Uint16Array(CTX_LEN * CTX_DIM);       // zero-pad → 512
+  padded.set(ctx.data.subarray(0, Math.min(ctx.data.length, padded.length)));
+  return new ort.Tensor('float16', padded, [1, CTX_LEN, CTX_DIM]);
+}
+
+async function generate() {
+  $('btnGen').disabled = true; $('btnSave').disabled = true;
+  const t0 = performance.now();
+  try {
+    const pxW = +$('width').value, pxH = +$('height').value;
+    if (pxW % 16 || pxH % 16) throw new Error('해상도는 16의 배수여야 함 (latent/patch 제약)');
+    const W = pxW / 8, H = pxH / 8, LAT_N = LAT_C * H * W;
+
+    const steps = +$('steps').value, cfg = +$('cfg').value;
+    let seed = +$('seed').value;
+    if (seed < 0) seed = (Math.random() * 0x7fffffff) | 0;
+    const rand = mulberry32(seed);
+    const useCfg = cfg > 1.0;
+
+    log(`생성 시작 — seed ${seed} · ${pxW}x${pxH}`, 'dim');
+    const ctxPos = await encodePrompt($('prompt').value);
+    const ctxNeg = useCfg ? await encodePrompt($('negative').value) : null;
+
+    const x = new Float32Array(LAT_N);
+    gaussianFill(x, rand);                                            // σ_max = 1.0
+
+    const sigmas = ($('scheduler').value === 'simple' ? simpleSchedule : normalSchedule)(steps);
+
+    const denoise = async (xf32, sigma) => {
+      const lat = makeF16Tensor(xf32, [1, LAT_C, 1, H, W]);
+      const t = new ort.Tensor('float32', new Float32Array([sigma]), [1]); // t = σ
+      const o1 = await sess.dit.run({ latent: lat, timesteps: t, context: ctxPos });
+      let v = toF32(o1[Object.keys(o1)[0]].data);
+      if (useCfg) {
+        const o2 = await sess.dit.run({ latent: lat, timesteps: t, context: ctxNeg });
+        const vu = toF32(o2[Object.keys(o2)[0]].data);
+        for (let k = 0; k < v.length; k++) v[k] = vu[k] + cfg * (v[k] - vu[k]);
+      }
+      const den = new Float32Array(xf32.length);
+      for (let k = 0; k < den.length; k++) den[k] = xf32[k] - sigma * v[k];
+      return den;                                                     // denoised = x - σ·v
+    };
+
+    const onStep = (i, s, sn) => {
+      $('genBar').style.width = ((i + 1) / steps * 100) + '%';
+      $('genStat').textContent =
+        `step ${i + 1}/${steps}  σ ${s.toFixed(4)} → ${sn.toFixed(4)}  ` +
+        `(${((performance.now() - t0) / 1000).toFixed(1)}s)`;
+    };
+
+
+    const sampler = $('sampler').value === 'er_sde' ? sampleErSde : sampleEuler;
+    const xf = await sampler(denoise, x, sigmas, rand, onStep);
+
+    log('VAE 디코드...', 'dim');
+    const vo = await sess.vae.run({
+      latent: makeF16Tensor(xf, [1, LAT_C, 1, H, W]),
+    });
+    const img = vo[Object.keys(vo)[0]].data;                          // fp32 (1,3,H,W) [-1,1]
+
+    const cv = $('canvas');
+    cv.width = pxW; cv.height = pxH;
+    const cx = cv.getContext('2d');
+    const im = cx.createImageData(pxW, pxH);
+    const plane = pxW * pxH;
+    for (let p = 0; p < plane; p++) {
+      im.data[p * 4]     = Math.min(255, Math.max(0, (img[p] + 1) * 127.5));
+      im.data[p * 4 + 1] = Math.min(255, Math.max(0, (img[plane + p] + 1) * 127.5));
+      im.data[p * 4 + 2] = Math.min(255, Math.max(0, (img[2 * plane + p] + 1) * 127.5));
+      im.data[p * 4 + 3] = 255;
+    }
+    cx.putImageData(im, 0, 0);
+    log(`완료 — ${((performance.now() - t0) / 1000).toFixed(1)}s · seed ${seed}`, 'ok');
+    $('genStat').textContent = `seed ${seed} · ${pxW}x${pxH} · ${steps}스텝 · CFG ${cfg}`;
+    $('btnSave').disabled = false;
+  } catch (e) {
+    log('생성 실패: ' + e.message, 'err');
+    console.error(e);
+  }
+  $('btnGen').disabled = false;
+}
+
+// ───────── 초기화 ─────────
+(async () => {
+  const fail = msg => {
+    $('gpuInfo').innerHTML = `<span style="color:var(--err)">${msg}</span>`;
+    $('btnLoad').disabled = true;
+  };
+  if (!window.isSecureContext)
+    return fail('보안 컨텍스트가 아닙니다 (http + IP 접속). WebGPU는 HTTPS 또는 localhost에서만 동작합니다 — https 주소로 접속하세요.');
+  if (!navigator.gpu)
+    return fail('이 브라우저는 WebGPU를 지원하지 않습니다. 데스크톱 Chrome/Edge 최신 버전이 필요합니다.');
+  const adapter = await navigator.gpu.requestAdapter();
+  if (!adapter) return fail('GPU 어댑터를 찾을 수 없습니다. GPU 드라이버를 확인하세요.');
+  const f16 = adapter.features.has('shader-f16');
+  if (!f16)
+    return fail('이 GPU/드라이버는 shader-f16을 지원하지 않아 모델 실행이 불가능합니다.');
+  const bufGB = adapter.limits.maxBufferSize / 2 ** 30;
+  const warn = bufGB < 2
+    ? ' · <span style="color:var(--err)">maxBufferSize가 작아 DiT 로드가 실패할 수 있음</span>' : '';
+  $('gpuInfo').innerHTML =
+    `WebGPU OK · shader-f16 <span style="color:var(--ok)">지원</span>` +
+    ` · maxBufferSize ${bufGB.toFixed(1)}GB${warn}` +
+    `<br><span style="color:var(--dim)">권장: VRAM 6GB+ 외장 GPU · 최초 로드 시 ~2.5GB 다운로드 (이후 캐시)</span>`;
+})();
+
+$('btnLoad').onclick = loadAll;
+$('btnClearCache').onclick = clearCache;
+$('modelSel').onchange = onModelChange;
+applyModelSettings();
+$('btnGen').onclick = generate;
+$('btnSave').onclick = () => {
+  const a = document.createElement('a');
+  a.download = `anima_${Date.now()}.png`;
+  a.href = $('canvas').toDataURL('image/png');
+  a.click();
+};
+</script>
+</body>
+</html>

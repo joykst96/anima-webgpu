@@ -1,0 +1,12 @@
+# 모델 가중치/산출물 — 레포에 포함 금지 (용량 + 라이선스)
+out/
+tokenizers/
+*.safetensors
+*.onnx
+*.onnx.data
+*.bin
+*.manifest.json
+__pycache__/
+*.pyc
+result*.png
+check*.png
