@@ -74,7 +74,8 @@ def find_exclude_nodes(model):
     return excluded
 
 
-def get_quantizer(model, bits, block_size, nodes_to_exclude, algo="rtn"):
+def get_quantizer(model, bits, block_size, nodes_to_exclude, algo="rtn",
+                  accuracy_level=None):
     """ORT 버전별 API 차이 흡수: MatMulNBitsQuantizer(신) → MatMul4BitsQuantizer(구)"""
     try:
         from onnxruntime.quantization.matmul_nbits_quantizer import (
@@ -90,7 +91,8 @@ def get_quantizer(model, bits, block_size, nodes_to_exclude, algo="rtn"):
             q = MatMulNBitsQuantizer(model, block_size=block_size,
                                      is_symmetric=True, bits=bits,
                                      nodes_to_exclude=nodes_to_exclude,
-                                     algo_config=algo_config)
+                                     algo_config=algo_config,
+                                     accuracy_level=accuracy_level)
             print(f"[quant] MatMulNBitsQuantizer, bits={bits}, block={block_size}")
             return q
         except TypeError:
@@ -113,7 +115,42 @@ def get_quantizer(model, bits, block_size, nodes_to_exclude, algo="rtn"):
         return q
 
 
-SCRIPT_VERSION = "v4 (size-checked save)"
+def apply_accuracy_level(qmodel, level):
+    """모든 MatMulNBits 노드에 accuracy_level 속성을 강제 설정.
+
+    양자화기 kwarg가 무시되는 경로(HQQ algo_config, 구버전 API)까지 보장하는
+    사후 패스. level=4 = "활성화 int8 동적 양자화 허용" → ORT WebGPU 네이티브
+    EP(onnxruntime-web jspi 빌드)의 DP4A MatMulNBits 커널 발동 조건.
+    나머지 발동 조건(block_size%32==0, K%128==0, N%16==0)도 함께 점검해 출력.
+    """
+    import onnx.helper as oh
+    n_set, n_dp4a_ok, n_dp4a_no = 0, 0, 0
+    for n in qmodel.graph.node:
+        if n.op_type != "MatMulNBits":
+            continue
+        attrs = {a.name: a for a in n.attribute}
+        if "accuracy_level" in attrs:
+            attrs["accuracy_level"].i = level
+        else:
+            n.attribute.append(oh.make_attribute("accuracy_level", level))
+        n_set += 1
+        K = attrs["K"].i if "K" in attrs else 0
+        N = attrs["N"].i if "N" in attrs else 0
+        bs = attrs["block_size"].i if "block_size" in attrs else 0
+        if level == 4:
+            if K % 128 == 0 and N % 16 == 0 and bs % 32 == 0:
+                n_dp4a_ok += 1
+            else:
+                n_dp4a_no += 1
+                print(f"  [dp4a-skip] {n.name}: K={K} N={N} block={bs} "
+                      f"— 차원 조건 미충족, 기본 커널로 동작")
+    print(f"[accuracy_level] MatMulNBits {n_set}개에 level={level} 설정")
+    if level == 4:
+        print(f"[accuracy_level] DP4A 차원 조건 충족 {n_dp4a_ok}개 / "
+              f"미충족 {n_dp4a_no}개")
+
+
+SCRIPT_VERSION = "v5 (accuracy_level)"
 
 
 def main():
@@ -128,6 +165,14 @@ def main():
                         "원본 정밀도(fp32)로 남아 용량이 커지므로, int8은 "
                         "제외 없이 가는 것을 권장 (int8은 제외 불필요할 만큼 "
                         "정확). 제외는 int4가 아슬아슬할 때의 카드.")
+    p.add_argument("--accuracy-level", type=int, default=None,
+                   choices=[1, 2, 3, 4], dest="accuracy_level",
+                   help="MatMulNBits accuracy_level 속성 (1=fp32 2=fp16 "
+                        "3=bf16 4=int8). 4를 주면 ORT WebGPU 네이티브 EP가 "
+                        "활성화를 int8로 동적 양자화해 DP4A 정수 커널을 탐 — "
+                        "브라우저(jspi 빌드) 가속의 핵심. 미지정 시 기존 동작. "
+                        "주의: 활성화 양자화는 가중치 양자화와 별개의 정확도 "
+                        "트레이드오프 — 브라우저 이미지 비교 필수.")
     p.add_argument("--algo", default="rtn", choices=["rtn", "hqq"],
                    help="양자화 알고리즘. rtn=기본(빠름, 거침), "
                         "hqq=최적화 기반(느림, int4에서 훨씬 정확, torch 필요)")
@@ -149,9 +194,13 @@ def main():
         for name in excluded:
             print(f"  - {name}")
 
-    quant = get_quantizer(model, args.bits, args.block_size, excluded, args.algo)
+    quant = get_quantizer(model, args.bits, args.block_size, excluded,
+                          args.algo, args.accuracy_level)
     quant.process()
     qmodel = quant.model.model if hasattr(quant.model, "model") else quant.model
+
+    if args.accuracy_level is not None:
+        apply_accuracy_level(qmodel, args.accuracy_level)
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     data_name = os.path.basename(args.out) + ".data"
