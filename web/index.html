@@ -126,10 +126,19 @@
 </div>
 
 <script type="module">
-import * as ort from 'https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.webgpu.min.mjs';
 import { AutoTokenizer, env as hfEnv } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers';
 
-ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/';
+// ── ORT 로드 ──
+// JSPI 지원 브라우저(Chrome 137+): 네이티브 C++ WebGPU EP 빌드(jspi).
+//   → DP4A MatMulNBits / FlashAttention 커널은 이 빌드에만 존재 (인수인계 사실 10, 14).
+// 미지원: 기존 JSEP 빌드 폴백 (동작 동일, 최적화 커널 없음).
+// EP 교체기라 latest 추적은 회귀 위험 → 버전 고정 (인수인계 '기타' 항목).
+const ORT_VER  = '1.26.0';
+const ORT_BASE = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_VER}/dist/`;
+const HAS_JSPI = typeof WebAssembly.Suspending === 'function';
+const ort = await import(ORT_BASE +
+  (HAS_JSPI ? 'ort.jspi.bundle.min.mjs' : 'ort.webgpu.min.mjs'));
+ort.env.wasm.wasmPaths = ORT_BASE;
 hfEnv.allowLocalModels = true;
 hfEnv.localModelPath = 'tokenizers/';   // prepare_tokenizers.py 산출물 위치
 
@@ -151,9 +160,9 @@ const PATHS = {
   vae:     'out/vae/qwen_image_vae_decoder_dyn32.onnx',
 };
 const MODELS = {
-  anima: { label: 'Anima',            dit: 'out/dit/anima_dit_dyn32_q8s.onnx',
+  anima: { label: 'Anima',            dit: 'out/dit/anima_dit_dyn32_q8a4s.onnx',
            steps: 30, cfg: 5.0, sampler: 'er_sde', scheduler: 'simple' },
-  turbo: { label: 'Anima+Turbo v0.2', dit: 'out/dit/anima_dit_turbo32_q8s.onnx',
+  turbo: { label: 'Anima+Turbo v0.2', dit: 'out/dit/anima_dit_turbo32_q8a4s.onnx',
            steps: 8,  cfg: 1.0, sampler: 'euler',  scheduler: 'simple' },
 };
 
@@ -619,7 +628,8 @@ async function generate() {
     ? ' · <span style="color:var(--err)">maxBufferSize가 작아 DiT 로드가 실패할 수 있음</span>' : '';
   $('gpuInfo').innerHTML =
     `WebGPU OK · shader-f16 <span style="color:var(--ok)">지원</span>` +
-    ` · maxBufferSize ${bufGB.toFixed(1)}GB${warn}` +
+    ` · maxBufferSize ${bufGB.toFixed(1)}GB` +
+    ` · 엔진 ${HAS_JSPI ? '<span style="color:var(--ok)">native EP (jspi)</span>' : 'JSEP'}${warn}` +
     `<br><span style="color:var(--dim)">권장: VRAM 6GB+ 외장 GPU · 최초 로드 시 ~2.5GB 다운로드 (이후 캐시)</span>`;
 })();
 
