@@ -59,11 +59,70 @@ def _rms_norm_manual(input, normalized_shape, weight=None, eps=None):
     return out.to(input.dtype)
 
 
+def _rope_generate_embeddings_dynamic(self, B_T_H_W_C, fps=None,
+                                      h_ntk_factor=None, w_ntk_factor=None,
+                                      t_ntk_factor=None, device=None, dtype=None):
+    """VideoRopePosition3DEmb.generate_embeddings의 동적 H/W 안전 버전.
+
+    원본은 `seq = arange(max(H, W, T))` 후 seq[:H]/seq[:W]/seq[:T]로 슬라이싱하는데,
+    max(H,W,T)가 파이썬 정수 비교라 dynamo trace 시 상수로 박힌다. 정사각형이든
+    비정사각형이든 trace 한 번의 H/W 관계(특히 H≤W 여부)가 그래프에 굳어,
+    landscape(W>H) 해상도에서 Reshape가 깨진다('{52}→{76,1}').
+    H/W/T 각각 독립 arange를 써서 max 비교와 공유 슬라이싱을 제거 → 세 축이
+    완전히 독립적인 동적 길이가 된다. 수치는 원본과 동일.
+    """
+    import torch
+    from einops import repeat, rearrange
+
+    h_ntk_factor = h_ntk_factor if h_ntk_factor is not None else self.h_ntk_factor
+    w_ntk_factor = w_ntk_factor if w_ntk_factor is not None else self.w_ntk_factor
+    t_ntk_factor = t_ntk_factor if t_ntk_factor is not None else self.t_ntk_factor
+
+    h_theta = 10000.0 * h_ntk_factor
+    w_theta = 10000.0 * w_ntk_factor
+    t_theta = 10000.0 * t_ntk_factor
+
+    h_spatial_freqs = 1.0 / (h_theta ** self.dim_spatial_range.to(device=device))
+    w_spatial_freqs = 1.0 / (w_theta ** self.dim_spatial_range.to(device=device))
+    temporal_freqs = 1.0 / (t_theta ** self.dim_temporal_range.to(device=device))
+
+    B, T, H, W, _ = B_T_H_W_C
+    # 핵심 차이: max(H,W,T) + 슬라이싱 대신 축별 독립 arange
+    seq_h = torch.arange(H, dtype=torch.float, device=device)
+    seq_w = torch.arange(W, dtype=torch.float, device=device)
+    seq_t = torch.arange(T, dtype=torch.float, device=device)
+
+    uniform_fps = (fps is None) or isinstance(fps, (int, float)) or (fps.min() == fps.max())
+    assert uniform_fps or B == 1 or T == 1, \
+        "For video batch, batch size should be 1 for non-uniform fps. For image batch, T should be 1"
+
+    half_emb_h = torch.outer(seq_h, h_spatial_freqs)
+    half_emb_w = torch.outer(seq_w, w_spatial_freqs)
+    if fps is None or self.enable_fps_modulation is False:
+        half_emb_t = torch.outer(seq_t, temporal_freqs)
+    else:
+        half_emb_t = torch.outer(seq_t / fps * self.base_fps, temporal_freqs)
+
+    half_emb_h = torch.stack([torch.cos(half_emb_h), -torch.sin(half_emb_h), torch.sin(half_emb_h), torch.cos(half_emb_h)], dim=-1)
+    half_emb_w = torch.stack([torch.cos(half_emb_w), -torch.sin(half_emb_w), torch.sin(half_emb_w), torch.cos(half_emb_w)], dim=-1)
+    half_emb_t = torch.stack([torch.cos(half_emb_t), -torch.sin(half_emb_t), torch.sin(half_emb_t), torch.cos(half_emb_t)], dim=-1)
+
+    em_T_H_W_D = torch.cat([
+        repeat(half_emb_t, "t d x -> t h w d x", h=H, w=W),
+        repeat(half_emb_h, "h d x -> t h w d x", t=T, w=W),
+        repeat(half_emb_w, "w d x -> t h w d x", t=T, h=H),
+    ], dim=-2)
+
+    return rearrange(em_T_H_W_D, "t h w d (i j) -> (t h w) d i j", i=2, j=2).float()
+
+
 def patch_comfy_for_export():
     """
     ONNX export를 막는 ComfyUI 런타임 요소들을 치환.
     1) comfy.quant_ops.ck.apply_rope_split_half (torch.ops 커스텀 op) → 순수 PyTorch
     2) F.rms_norm (aten._fused_rms_norm) → 수동 분해 구현
+    3) VideoRopePosition3DEmb.generate_embeddings → 동적 H/W 안전 버전
+       (max(H,W,T) 상수화로 landscape 해상도가 깨지는 문제 수정)
     반드시 모델 로드 전에 호출할 것.
     """
     import comfy.quant_ops as qo
@@ -87,6 +146,14 @@ def patch_comfy_for_export():
     except ImportError:
         pass
     print("[patch] F.rms_norm → 수동 분해 구현 치환 완료")
+
+    # RoPE 임베딩: max(H,W,T) 상수화 → landscape Reshape 실패 수정
+    try:
+        from comfy.ldm.cosmos.position_embedding import VideoRopePosition3DEmb
+        VideoRopePosition3DEmb.generate_embeddings = _rope_generate_embeddings_dynamic
+        print("[patch] VideoRopePosition3DEmb.generate_embeddings → 동적 H/W 버전 치환 완료")
+    except ImportError:
+        print("[patch] (경고) VideoRopePosition3DEmb 미발견 — RoPE 패치 건너뜀")
 
 
 def save_onnx_external(onnx_program_or_none, wrapper, args_tuple, out_path,

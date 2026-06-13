@@ -147,13 +147,16 @@ def main():
         verify_onnx(args.out, wrapper, (latent, timesteps, context),
                     ["latent", "timesteps", "context"])
         if args.dynamic:
-            # 다른 해상도/종횡비에서도 그래프가 올바른지 확인 (832x1216 세로 버킷)
-            h2, w2 = 1216 // VAE_DOWNSCALE, 832 // VAE_DOWNSCALE
-            print(f"[verify] 동적 해상도 검증: latent {h2}x{w2} (832x1216px)")
-            latent2 = torch.randn(1, LATENT_CHANNELS, 1, h2, w2,
-                                  dtype=torch.float16, device=args.device)
-            verify_onnx(args.out, wrapper, (latent2, timesteps, context),
-                        ["latent", "timesteps", "context"])
+            # 다른 해상도/종횡비에서도 그래프가 올바른지 확인.
+            # portrait(H>W)와 landscape(W>H) 둘 다 검증 — 과거 landscape에서만
+            # Reshape가 깨진 적이 있어 양쪽 모두 필수.
+            for px_h, px_w in [(1216, 832), (832, 1216), (768, 1344)]:
+                lh, lw = px_h // VAE_DOWNSCALE, px_w // VAE_DOWNSCALE
+                print(f"[verify] 동적 해상도: latent {lh}x{lw} ({px_w}x{px_h}px)")
+                latent2 = torch.randn(1, LATENT_CHANNELS, 1, lh, lw,
+                                      dtype=torch.float16, device=args.device)
+                verify_onnx(args.out, wrapper, (latent2, timesteps, context),
+                            ["latent", "timesteps", "context"])
 
 
 if __name__ == "__main__":
