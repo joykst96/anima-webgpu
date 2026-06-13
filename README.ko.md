@@ -14,7 +14,10 @@
 - int8 weight-only 양자화 (MatMulNBits): 연산은 fp16, 다운로드 ~2.3GB. `shader-f16`만 지원하면 어떤 WebGPU GPU에서도 동작 — INT8 텐서코어 같은 하드웨어 요구 없음.
 - 가중치 샤딩 (파일당 ~480MB 이하): 브라우저 단일 ArrayBuffer 한계 우회 + 무료 CDN 캐시 한도 대응.
 - OPFS 캐싱: 첫 방문만 다운로드, 재방문은 디스크에서 수 초 내 로드.
-- 한 페이지에서 두 모델 변형 선택: 베이스(er_sde · 30스텝 · CFG 5), Turbo LoRA 머지본(euler · 8스텝 · CFG 1).
+- 한 페이지에서 두 모델 변형 선택: 베이스(er_sde · 30스텝 · CFG 5), Turbo LoRA 머지본(euler · 8스텝 · CFG 1). 추가로 **사용자 설정** 옵션으로 자신의 ONNX DiT를 디스크에서 직접 로드 (모바일 친화적, OPFS 불필요).
+- **네이티브 WebGPU EP (JSPI 빌드)** + DP4A int8 matmul(`accuracy_level=4`) — JSEP 빌드 대비 샘플러 약 2배 빠름, 구형 브라우저는 자동 폴백.
+- **런타임 LoRA**: 아무 Anima `.safetensors` LoRA(kohya 또는 `diffusion_model.` 포맷)를 강도와 함께 장착. 여러 개는 ΔW + SVD로 정확히 병합(Web Worker에서 — UI 안 멈춤). 재export 불필요.
+- **프롬프트 가중치** `(태그:1.2)`와 **NegPip**(CFG=1/터보에서 부정 프롬프트), 둘 다 ComfyUI 충실 구현.
 
 ## 동작 구조
 
@@ -22,8 +25,8 @@
 |---|---|---|---|
 | 텍스트 인코딩 | Qwen3-0.6B-Base | ONNX fp16 | last hidden states |
 | 컨텍스트 어댑터 | Anima LLMAdapter | ONNX fp16 | **이중 토큰화**: Qwen3 토큰 → 인코더 hidden states, T5 토큰 → 어댑터 쿼리. 출력은 512×1024로 zero-pad |
-| 디노이저 | Anima DiT 2B (Cosmos-Predict2) | ONNX, int8 가중치 / fp32 활성, fp16 입출력 | H/W 동적 축, RoPE는 그래프 내부 |
-| 디코드 | Qwen-Image (Wan 2.1) VAE 디코더 | ONNX fp32 | Wan21 latent 역정규화를 그래프에 베이킹 |
+| 디노이저 | Anima DiT 2B (Cosmos-Predict2) | ONNX, int8 가중치(DP4A용 `accuracy_level=4`) / fp32 활성, fp16 입출력 | H/W 동적 축, RoPE 그래프 내부; NegPip·LoRA 슬롯 입력 선택 |
+| 디코드 | Qwen-Image (Wan 2.1) VAE 디코더 | ONNX fp32 | T=1에서 CausalConv3d를 2D로 폴딩(Conv2d 커널 경로); Wan21 역정규화 베이킹 |
 
 샘플러(Euler / ER-SDE-Solver)와 시그마 스케줄은 순수 JavaScript로 돌고, 스텝마다 DiT 세션을 1회(CFG 1) 또는 2회(CFG > 1) 호출합니다.
 
@@ -57,24 +60,44 @@ python export/export_adapter.py --comfyui /path/to/ComfyUI \
 python export/export_text_encoder.py --out out/text_encoder/qwen3_06b.onnx
 python export/export_vae_decoder.py --comfyui /path/to/ComfyUI \
   --vae /path/to/qwen_image_vae.safetensors \
-  --out out/vae/qwen_image_vae_decoder_dyn32.onnx --dynamic --size 512
+  --out out/vae/qwen_image_vae_decoder_dyn32_2d.onnx --dynamic --size 1024
+# T=1 전제로 CausalConv3d를 등가 2D conv로 폴딩 (--keep-3d로 끔, --verify로 동치 검증)
 ```
 
 참고: VAE의 `--size 512`는 trace 크기일 뿐이고(그래프는 동적), fp32 VAE를 1024로 trace하면 16GB 카드에서 OOM이 날 수 있습니다. `export_dit.py --verify`를 주면 두 해상도에서 ONNX vs PyTorch 출력 비교까지 수행합니다.
 
-## 2. DiT 양자화 & 샤딩
+## 2. DiT 양자화 · 기능 추가 · 샤딩
+
+DiT 전체 파이프라인: **양자화 → NegPip → 샤딩 → LoRA 슬롯**. NegPip은 샤딩 전(그래프 편집), LoRA 슬롯은 샤딩 *후*(graph-only, 같은 샤드 재사용)에 추가합니다.
 
 ```bash
-# int8 weight-only (권장 — 이 DiT에서 사실상 무손실)
+# int8 weight-only + accuracy_level=4 (DP4A 정수 커널 발동 → 샘플러 약 2배)
 python export/quantize_dit.py --src out/dit/anima_dit_dyn32.onnx \
-  --out out/dit/anima_dit_dyn32_q8.onnx --bits 8 --no-exclude
+  --out out/dit/anima_dit_dyn32_q8a4.onnx --bits 8 --no-exclude --accuracy-level 4
+
+# NegPip: negpip_mask 입력 추가, cross-attn v_proj 재배선 (mask=1이면 출력 동일)
+python export/add_negpip.py --src out/dit/anima_dit_dyn32_q8a4.onnx \
+  --out out/dit/anima_dit_dyn32_q8a4n.onnx
 
 # 가중치를 CDN/브라우저 친화적 샤드로 분할
-python export/shard_onnx_data.py --src out/dit/anima_dit_dyn32_q8.onnx \
-  --out out/dit/anima_dit_dyn32_q8s.onnx --shard-mb 400
+python export/shard_onnx_data.py --src out/dit/anima_dit_dyn32_q8a4n.onnx \
+  --out out/dit/anima_dit_dyn32_q8a4ns.onnx --shard-mb 480
+
+# LoRA 슬롯: 런타임 LoRA용 저랭크 사이드브랜치(랭크 48). 위 샤드를 그대로 재사용.
+python export/add_lora_slots.py --src out/dit/anima_dit_dyn32_q8a4ns.onnx \
+  --out out/dit/anima_dit_dyn32_q8a4nLs.onnx --rank 48
 ```
 
-Turbo export에도 같은 두 단계를 반복하세요. `.data`가 CDN 캐시 한도를 넘는 다른 모델도 샤딩하는 게 좋습니다 (fp16 텍스트 인코더가 ~1.2GB):
+비슬롯(`q8a4ns`)과 슬롯(`q8a4nLs`) 그래프를 **둘 다** 서버에 두세요: 페이지는 LoRA가 없으면 더 빠른 비슬롯 그래프를 쓰고, LoRA를 장착할 때만 슬롯 그래프로 전환합니다(샤드 동일, 추가 다운로드 없음). Turbo export에도 전체 체인을 반복하세요.
+
+최소 구성(레거시):
+
+```bash
+python export/quantize_dit.py --src out/dit/anima_dit_dyn32.onnx \
+  --out out/dit/anima_dit_dyn32_q8.onnx --bits 8 --no-exclude
+python export/shard_onnx_data.py --src out/dit/anima_dit_dyn32_q8.onnx \
+  --out out/dit/anima_dit_dyn32_q8s.onnx --shard-mb 480
+``` `.data`가 CDN 캐시 한도를 넘는 다른 모델도 샤딩하는 게 좋습니다 (fp16 텍스트 인코더가 ~1.2GB):
 
 ```bash
 python export/shard_onnx_data.py --src out/text_encoder/qwen3_06b.onnx \
@@ -113,15 +136,25 @@ Qwen3와 진짜 `t5-v1_1` 토크나이저를 transformers.js가 요구하는 fas
 index.html
 tokenizers/{qwen3,t5}/
 out/
-├── dit/           *_q8s.onnx + .bin 샤드 + .manifest.json   (변형별)
+├── dit/           변형별: *_q8a4ns.onnx(비슬롯) + *_q8a4nLs.onnx(LoRA 슬롯),
+│                 각각 .bin 샤드 + .onnx.manifest.json; 슬롯 그래프는 .onnx.lora_manifest.json도.
+│                 샤드는 두 그래프가 공유.
 ├── adapter/       anima_llm_adapter.onnx (+ .data)
 ├── text_encoder/  qwen3_06b_s.onnx + 샤드 + manifest
-└── vae/           qwen_image_vae_decoder_dyn32.onnx (+ .data)
+└── vae/           qwen_image_vae_decoder_dyn32_2d.onnx (+ .data)
 ```
 
 파일명이 다르면 `web/index.html` 상단의 `PATHS` / `MODELS` 상수를 수정하세요. **양자화 전 원본 모델을 웹 루트에 두지 마세요.**
 
 바로 쓸 수 있는 정적 서버가 `deploy/`에 있습니다 (`docker compose up -d`; nginx — 가중치는 `immutable` 캐시 헤더, 페이지는 `no-cache`). Cloudflare 뒤에 두는 경우 `.bin/.onnx/.data/.json`을 캐시 대상으로 지정하는 Cache Rule을 반드시 추가하세요 — 이 확장자들은 기본적으로 캐시되지 않아서, 규칙 없이는 모든 요청이 오리진까지 내려옵니다. 무료 플랜의 파일당 캐시 한도 때문에 샤드는 ~500MB 이하로 유지하세요. 가중치가 `immutable`로 서빙되므로 **모델 파일을 같은 이름으로 덮어쓰면 안 됩니다** — 새 파일명으로 올리고 `index.html`만 갱신하세요.
+
+## 브라우저 기능
+
+- **프롬프트 가중치** — `(태그:1.2)`로 강조, `(태그)` = ×1.1, 중첩은 곱, `\(` `\)`는 리터럴 괄호(단보루 태그용). 어댑터 출력에 토큰 단위로 적용 — ComfyUI와 동일 지점.
+- **NegPip** — CFG=1(터보)에서는 부정 프롬프트가 무시됩니다. NegPip 체크 시 부정 프롬프트가 음수 가중치 그룹으로 병합되고, 슬롯 모델의 `negpip_mask`가 해당 토큰의 cross-attn value 부호를 뒤집어 개념을 빼냅니다. `add_negpip.py`로 만든 DiT 필요.
+- **런타임 LoRA** — `.safetensors` LoRA를 여러 개, 각자 강도로 추가한 뒤 **LoRA 반영**을 누릅니다(지연 적용 — N개를 N번이 아니라 1번에 컴파일). 변환(safetensors 파싱 + 멀티 LoRA ΔW/SVD 병합)은 Web Worker에서 진행바와 함께 돌고, 끝날 때까지 생성은 비활성화됩니다. **단일** LoRA는 강도가 그래프 입력(`lora_scale`)이라 슬라이더가 재컴파일 없이 다음 생성에 즉시 반영되고, **여러 개**일 때는 강도가 SVD 병합에 들어가 변경 시 재병합합니다. 어느 쪽이든 그래프는 랭크 48 유지. 미지원 키(텍스트 인코더 LoRA, LoKr)와 슬롯 밖 모듈은 조용히 버리지 않고 리포트합니다. `add_lora_slots.py`로 만든 슬롯 모델 필요.
+- **사용자 설정 모델** — *사용자 설정* 드롭다운으로 DiT(`.onnx` + 샤드 + manifest)를 디스크에서 골라 메모리에 직접 로드(OPFS 미사용, 모바일 동작). TE/어댑터/VAE는 기본 경로 사용.
+- **GPU 우선순위** — 고성능/절전/기본을 WebGPU `powerPreference`에 매핑(스펙상 GPU 번호 직접 지정 불가). 페이지 (재)로드 시 적용.
 
 ## 구현 노트 (다른 환경으로 포팅할 때)
 
@@ -143,10 +176,16 @@ ComfyUI 소스 대조로 검증한 Anima의 추론 계약:
 5. **`aten._fused_rms_norm`에 ONNX lowering이 없습니다** (최신 PyTorch). export 전에 `F.rms_norm`을 수동 분해 구현으로 몽키패치합니다 (`common.py`).
 6. **브라우저 단일 ArrayBuffer 한계(~2GB)** 때문에 큰 `.data`를 통째로 로드할 수 없습니다 — 그래서 샤딩이며, ORT Web의 `externalData`는 파일 목록을 네이티브로 지원합니다.
 7. ComfyUI 커스텀 op(`comfy_kitchen.apply_rope_split_half`)는 trace 전에 순수 PyTorch 등가 구현으로 치환해야 합니다.
+8. **onnxruntime-web은 WebGPU 빌드를 두 갈래로 배포합니다.** 기본(`ort.webgpu.*`, JSEP)에는 DP4A·FlashAttention 커널이 **없고**, `ort.jspi.*` 빌드가 그 커널을 가진 네이티브 C++ WebGPU EP입니다. 이 페이지는 `WebAssembly.Suspending`이 있으면(Chrome 137+) JSPI 빌드(`1.26.0` 고정)를 쓰고, 없으면 폴백합니다. `subgroup-matrix` 경로는 wasm 빌드에서 컴파일 자체가 제외되니 좇지 마세요.
+9. **DP4A는 노드 속성 `accuracy_level=4`가 필요합니다**(`quantize_dit.py --accuracy-level 4`). 추가로 `K%128==0 && N%16==0 && block_size%32==0`. 이는 활성화를 int8로 동적 양자화하는 것 — 가중치 양자화와는 *다른* 정확도 트레이드오프라 브라우저에서 이미지 품질을 확인하세요(`run_pipeline.py`의 CPU EP는 이 경로를 안 탑니다).
+10. **VAE `CausalConv3d`는 fp32 전용 rank-5**라 ORT가 느린 naive conv3d 커널로 돌립니다. 단일 이미지(T=1)에서는 마지막 시간탭의 2D conv와 수학적으로 동일 — `export_vae_decoder.py`가 가중치를 4D로 실체화해 Conv2d 커널이 돌게 만들어 스텝당 디코드를 거의 즉시로 만듭니다. 비디오(T>1)에는 사용 불가.
+11. **RoPE가 내부적으로 `max(H, W, T)`를 씁니다** — 파이썬 `int` 비교라 dynamo가 trace 시점 값으로 굳혀, trace 때의 H/W 대소관계가 박히고 **landscape(W>H) 해상도가 Reshape 에러로 실패**합니다(정사각형·portrait는 통과). 비정사각형 trace로도 안 고쳐지므로(dynamo가 심볼을 안 나눔), `common.py`의 `patch_comfy_for_export`가 RoPE 임베딩을 축별 독립 `arange`로 monkeypatch합니다(수치 동일). `export_dit.py --verify`가 이제 landscape 케이스도 검증합니다.
 
 ## 성능 (참고치)
 
-RTX 5070 Ti, 1024×1024 기준: Turbo 변형(8스텝, CFG 1)은 수십 초, 베이스(30스텝, CFG 5 → DiT 60회)는 분 단위. WebGPU에는 아직 fused attention이 없어 네이티브 CUDA 대비 상당한 격차가 있고, ORT Web 커널이 발전하면서 좁혀질 영역입니다. 새 해상도의 첫 생성은 셰이더 특화 때문에 느리고 이후 캐시됩니다.
+RTX 5070 Ti, 1024×1024, JSPI 빌드 + DP4A + 2D VAE 기준: **Turbo ≈ 11초**(8스텝, CFG 1), **베이스 ≈ 70초**(30스텝, CFG 5 → DiT 60회) — 로컬 ComfyUI 대비 약 3배(이전 ~10배에서 단축). DP4A가 샘플러 시간을 대략 절반으로 줄였고, VAE를 2D로 폴딩해 디코드가 사실상 즉시가 됐습니다. 이 그래프가 발동하는 커널엔 아직 fused attention이 없어 네이티브 CUDA와 격차가 남습니다(예정된 attention 융합 트랙의 목표). LoRA 장착 시 슬롯 디스패치로 ~9초 추가됩니다. 새 해상도의 첫 생성은 셰이더 특화 때문에 느리고 이후 캐시됩니다.
+
+> 참고: DiT를 반복 재컴파일하면(예: LoRA를 여러 번 토글) 현재 ORT Web에서 페이지 새로고침 전까지 GPU 메모리가 누수될 수 있습니다 — 알려진 업스트림 이슈. 페이지는 재컴파일을 최소화(LoRA 지연 반영, 단일 상주 세션)해 정상 사용에선 피하도록 했습니다.
 
 ## 라이선스
 

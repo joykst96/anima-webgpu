@@ -64,8 +64,30 @@
         <select id="modelSel">
           <option value="anima">Anima (베이스 · 30스텝 · CFG 5)</option>
           <option value="turbo" selected>Anima + Turbo v0.2 (8스텝 · CFG 1)</option>
+          <option value="custom">사용자 설정 (직접 모델 지정)</option>
         </select>
+        <label style="margin-top:8px">GPU 우선순위</label>
+        <select id="gpuPref">
+          <option value="high-performance" selected>고성능 GPU 우선</option>
+          <option value="low-power">절전 GPU 우선</option>
+          <option value="default">브라우저 기본</option>
+        </select>
+        <div style="font-size:11px;color:var(--dim,#888);margin-top:2px">
+          WebGPU는 GPU 번호 직접 지정을 지원하지 않음 — 전력 선호도로 어댑터를 고름. 변경 후 새로고침 시 적용.</div>
+        <div id="customPanel" style="display:none;margin:8px 0;padding:10px;border:1px solid var(--line,#333);border-radius:6px">
+          <label>DiT 모델 파일 (.onnx + 샤드 .bin + manifest 모두 선택)</label>
+          <input id="customDitFiles" type="file" multiple accept=".onnx,.bin,.json">
+          <div style="font-size:11px;color:var(--dim,#888);margin:2px 0 0">
+            OPFS 캐시 대신 메모리에서 직접 로드 (모바일·개발용). TE/어댑터/VAE는 기본 경로 사용.</div>
+        </div>
         <button id="btnLoad">모델 로드 (최초 1회 다운로드, 이후 캐시)</button>
+        <div style="margin-top:8px"><label>LoRA (.safetensors · 여러 개 가능)</label></div>
+        <div id="loraList"></div>
+        <div style="display:flex;gap:8px;align-items:center;margin-top:4px">
+          <button id="btnLoraAdd" style="font-size:12px;padding:3px 10px;width:auto">+ LoRA 추가</button>
+          <button id="btnLoraApply" style="font-size:12px;padding:3px 10px;width:auto" disabled>LoRA 반영</button>
+          <div id="loraStat" style="font-size:11px;color:var(--dim,#888);flex:1"></div>
+        </div>
         <button id="btnClearCache" class="secondary">캐시 비우기</button>
         <div class="bar"><i id="loadBar"></i></div>
         <div id="loadStat" class="stats"></div>
@@ -73,9 +95,9 @@
 
       <div class="panel" style="margin-top:16px">
         <h2>2. 생성</h2>
-        <label>프롬프트</label>
+        <label>긍정 프롬프트</label>
         <textarea id="prompt">masterpiece, best quality, score_7, safe</textarea>
-        <label style="display:flex;align-items:center;gap:8px">네거티브 프롬프트
+        <label style="display:flex;align-items:center;gap:8px">부정 프롬프트
           <span style="margin-left:auto;display:flex;align-items:center;gap:5px;font-weight:normal;font-size:12px">
             <input id="negpipChk" type="checkbox" style="width:auto;margin:0">NegPip
             <input id="negpipW" type="number" value="-1.0" step="0.1" max="-0.1" min="-3"
@@ -168,11 +190,17 @@ const PATHS = {
   vae:     'out/vae/qwen_image_vae_decoder_dyn32_2d.onnx',
 };
 const MODELS = {
-  anima: { label: 'Anima',            dit: 'out/dit/anima_dit_dyn32_q8a4s.onnx',
+  anima: { label: 'Anima',            dit: 'out/dit/anima_dit_dyn32_q8a4ns.onnx', ditLora: 'out/dit/anima_dit_dyn32_q8a4nLs.onnx',
            steps: 30, cfg: 5.0, sampler: 'er_sde', scheduler: 'simple' },
-  turbo: { label: 'Anima+Turbo v0.2', dit: 'out/dit/anima_dit_turbo32_q8a4s.onnx',
+  turbo: { label: 'Anima+Turbo v0.2', dit: 'out/dit/anima_dit_turbo32_q8a4ns.onnx', ditLora: 'out/dit/anima_dit_turbo32_q8a4nLs.onnx',
+           steps: 8,  cfg: 1.0, sampler: 'euler',  scheduler: 'simple' },
+  custom: { label: '사용자 설정', dit: null, ditLora: null,
            steps: 8,  cfg: 1.0, sampler: 'euler',  scheduler: 'simple' },
 };
+
+// 사용자설정: 직접 선택한 DiT 파일들 (파일명 → File). loadSession이 URL 대신 사용.
+const customFiles = new Map();
+let gpuPreference = 'high-performance';
 
 const SHIFT = 3.0, CTX_LEN = 512, CTX_DIM = 1024, LAT_C = 16;
 
@@ -416,10 +444,100 @@ async function clearCache() {
   log(`캐시 ${n}개 파일 삭제됨`, 'ok');
 }
 
+
+// ───────── LoRA (런타임 슬롯 주입) ─────────
+const lora = { items: [], lastReport: '', dirty: false };   // items: [{file, fileName, src, weight, id}]
+let loraSeq = 0;
+
+async function reloadDit() {
+  const key = $('modelSel').value;
+  if (!ditSessions[key]) return;          // 미로드 상태면 다음 로드 때 자동 반영
+  if (sess.dit === ditSessions[key]) sess.dit = null;
+  try { await ditSessions[key].release(); } catch (e) { console.warn(e); }
+  delete ditSessions[key];
+  await new Promise(r => setTimeout(r, 300));         // GPU 버퍼 반납 정리 시간
+  await loadAll();
+}
+
+const LORA_WORKER_SRC = "let svdDecompose = null;\nconst svdReady = import('https://cdn.jsdelivr.net/npm/svd-js@1.1.1/build-es/svd.js').then(m => { svdDecompose = m.default; });\n\nfunction f16ToF32(u16){const out=new Float32Array(u16.length);for(let i=0;i<u16.length;i++){const h=u16[i],s=(h&0x8000)<<16,e=(h>>10)&0x1f,m=h&0x3ff;let bits;if(e===0)bits=m===0?s:(()=>{let mm=m,ee=-1;do{mm<<=1;ee++;}while(!(mm&0x400));return s|((127-15-ee)<<23)|((mm&0x3ff)<<13);})();else if(e===31)bits=s|0x7f800000|(m<<13);else bits=s|((e-15+127)<<23)|(m<<13);out[i]=new Float32Array(new Uint32Array([bits]).buffer)[0];}return out;}\n\n// safetensors: [u64 헤더길이][JSON 헤더][텐서 데이터]\nfunction parseSafetensors(arrayBuffer) {\n  const dv = new DataView(arrayBuffer);\n  const hlen = Number(dv.getBigUint64(0, true));\n  const header = JSON.parse(new TextDecoder().decode(new Uint8Array(arrayBuffer, 8, hlen)));\n  const base = 8 + hlen;\n  const tensors = new Map();\n  for (const [k, v] of Object.entries(header)) {\n    if (k === '__metadata__') continue;\n    tensors.set(k, { dtype: v.dtype, shape: v.shape,\n                     off: base + v.data_offsets[0], len: v.data_offsets[1] - v.data_offsets[0] });\n  }\n  return { tensors, buffer: arrayBuffer };\n}\n\nfunction readTensorF32(srcFile, t) {\n  // slice 복사로 TypedArray 정렬 보장 (safetensors 오프셋은 정렬 미보장)\n  const bytes = srcFile.buffer.slice(t.off, t.off + t.len);\n  if (t.dtype === 'F32') return new Float32Array(bytes);\n  const u16 = new Uint16Array(bytes);\n  if (t.dtype === 'BF16') {\n    const out = new Float32Array(u16.length);\n    const u32 = new Uint32Array(1), f32v = new Float32Array(u32.buffer);\n    for (let i = 0; i < u16.length; i++) { u32[0] = u16[i] << 16; out[i] = f32v[0]; }\n    return out;\n  }\n  if (t.dtype === 'F16') return f16ToF32(u16);\n  throw new Error(`지원하지 않는 dtype: ${t.dtype}`);\n}\n\nconst LORA_SUFFIXES = [\n  ['.lora_down.weight', 'down'], ['.lora_up.weight', 'up'],\n  ['.lora_A.weight', 'down'], ['.lora_B.weight', 'up'],\n  ['.lora_down', 'down'], ['.lora_up', 'up'],\n  ['.lora_A', 'down'], ['.lora_B', 'up'], ['.alpha', 'alpha'],\n];\nconst LORA_PREFIXES = ['lora_unet_', 'diffusion_model.', 'model.diffusion_model.',\n                       'transformer.', 'lora_transformer_', 'base_model.model.', 'unet.'];\n\nfunction classifyLoraKey(k) {\n  if (k.startsWith('lora_te')) return { skip: 'te' };\n  let role = null, base = k;\n  for (const [suf, r] of LORA_SUFFIXES)\n    if (k.endsWith(suf)) { base = k.slice(0, -suf.length); role = r; break; }\n  if (!role) return { skip: 'unknown' };              // lokr_* 등\n  for (const p of LORA_PREFIXES)\n    if (base.startsWith(p)) { base = base.slice(p.length); break; }\n  return { mod: base.replace(/\\./g, '_'), role };     // blocks_0_self_attn_q_proj\n}\n\n// 멀티 LoRA를 manifest 슬롯 레이아웃의 fp32 버퍼로 병합 변환.\n// 모듈별로 ΔW = Σ_i s_i·up_i·down_i 를 rank R로 정확 분해 (ΔW 미실체화,\n// 스택 [up...]·[down...] 의 2단 그람 고유분해 thin SVD). A(K,R)=V·√Σ 형태가 아니라\n// 슬롯 규약(y += B(Ax))에 맞춰 A=Vᵀ스케일, B=UΣ 로 재구성.\n\n// 한 모듈의 LoRA 기여 목록 → (A: K×R, B: R×N) Float32. svd-js 2단 thin-SVD.\n// ΔW = M(N×rt)·P(rt×K) 를 rank R로 정확 절단 분해. ΔW 미실체화.\nfunction mergeModule(contribs, K, N, R) {\n  const rt = contribs.reduce((s, c) => s + c.r, 0);\n  if (rt === 0) return null;\n  // M (N×rt) = [up_i·s_i],  P (rt×K) = [down_i]\n  const M = Array.from({ length: N }, () => new Array(rt).fill(0));\n  const P = Array.from({ length: rt }, () => new Float64Array(K));\n  let col = 0;\n  for (const c of contribs) {\n    for (let n = 0; n < N; n++) for (let j = 0; j < c.r; j++) M[n][col + j] = c.up[n * c.r + j] * c.scale;\n    for (let j = 0; j < c.r; j++) for (let k = 0; k < K; k++) P[col + j][k] = c.down[j * K + k];\n    col += c.r;\n  }\n  // (1) M = Um(N×rt) Σm Wmᵀ.  svd-js는 m≥n 요구 — N≥rt는 일반 성립.\n  const { u: Um, v: Wm, q: Sm } = svdDecompose(M, true, true);\n  // (2) Y = Σm·Wmᵀ·P  (rt×K)\n  const Y = [];\n  for (let i = 0; i < rt; i++) {\n    const row = new Array(K).fill(0);\n    for (let k = 0; k < K; k++) { let s = 0; for (let j = 0; j < rt; j++) s += Wm[j][i] * P[j][k]; row[k] = Sm[i] * s; }\n    Y.push(row);\n  }\n  // Yᵀ(K×rt) SVD → u=Vk(K×rt: ΔW의 우특이), v=Wy(rt×rt), q=Sy\n  const Yt = [];\n  for (let k = 0; k < K; k++) { const r = new Array(rt); for (let i = 0; i < rt; i++) r[i] = Y[i][k]; Yt.push(r); }\n  const { u: Vk, v: Wy, q: Sy } = svdDecompose(Yt, true, true);\n  // 상위 R개 (svd-js q 미정렬)\n  const idx = [...Sy.keys()].sort((a, b) => Sy[b] - Sy[a]).slice(0, R);\n  const A = new Float32Array(K * R), B = new Float32Array(R * N);\n  // ΔW = (Um·Wy)·Σy·Vkᵀ → B = (Um·Wy·Σy)ᵀ, A = Vk\n  for (let jj = 0; jj < idx.length; jj++) {\n    const c = idx[jj], sv = Sy[c];\n    if (sv < 1e-12) continue;\n    for (let k = 0; k < K; k++) A[k * R + jj] = Vk[k][c];\n    for (let n = 0; n < N; n++) { let s = 0; for (let r = 0; r < rt; r++) s += Um[n][r] * Wy[r][c]; B[jj * N + n] = s * sv; }\n  }\n  return { A, B };\n}\n\n// 단일 LoRA: SVD 불필요. down/up을 슬롯 레이아웃에 직접 배치 (scale 미적용 —\n// 강도는 그래프 입력 lora_scale이 런타임에 곱하므로 재컴파일 없이 슬라이더 즉시 반영).\n// alpha/r0 정규화만 B에 흡수. r0>R이면 상위 R랭크만 (절단, 드묾).\nfunction convertLoraSingle(item, manifest) {\n  const R = manifest.rank;\n  const total = manifest.entries.reduce((m, e) => Math.max(m, e.B.offset + R * e.N * 4), 0);\n  const out = new Float32Array(total / 4);\n  const mods = new Map(); let skipTe = 0, skipUnknown = 0;\n  for (const [k, t] of item.src.tensors) {\n    const c = classifyLoraKey(k);\n    if (c.skip) { c.skip === 'te' ? skipTe++ : skipUnknown++; continue; }\n    if (!mods.has(c.mod)) mods.set(c.mod, {});\n    mods.get(c.mod)[c.role] = t;\n  }\n  let applied = 0, missing = 0, mismatch = 0, trunc = 0; const seen = new Set();\n  let _done = 0; const _tot = manifest.entries.length;\n  for (const e of manifest.entries) {\n    if ((++_done & 63) === 0) self.postMessage({ type:'progress', value: 0.1 + 0.85*_done/_tot });\n    const km = e.key.match(/^b(\\d+)_(.+)$/);\n    const srcMod = `blocks_${km[1]}_${km[2]}`;\n    const ent = mods.get(srcMod);\n    if (!ent || !ent.down || !ent.up) { missing++; continue; }\n    const r0 = ent.down.shape[0], K = ent.down.shape[1], N = ent.up.shape[0];\n    if (K !== e.K || N !== e.N || ent.up.shape[1] !== r0) { mismatch++; continue; }\n    seen.add(srcMod);\n    const down = readTensorF32(item.src, ent.down);   // (r0, K)\n    const up = readTensorF32(item.src, ent.up);       // (N, r0)\n    const alpha = ent.alpha ? readTensorF32(item.src, ent.alpha)[0] : r0;\n    const scale = alpha / r0;                          // 강도(weight)는 lora_scale이 처리 — 여기선 제외\n    const rUse = Math.min(r0, R);\n    if (r0 > R) trunc++;\n    const aBase = e.A.offset / 4, bBase = e.B.offset / 4;\n    // A(K,R) = downᵀ 제로패딩,  B(R,N) = upᵀ·scale 제로패딩\n    for (let j = 0; j < rUse; j++) { const dRow = j * K; for (let k = 0; k < K; k++) out[aBase + k * R + j] = down[dRow + k]; }\n    for (let n = 0; n < N; n++) { const uRow = n * r0; for (let j = 0; j < rUse; j++) out[bBase + j * N + n] = up[uRow + j] * scale; }\n    applied++;\n  }\n  const notes = [];\n  if (missing) notes.push(`빈 슬롯 ${missing}`);\n  const extra = [...mods.keys()].filter(x => !seen.has(x)).length;\n  if (extra) notes.push(`슬롯 밖 모듈 ${extra}`);\n  if (skipTe) notes.push(`TE 키 ${skipTe} 무시`);\n  if (skipUnknown) notes.push(`미지원 키 ${skipUnknown}`);\n  if (trunc) notes.push(`랭크 절단 ${trunc}`);\n  if (mismatch) notes.push(`차원 불일치 ${mismatch}`);\n  return { bytes: new Uint8Array(out.buffer),\n           report: { applied, total: manifest.entries.length, notes: notes.join(' · ') } };\n}\n\nfunction convertLoraMulti(items, manifest) {\n  const R = manifest.rank;\n  const total = manifest.entries.reduce((m, e) => Math.max(m, e.B.offset + R * e.N * 4), 0);\n  const out = new Float32Array(total / 4);\n  // 각 LoRA를 모듈맵으로 미리 분해\n  const perLora = items.map(it => {\n    const mods = new Map(); let skipTe = 0, skipUnknown = 0;\n    for (const [k, t] of it.src.tensors) {\n      const c = classifyLoraKey(k);\n      if (c.skip) { c.skip === 'te' ? skipTe++ : skipUnknown++; continue; }\n      if (!mods.has(c.mod)) mods.set(c.mod, {});\n      mods.get(c.mod)[c.role] = t;\n    }\n    return { it, mods, skipTe, skipUnknown, seen: new Set() };\n  });\n  let appliedSlots = 0, missingAll = 0, mismatch = 0, trunc = 0;\n  let _done = 0; const _tot = manifest.entries.length;\n  for (const e of manifest.entries) {\n    if ((++_done & 31) === 0) self.postMessage({ type:'progress', value: 0.1 + 0.85*_done/_tot });\n    const km = e.key.match(/^b(\\d+)_(.+)$/);\n    const srcMod = `blocks_${km[1]}_${km[2]}`;\n    const contribs = [];\n    for (const pl of perLora) {\n      const ent = pl.mods.get(srcMod);\n      if (!ent || !ent.down || !ent.up) continue;\n      const r0 = ent.down.shape[0], K = ent.down.shape[1], N = ent.up.shape[0];\n      if (K !== e.K || N !== e.N || ent.up.shape[1] !== r0) { mismatch++; continue; }\n      pl.seen.add(srcMod);\n      const alpha = ent.alpha ? readTensorF32(pl.it.src, ent.alpha)[0] : r0;\n      contribs.push({ r: r0, down: readTensorF32(pl.it.src, ent.down),\n                      up: readTensorF32(pl.it.src, ent.up),\n                      scale: (alpha / r0) * pl.it.weight });\n      if (r0 > R) trunc++;\n    }\n    if (contribs.length === 0) { missingAll++; continue; }\n    const merged = mergeModule(contribs, e.K, e.N, R);\n    if (!merged) { missingAll++; continue; }\n    const aBase = e.A.offset / 4, bBase = e.B.offset / 4;\n    out.set(merged.A, aBase);\n    out.set(merged.B, bBase);\n    appliedSlots++;\n  }\n  const notes = [];\n  if (missingAll) notes.push(`빈 슬롯 ${missingAll}`);\n  let teTot = 0, unkTot = 0, extraTot = 0;\n  for (const pl of perLora) {\n    teTot += pl.skipTe; unkTot += pl.skipUnknown;\n    extraTot += [...pl.mods.keys()].filter(m => !pl.seen.has(m)).length;\n  }\n  if (extraTot) notes.push(`슬롯 밖 모듈 ${extraTot}`);\n  if (teTot) notes.push(`TE 키 ${teTot} 무시`);\n  if (unkTot) notes.push(`미지원 키 ${unkTot}`);\n  if (trunc) notes.push(`랭크 절단 ${trunc}`);\n  if (mismatch) notes.push(`차원 불일치 ${mismatch}`);\n  return { bytes: new Uint8Array(out.buffer),\n           report: { applied: appliedSlots, total: manifest.entries.length, notes: notes.join(' · ') } };\n}\n\nself.onmessage = async (ev) => {\n  const { manifest, loras } = ev.data;\n  try {\n    await svdReady;\n    const items = loras.map(l => ({ src: parseSafetensors(l.buffer), weight: l.weight, fileName: l.fileName }));\n    self.postMessage({ type:'progress', value: 0.05 });\n    // 단일 LoRA는 SVD 없이 직접 배치 (강도는 그래프 lora_scale) → 즉시 + 정확\n    const { bytes, report } = (items.length === 1)\n      ? convertLoraSingle(items[0], manifest)\n      : convertLoraMulti(items, manifest);\n    self.postMessage({ type:'done', bytes, report }, [bytes.buffer]);\n  } catch (e) { self.postMessage({ type:'error', message: e.message }); }\n};\n";
+
+// ───────── LoRA 변환 Worker (svd-js, 메인 비차단) ─────────
+let _loraWorker = null;
+function getLoraWorker() {
+  if (_loraWorker) return _loraWorker;
+  const blob = new Blob([LORA_WORKER_SRC], { type: 'application/javascript' });
+  _loraWorker = new Worker(URL.createObjectURL(blob), { type: 'module' });
+  return _loraWorker;
+}
+function buildLoraBinAsync(manifest, active, onProg) {
+  return new Promise((resolve, reject) => {
+    const wk = getLoraWorker();
+    const handle = (ev) => {
+      const m = ev.data;
+      if (m.type === 'progress') onProg && onProg(m.value);
+      else if (m.type === 'done') { wk.removeEventListener('message', handle); resolve({ bytes: m.bytes, report: m.report }); }
+      else if (m.type === 'error') { wk.removeEventListener('message', handle); reject(new Error(m.message)); }
+    };
+    wk.addEventListener('message', handle);
+    const loras = active.map(i => ({ fileName: i.fileName, weight: i.weight, buffer: i.src.buffer }));
+    wk.postMessage({ manifest, loras });
+  });
+}
+
+// 파일명에서 디렉터리 제거 (manifest는 베이스명으로 샤드를 참조)
+function baseName(p) { return p.split('/').pop(); }
+
+async function readFileBytes(file) { return new Uint8Array(await file.arrayBuffer()); }
+
 async function loadSession(name, url, onProgress) {
+  const opts = { executionProviders: ['webgpu'] };
+
+  // 0) 사용자설정: 메모리 파일맵에서 직접 조립 (네트워크/OPFS 미사용)
+  if (url === null && name.startsWith('dit:')) {
+    const onnxFile = [...customFiles.keys()].find(n => n.endsWith('.onnx') && !n.endsWith('.data'));
+    if (!onnxFile) throw new Error('.onnx 파일이 선택되지 않았습니다');
+    log(`${name} (사용자 파일: ${onnxFile})...`, 'dim');
+    const graph = await readFileBytes(customFiles.get(onnxFile));
+    const maniName = onnxFile + '.manifest.json';
+    if (customFiles.has(maniName)) {
+      const mani = JSON.parse(new TextDecoder().decode(await readFileBytes(customFiles.get(maniName))));
+      const ext = [];
+      for (const sName of mani.shards) {
+        const fh = customFiles.get(sName) || customFiles.get(baseName(sName));
+        if (!fh) throw new Error(`샤드 누락: ${sName} (선택 목록에 포함되었는지 확인)`);
+        ext.push({ path: baseName(sName), data: await readFileBytes(fh) });
+      }
+      opts.externalData = ext;
+    } else if (customFiles.has(onnxFile + '.data')) {
+      opts.externalData = [{ path: onnxFile + '.data',
+                             data: await readFileBytes(customFiles.get(onnxFile + '.data')) }];
+    }
+    // 사용자 모델의 LoRA manifest (선택)
+    const lmanName = onnxFile + '.lora_manifest.json';
+    let lman = customFiles.has(lmanName)
+      ? JSON.parse(new TextDecoder().decode(await readFileBytes(customFiles.get(lmanName)))) : null;
+    if (lman) {
+      const total = lman.entries.reduce((m, e) => Math.max(m, e.B.offset + lman.rank * e.N * 4), 0);
+      const active = lora.items.filter(i => i.src);
+      let bytes;
+      if (active.length) {
+        log(`LoRA 병합 (Worker, ${active.length}개)...`, 'dim');
+        const c = await buildLoraBinAsync(lman, active, f => {
+          $('loadBar').style.width = (f * 100) + '%'; $('loadStat').textContent = `LoRA 병합 ${(f * 100) | 0}%`; });
+        bytes = c.bytes;
+        lora.lastReport = `${active.length}개 LoRA — ${c.report.applied}/${c.report.total} 슬롯`;
+      } else bytes = new Uint8Array(total);
+      (opts.externalData = opts.externalData || []).push({ path: lman.bin, data: bytes });
+    }
+    log(`${name} 컴파일...`, 'dim');
+    const s = await ort.InferenceSession.create(graph, opts);
+    s.loraManifest = lman;
+    onProgress(1); log(`${name} OK`, 'ok');
+    return s;
+  }
+
   log(`${name} 그래프 다운로드...`, 'dim');
   const graph = await cachedFetch(url, f => onProgress(f * 0.05));
-  const opts = { executionProviders: ['webgpu'] };
 
   // 1) 샤드 manifest 우선 (shard_onnx_data.py 산출물 — ArrayBuffer 2GB 상한 우회)
   const maniRes = await fetch(url + '.manifest.json').catch(() => null);
@@ -445,8 +563,32 @@ async function loadSession(name, url, onProgress) {
       opts.externalData = [{ path: dataUrl.split('/').pop(), data }];
     }
   }
+  // LoRA 슬롯 manifest가 있으면 lora.bin을 변환본 또는 제로 버퍼로 주입
+  let lman = null;
+  const lres = await fetch(url + '.lora_manifest.json').catch(() => null);
+  if (lres && lres.ok) {
+    lman = await lres.json();
+    const total = lman.entries.reduce((m, e) => Math.max(m, e.B.offset + lman.rank * e.N * 4), 0);
+    let bytes;
+    const active = lora.items.filter(i => i.src);
+    if (active.length) {
+      log(`LoRA 병합 (Worker, ${active.length}개)...`, 'dim');
+      const c = await buildLoraBinAsync(lman, active, f => {
+        $('loadBar').style.width = (f * 100) + '%';
+        $('loadStat').textContent = `LoRA 병합 ${(f * 100) | 0}%`;
+      });
+      bytes = c.bytes;
+      lora.lastReport = `${active.length}개 LoRA — ${c.report.applied}/${c.report.total} 슬롯 적용`
+        + (c.report.notes ? ` (${c.report.notes})` : '');
+      log(lora.lastReport, c.report.applied ? 'ok' : 'err');
+    } else {
+      bytes = new Uint8Array(total);                  // 제로 = LoRA 없음 (다운로드 0)
+    }
+    (opts.externalData = opts.externalData || []).push({ path: lman.bin, data: bytes });
+  }
   log(`${name} 컴파일 (셰이더 빌드)...`, 'dim');
   const s = await ort.InferenceSession.create(graph, opts);
+  s.loraManifest = lman;
   onProgress(1);
   log(`${name} OK`, 'ok');
   return s;
@@ -463,8 +605,27 @@ function applyModelSettings() {
   $('scheduler').value = m.scheduler;
 }
 
+function updateModelUI() {
+  const key = $('modelSel').value;
+  $('customPanel').style.display = key === 'custom' ? '' : 'none';
+  const cfg = MODELS[key].cfg;
+  const chk = $('negpipChk'), nw = $('negpipW'), neg = $('negative');
+  // base(CFG>1): NegPip 무의미 → 비활성. base+turbo(CFG=1): NegPip 미체크면 부정칸 비활성.
+  if (cfg > 1) {
+    chk.checked = false; chk.disabled = true; nw.disabled = true;
+    neg.disabled = false;
+    chk.parentElement.title = 'CFG>1에서는 일반 부정 프롬프트가 동작하므로 NegPip 불필요';
+  } else {
+    chk.disabled = false; nw.disabled = !chk.checked;
+    neg.disabled = !chk.checked;     // CFG=1: NegPip 없으면 부정 프롬프트 무시되므로 비활성
+    neg.placeholder = chk.checked ? '' : 'CFG=1에서는 NegPip 체크 시에만 부정 프롬프트가 적용됩니다';
+    chk.parentElement.title = '';
+  }
+}
+
 function onModelChange() {
   applyModelSettings();
+  updateModelUI();
   const key = $('modelSel').value;
   if (ditSessions[key]) {
     sess.dit = ditSessions[key];
@@ -488,6 +649,10 @@ async function loadAll() {
     }
 
     const key = $('modelSel').value;
+    if (key === 'custom' && ![...customFiles.keys()].some(n => n.endsWith('.onnx') && !n.endsWith('.data'))) {
+      log('사용자 설정: DiT .onnx 파일을 먼저 선택하세요', 'err');
+      $('btnLoad').disabled = false; return;
+    }
 
     // 단일 상주 정책: 다른 DiT가 VRAM에 있으면 새 모델 로드 전에 내린다.
     // (가중치는 OPFS에 남아 있어 재전환 시 다운로드 없이 컴파일만 다시 함)
@@ -498,14 +663,21 @@ async function loadAll() {
         try { await ditSessions[k].release(); }
         catch (e) { console.warn('release 실패:', e); }
         delete ditSessions[k];
+        await new Promise(r => setTimeout(r, 300));   // GPU 버퍼 반납 정리 시간
       }
     }
 
     const items = [];
     if (!sharedLoaded)
       items.push(['te', PATHS.te], ['adapter', PATHS.adapter], ['vae', PATHS.vae]);
-    if (!ditSessions[key])
-      items.push([`dit:${key}`, MODELS[key].dit]);
+    if (!ditSessions[key]) {
+      // LoRA 장착 시에만 슬롯 스켈레톤 사용 — 샤드는 동일 파일이라 추가 다운로드 없음.
+      // 비장착 기본 상태는 슬롯 디스패치 오버헤드가 없는 빠른 그래프로.
+      const hasLora = lora.items.some(i => i.src);
+      const ditUrl = key === 'custom' ? null
+        : ((hasLora && MODELS[key].ditLora) ? MODELS[key].ditLora : MODELS[key].dit);
+      items.push([`dit:${key}`, ditUrl]);
+    }
 
     for (let i = 0; i < items.length; i++) {
       const [name, url] = items[i];
@@ -518,6 +690,12 @@ async function loadAll() {
     }
     sharedLoaded = true;
     sess.dit = ditSessions[key];
+    if (lora.items.some(i => i.src)) {
+      lora.dirty = false;
+      const ab = $('btnLoraApply'); if (ab) { ab.disabled = true; ab.textContent = 'LoRA 반영'; }
+      $('loraStat').textContent = sess.dit.loraManifest
+        ? lora.lastReport : '이 모델엔 LoRA 슬롯이 없음 (슬롯 빌드 필요)';
+    }
     log(`로드 완료 (${((performance.now() - t0) / 1000).toFixed(1)}s)`, 'ok');
     $('btnGen').disabled = false;
     $('loadStat').textContent = `${MODELS[key].label} 준비됨`;
@@ -636,6 +814,14 @@ async function generate() {
 
     log(`생성 시작 — seed ${seed} · ${pxW}x${pxH}`, 'dim');
     const negpipOK = !!(sess.dit.inputNames && sess.dit.inputNames.includes('negpip_mask'));
+    // 멀티 LoRA는 강도를 변환 단계(scale)에서 반영하므로 그래프 스칼라는 1.0 고정.
+    // 단일 LoRA: 강도를 그래프 lora_scale로 전달(재컴파일 없이 슬라이더 즉시 반영).
+    // 멀티 LoRA: 강도는 SVD 병합 단계에 흡수됐으므로 1.0 고정.
+    const activeLoras = lora.items.filter(i => i.src);
+    const loraScale = activeLoras.length === 1 ? Math.max(0, activeLoras[0].weight) : 1;
+    const loraFeed = sess.dit.inputNames.includes('lora_scale')
+      ? { lora_scale: new ort.Tensor('float32', Float32Array.of(loraScale), [1]) }
+      : {};
 
     // NegPip 체크박스: CFG=1일 때 부정 프롬프트를 음수 가중치 그룹으로 긍정에 병합.
     // 부정 프롬프트 내부의 (tag:1.2)는 중첩 곱 규칙으로 자동으로 -1.2가 됨.
@@ -665,11 +851,11 @@ async function generate() {
       const lat = makeF16Tensor(xf32, [1, LAT_C, 1, H, W]);
       const t = new ort.Tensor('float32', new Float32Array([sigma]), [1]); // t = σ
       const o1 = await sess.dit.run({ latent: lat, timesteps: t, context: ctxPos.ctx,
-        ...(ctxPos.mask ? { negpip_mask: ctxPos.mask } : {}) });
+        ...(ctxPos.mask ? { negpip_mask: ctxPos.mask } : {}), ...loraFeed });
       let v = toF32(o1[Object.keys(o1)[0]].data);
       if (useCfg) {
         const o2 = await sess.dit.run({ latent: lat, timesteps: t, context: ctxNeg.ctx,
-          ...(ctxNeg.mask ? { negpip_mask: ctxNeg.mask } : {}) });
+          ...(ctxNeg.mask ? { negpip_mask: ctxNeg.mask } : {}), ...loraFeed });
         const vu = toF32(o2[Object.keys(o2)[0]].data);
         for (let k = 0; k < v.length; k++) v[k] = vu[k] + cfg * (v[k] - vu[k]);
       }
@@ -712,6 +898,8 @@ async function generate() {
     $('btnSave').disabled = false;
   } catch (e) {
     log('생성 실패: ' + e.message, 'err');
+    if (/external Instance|[Dd]evice.*lost|mapAsync/.test(e.message))
+      log('GPU 컨텍스트가 손실됨 — 페이지를 새로고침해 주세요 (반복 재컴파일 후 VRAM 누수로 발생 가능)', 'err');
     console.error(e);
   }
   $('btnGen').disabled = false;
@@ -727,7 +915,7 @@ async function generate() {
     return fail('보안 컨텍스트가 아닙니다 (http + IP 접속). WebGPU는 HTTPS 또는 localhost에서만 동작합니다 — https 주소로 접속하세요.');
   if (!navigator.gpu)
     return fail('이 브라우저는 WebGPU를 지원하지 않습니다. 데스크톱 Chrome/Edge 최신 버전이 필요합니다.');
-  const adapter = await navigator.gpu.requestAdapter();
+  const adapter = await navigator.gpu.requestAdapter({ powerPreference: gpuPreference });
   if (!adapter) return fail('GPU 어댑터를 찾을 수 없습니다. GPU 드라이버를 확인하세요.');
   const f16 = adapter.features.has('shader-f16');
   if (!f16)
@@ -753,6 +941,109 @@ $('btnSave').onclick = () => {
   a.href = $('canvas').toDataURL('image/png');
   a.click();
 };
+
+// ── 멀티 LoRA UI ──
+function markLoraDirty() {
+  lora.dirty = true;
+  const btn = $('btnLoraApply');
+  btn.disabled = false;
+  btn.textContent = 'LoRA 반영 ●';
+  $('loraStat').textContent = '변경됨 — [LoRA 반영]을 눌러 적용';
+}
+
+function createLoraRow(item) {
+  const row = document.createElement('div');
+  row.dataset.loraId = item.id;
+  row.style.cssText = 'display:flex;gap:6px;align-items:center;margin-bottom:5px';
+  const file = document.createElement('input');
+  file.type = 'file'; file.accept = '.safetensors';
+  file.style.cssText = 'flex:1;min-width:0;font-size:12px';
+  file.onchange = async e => {
+    const f = e.target.files[0];
+    if (!f) return;
+    try {
+      log(`LoRA 읽는 중: ${f.name} (${(f.size / 2 ** 20).toFixed(0)}MB)`, 'dim');
+      // 파싱은 Worker가 수행 — 메인은 ArrayBuffer만 보관 (메인 스레드 비차단)
+      const buffer = await f.arrayBuffer();
+      item.src = { buffer }; item.fileName = f.name;
+      markLoraDirty();                          // 즉시 컴파일 안 함 — 대기
+    } catch (err) {
+      log('LoRA 로드 실패: ' + err.message, 'err');
+      item.src = null;
+    }
+  };
+  const wlabel = document.createElement('span');
+  wlabel.style.cssText = 'font-size:11px;color:var(--dim,#888);width:30px;text-align:right';
+  wlabel.textContent = item.weight.toFixed(2);
+  const w = document.createElement('input');
+  w.type = 'range'; w.min = '0'; w.max = '2'; w.step = '0.05'; w.value = item.weight;
+  w.style.cssText = 'width:90px';
+  w.oninput = () => { item.weight = +w.value; wlabel.textContent = item.weight.toFixed(2); };
+  w.onchange = () => {
+    if (!item.src) return;
+    // 단일 LoRA면 강도가 그래프 lora_scale로 가므로 재컴파일 불필요 — 다음 생성에 즉시 반영.
+    // 멀티면 SVD 병합에 강도가 들어가므로 재반영 필요.
+    if (lora.items.filter(i => i.src).length >= 2) markLoraDirty();
+  };
+  const del = document.createElement('button');
+  del.textContent = '×'; del.style.cssText = 'width:auto;padding:2px 9px;font-size:14px';
+  del.onclick = () => {
+    const had = !!item.src;
+    lora.items = lora.items.filter(x => x.id !== item.id);
+    row.remove();                               // 이 행만 제거 — 나머지 행은 그대로
+    if (had) markLoraDirty();
+  };
+  row.append(file, w, wlabel, del);
+  return row;
+}
+
+async function applyLora() {
+  const btn = $('btnLoraApply');
+  btn.disabled = true; btn.textContent = '반영 중...';
+  const genBtn = $('btnGen'), wasGenEnabled = !genBtn.disabled;
+  genBtn.disabled = true;                          // 병합·컴파일 중 생성 차단 (오류 방지)
+  $('loadBar').style.width = '0%';
+  const n = lora.items.filter(i => i.src).length;
+  $('loraStat').textContent = n ? `${n}개 LoRA 병합·컴파일...` : 'LoRA 해제·컴파일...';
+  try {
+    await reloadDit();                             // 한 번만 컴파일 (병합은 Worker)
+    lora.dirty = false;
+    if (!sess.dit) $('loraStat').textContent = '다음 모델 로드 때 적용됨';
+  } catch (e) {
+    log('LoRA 반영 실패: ' + e.message, 'err');
+    $('loraStat').textContent = 'LoRA 반영 실패';
+  } finally {
+    btn.textContent = lora.dirty ? 'LoRA 반영 ●' : 'LoRA 반영';
+    btn.disabled = !lora.dirty;
+    genBtn.disabled = sess.dit ? false : !wasGenEnabled;   // 세션 있으면 생성 복구
+    $('loadBar').style.width = '0%';
+  }
+}
+
+function addLoraRow() {
+  const item = { id: ++loraSeq, src: null, fileName: '', weight: 1.0 };
+  lora.items.push(item);
+  $('loraList').appendChild(createLoraRow(item));   // 새 행만 추가
+}
+
+$('customDitFiles').addEventListener('change', e => {
+  customFiles.clear();
+  for (const f of e.target.files) customFiles.set(f.name, f);
+  const onnx = [...customFiles.keys()].find(n => n.endsWith('.onnx') && !n.endsWith('.data'));
+  log(`사용자 파일 ${e.target.files.length}개 선택됨` + (onnx ? ` · DiT: ${onnx}` : ' · .onnx 없음!'),
+      onnx ? 'ok' : 'err');
+});
+$('gpuPref').addEventListener('change', e => {
+  gpuPreference = e.target.value;
+  log(`GPU 선호도: ${e.target.value} (다음 페이지 로드부터 적용)`, 'dim');
+});
+
+$('btnLoraAdd').addEventListener('click', addLoraRow);
+$('btnLoraApply').addEventListener('click', applyLora);
+addLoraRow();   // 기본 1줄
+
+$('negpipChk').addEventListener('change', updateModelUI);
+updateModelUI();
 </script>
 </body>
 </html>
