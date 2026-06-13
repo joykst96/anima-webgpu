@@ -32,7 +32,7 @@ import os
 import onnx
 from onnx import TensorProto, helper
 
-SCRIPT_VERSION = "v1"
+SCRIPT_VERSION = "v2 (fuse-meta)"
 
 # 식별 시 "투과"하는 노드 (값을 변형해도 attention 구조를 바꾸지 않는 것들)
 WEIGHT_MATMULS = {"MatMulNBits", "MatMul", "Gemm"}
@@ -137,12 +137,107 @@ def comes_from_softmax(tensor, producer, init_names, limit=4000):
     return False
 
 
+def identify_via_meta(graph, meta_path, init_names, init_shapes):
+    """fuse_meta.json 기반 cross v/k_proj 식별 (fuse된 그래프용).
+
+    fuse 후엔 Softmax가 MHA로 흡수돼 기존 앵커가 죽으므로, fuse_attention.py가
+    남긴 메타에서 cross attention의 v_proj/k_proj 노드명을 직접 읽는다.
+    반환: (v_nodes, k_nodes) — 둘 다 그래프 노드 객체 리스트. 없으면 (None, None).
+    """
+    import json
+    import os
+    if not os.path.exists(meta_path):
+        return None, None
+    try:
+        meta = json.load(open(meta_path))
+    except Exception as e:
+        print(f"[meta] 로드 실패 ({e}) — Softmax 앵커 폴백")
+        return None, None
+
+    byname = {n.name: n for n in graph.node}
+    cross = [a for a in meta.get("attentions", []) if a.get("kind") == "cross"]
+    if not cross:
+        print("[meta] cross attention 항목 없음 — 폴백")
+        return None, None
+
+    v_nodes, k_nodes, missing = [], [], []
+    for a in cross:
+        vn, kn = a.get("v_proj"), a.get("k_proj")
+        if vn in byname and kn in byname:
+            v_nodes.append(byname[vn])
+            k_nodes.append(byname[kn])
+        else:
+            missing.append((vn, kn))
+    if missing:
+        print(f"[meta] proj 노드 {len(missing)}개가 그래프에 없음 — 메타/그래프 불일치, 폴백")
+        return None, None
+
+    # 검증: v_proj가 K=ctx_dim 프로젝션인지(있으면). 메타 신뢰가 우선이라 경고만.
+    bad = 0
+    for n in v_nodes:
+        K, _ = get_kn(n, init_shapes)
+        if K is not None and K not in (1024,):   # Anima cross k/v는 K=1024
+            bad += 1
+    if bad:
+        print(f"[meta] (경고) v_proj 중 K≠1024 {bad}개 — 메타 확인 권장 (계속 진행)")
+    print(f"[meta] fuse_meta 기반 식별: cross v_proj {len(v_nodes)} / k_proj {len(k_nodes)}")
+    return v_nodes, k_nodes
+
+
+def identify_via_softmax(graph, init_names, init_shapes, ctx_input, ctx_dim):
+    """기존 Softmax 앵커 식별 (비-fuse 모델 폴백). 원본 로직 그대로.
+    반환: (v_nodes, k_nodes)."""
+    producer, consumers = build_maps(graph)
+
+    ctx_reach, frontier = set(), [ctx_input]
+    while frontier:
+        t = frontier.pop()
+        if t in ctx_reach:
+            continue
+        ctx_reach.add(t)
+        for c in consumers.get(t, []):
+            if c.op_type == "MatMulNBits" or is_weight_matmul(c, init_names):
+                continue
+            frontier.extend(c.output)
+
+    cands = []
+    for n in graph.node:
+        if not is_weight_matmul(n, init_names):
+            continue
+        if n.input[0] not in ctx_reach:
+            continue
+        K, N = get_kn(n, init_shapes)
+        if K == ctx_dim:
+            cands.append(n)
+    print(f"[anchor] context 소비 K={ctx_dim} 프로젝션: {len(cands)}개")
+    assert cands and len(cands) % 2 == 0, \
+        "cross k/v 후보 수가 짝수가 아님 — 그래프 구조 확인 필요"
+
+    k_nodes, v_nodes, unknown = [], [], []
+    for n in cands:
+        hits = forward_first_matmuls(n, consumers, init_names)
+        is_v = any(comes_from_softmax(mm.input[1 - idx], producer, init_names)
+                   for mm, idx in hits)
+        is_k = (not is_v) and any(reaches_softmax_forward(mm, consumers, init_names)
+                                  for mm, _ in hits)
+        (v_nodes if is_v else k_nodes if is_k else unknown).append(n)
+
+    print(f"[classify] v_proj {len(v_nodes)} / k_proj {len(k_nodes)} / 불명 {len(unknown)}")
+    assert not unknown, f"분류 불가 노드 {len(unknown)}개 — 수동 확인 필요"
+    assert len(v_nodes) == len(k_nodes), "k/v 개수 불일치 — 분류 오류 의심"
+    return v_nodes, k_nodes
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--src", required=True, help="양자화된 DiT .onnx")
     p.add_argument("--out", required=True, help="출력 .onnx (새 파일명 — immutable 캐시)")
     p.add_argument("--context-input", default="context")
     p.add_argument("--mask-name", default="negpip_mask")
+    p.add_argument("--fuse-meta", default=None, dest="fuse_meta",
+                   help="fuse_attention.py가 남긴 .fuse_meta.json 경로. "
+                        "기본: <src>.fuse_meta.json. 있으면 메타 기반 식별, "
+                        "없으면 Softmax 앵커 폴백(비-fuse 모델).")
     args = p.parse_args()
 
     print(f"[add_negpip {SCRIPT_VERSION}]")
@@ -164,44 +259,20 @@ def main():
           f"dtype={TensorProto.DataType.Name(ctx_dtype)}")
 
     # context에서 전방 도달 가능한 텐서 집합 (프로젝션 투과 안 함)
-    ctx_reach, frontier = set(), [args.context_input]
-    while frontier:
-        t = frontier.pop()
-        if t in ctx_reach:
-            continue
-        ctx_reach.add(t)
-        for c in consumers.get(t, []):
-            if c.op_type == "MatMulNBits" or is_weight_matmul(c, init_names):
-                continue
-            frontier.extend(c.output)
-
-    # 앵커: context를 직접 소비하는 K=ctx_dim 프로젝션
-    cands = []
-    for n in graph.node:
-        if not is_weight_matmul(n, init_names):
-            continue
-        if n.input[0] not in ctx_reach:
-            continue
-        K, N = get_kn(n, init_shapes)
-        if K == ctx_dim:
-            cands.append(n)
-    print(f"[anchor] context 소비 K={ctx_dim} 프로젝션: {len(cands)}개")
-    assert cands and len(cands) % 2 == 0, "cross k/v 후보 수가 짝수가 아님 — 그래프 구조 확인 필요"
-
-    k_nodes, v_nodes, unknown = [], [], []
-    for n in cands:
-        hits = forward_first_matmuls(n, consumers, init_names)
-        is_v = any(comes_from_softmax(mm.input[1 - idx], producer, init_names)
-                   for mm, idx in hits)
-        is_k = (not is_v) and any(reaches_softmax_forward(mm, consumers, init_names)
-                                  for mm, _ in hits)
-        (v_nodes if is_v else k_nodes if is_k else unknown).append(n)
-
-    print(f"[classify] v_proj {len(v_nodes)} / k_proj {len(k_nodes)} / 불명 {len(unknown)}")
-    assert not unknown, f"분류 불가 노드 {len(unknown)}개 — 수동 확인 필요"
-    assert len(v_nodes) == len(k_nodes), "k/v 개수 불일치 — 분류 오류 의심"
+    # ── 식별: 메타 우선, 실패 시 Softmax 앵커 폴백 ──
+    meta_path = args.fuse_meta or (args.src + ".fuse_meta.json")
+    v_nodes, k_nodes = identify_via_meta(graph, meta_path, init_names, init_shapes)
+    if v_nodes is None:
+        print("[identify] 메타 없음/불일치 → Softmax 앵커 폴백 (비-fuse 모델 경로)")
+        v_nodes, k_nodes = identify_via_softmax(
+            graph, init_names, init_shapes, args.context_input, ctx_dim)
+    else:
+        print("[identify] 메타 기반 식별 사용 (fuse된 모델)")
+    assert len(v_nodes) == len(k_nodes), "k/v 개수 불일치"
 
     # ── 삽입 ──
+    # (producer 맵은 위 build_maps(graph)에서 이미 생성됨 — act_dtype이 사용)
+
     # 새 입력 negpip_mask (context와 동일 dtype)
     mask_in = helper.make_tensor_value_info(
         args.mask_name, ctx_dtype, [1, ctx_len, 1])

@@ -41,7 +41,7 @@ import shutil
 import onnx
 from onnx import TensorProto, helper
 
-SCRIPT_VERSION = "v1"
+SCRIPT_VERSION = "v2 (fuse-meta)"
 WEIGHT_MATMULS = {"MatMulNBits", "MatMul", "Gemm"}
 
 # 블록당 모듈의 정규 순서 (manifest/lora.bin 레이아웃 기준)
@@ -135,7 +135,49 @@ def reachable_fwd(start_tensors, consumers, init_names):
 
 # ───────────────────────── 모듈 식별 ─────────────────────────
 
-def identify_modules(graph, ctx_input="context"):
+def _groups_from_meta(graph, meta_path, init_names, init_shapes, node_idx):
+    """fuse_meta.json 기반 attention 그룹 구성 (fuse된 그래프용).
+
+    fuse 후 Softmax가 MHA로 흡수돼 앵커가 죽으므로 메타에서 q/k/v/o proj 노드명을
+    직접 읽는다. 메타 attentions 배열은 self0..N-1, cross0..N-1 순서(fuse_attention.py)
+    이며 같은 kind 내 인덱스가 곧 블록 순서(검증됨). 반환: groups 리스트 또는 None.
+    각 group = dict(cross, q, k, v, o, pos) — 하위 코드(adaln/mlp/mapping)와 동일 계약.
+    """
+    import json
+    import os
+    if not os.path.exists(meta_path):
+        return None
+    try:
+        meta = json.load(open(meta_path))
+    except Exception as e:
+        print(f"[meta] 로드 실패 ({e}) — Softmax 앵커 폴백")
+        return None
+    attns = meta.get("attentions", [])
+    if not attns:
+        print("[meta] attentions 비어있음 — 폴백")
+        return None
+
+    byname = {n.name: n for n in graph.node}
+    groups, missing = [], []
+    for a in attns:
+        try:
+            q, k, v, o = (byname[a["q_proj"]], byname[a["k_proj"]],
+                          byname[a["v_proj"]], byname[a["o_proj"]])
+        except KeyError:
+            missing.append(a.get("mha"))
+            continue
+        groups.append(dict(cross=(a["kind"] == "cross"), q=q, k=k, v=v, o=o,
+                           pos=node_idx[id(q)]))
+    if missing:
+        print(f"[meta] proj 노드 {len(missing)}개 그래프에 없음 — 메타/그래프 불일치, 폴백")
+        return None
+    n_self = sum(1 for g in groups if not g["cross"])
+    n_cross = sum(1 for g in groups if g["cross"])
+    print(f"[meta] fuse_meta 기반 attention: self {n_self} / cross {n_cross}")
+    return groups
+
+
+def identify_modules(graph, ctx_input="context", fuse_meta=None):
     init_names = {i.name for i in graph.initializer}
     init_names |= {n.output[0] for n in graph.node if n.op_type == "Constant"}
     init_shapes = {i.name: tuple(i.dims) for i in graph.initializer}
@@ -143,62 +185,69 @@ def identify_modules(graph, ctx_input="context"):
     node_idx = {id(n): i for i, n in enumerate(graph.node)}
     ctx_reach = reachable_fwd([ctx_input], consumers, init_names)
 
-    # ── attention 그룹 (Softmax 앵커) ──
-    groups = []
-    for sm in graph.node:
-        if sm.op_type != "Softmax":
-            continue
-        # PV: softmax 출력을 (투과 경유) 소비하는 활성×활성 MatMul
-        pv = None
-        frontier, seen = list(sm.output), set()
-        while frontier and pv is None:
-            t = frontier.pop()
-            for c in consumers.get(t, []):
-                if id(c) in seen:
-                    continue
-                seen.add(id(c))
-                if c.op_type in ("MatMul", "Gemm") and not is_weight_matmul(c, init_names):
-                    pv = (c, t)
-                    break
-                if not is_weight_matmul(c, init_names):
-                    frontier.extend(c.output)
-        if pv is None:
-            continue
-        pv_node, sm_side = pv
-        v_side = [i for i in pv_node.input if i != sm_side]
-        v_node = back_first_projection(v_side[0], producer, init_names) if v_side else None
+    # ── attention 그룹: 메타 우선, 실패 시 Softmax 앵커 폴백 ──
+    groups = _groups_from_meta(graph, fuse_meta, init_names, init_shapes, node_idx) \
+        if fuse_meta else None
+    if groups is not None:
+        print("[identify] 메타 기반 attention 식별 (fuse된 모델)")
+    else:
+        if fuse_meta:
+            print("[identify] 메타 없음/불일치 → Softmax 앵커 폴백")
+        groups = []
+        for sm in graph.node:
+            if sm.op_type != "Softmax":
+                continue
+            # PV: softmax 출력을 (투과 경유) 소비하는 활성×활성 MatMul
+            pv = None
+            frontier, seen = list(sm.output), set()
+            while frontier and pv is None:
+                t = frontier.pop()
+                for c in consumers.get(t, []):
+                    if id(c) in seen:
+                        continue
+                    seen.add(id(c))
+                    if c.op_type in ("MatMul", "Gemm") and not is_weight_matmul(c, init_names):
+                        pv = (c, t)
+                        break
+                    if not is_weight_matmul(c, init_names):
+                        frontier.extend(c.output)
+            if pv is None:
+                continue
+            pv_node, sm_side = pv
+            v_side = [i for i in pv_node.input if i != sm_side]
+            v_node = back_first_projection(v_side[0], producer, init_names) if v_side else None
 
-        # QK: softmax 입력 후방의 활성×활성 MatMul
-        qk = None
-        frontier, seen = list(sm.input), set()
-        while frontier and qk is None:
-            t = frontier.pop()
-            p = producer.get(t)
-            if p is None or id(p) in seen:
+            # QK: softmax 입력 후방의 활성×활성 MatMul
+            qk = None
+            frontier, seen = list(sm.input), set()
+            while frontier and qk is None:
+                t = frontier.pop()
+                p = producer.get(t)
+                if p is None or id(p) in seen:
+                    continue
+                seen.add(id(p))
+                if p.op_type in ("MatMul", "Gemm") and not is_weight_matmul(p, init_names):
+                    qk = p
+                    continue
+                if not is_weight_matmul(p, init_names):
+                    frontier.extend(p.input)
+            if qk is None or v_node is None:
                 continue
-            seen.add(id(p))
-            if p.op_type in ("MatMul", "Gemm") and not is_weight_matmul(p, init_names):
-                qk = p
+            pa = back_first_projection(qk.input[0], producer, init_names)
+            pb = back_first_projection(qk.input[1], producer, init_names)
+            if pa is None or pb is None:
                 continue
-            if not is_weight_matmul(p, init_names):
-                frontier.extend(p.input)
-        if qk is None or v_node is None:
-            continue
-        pa = back_first_projection(qk.input[0], producer, init_names)
-        pb = back_first_projection(qk.input[1], producer, init_names)
-        if pa is None or pb is None:
-            continue
-        o_node = fwd_first_weight_matmul(pv_node, consumers, init_names)
-        is_cross = v_node.input[0] in ctx_reach
-        if is_cross:
-            # q = context 미도달 측, k = 도달 측
-            q_node = pa if pa.input[0] not in ctx_reach else pb
-            k_node = pb if q_node is pa else pa
-        else:
-            # self: 소스 코드 순서 q → k (predict2.py 확인)
-            q_node, k_node = sorted([pa, pb], key=lambda n: node_idx[id(n)])
-        groups.append(dict(cross=is_cross, q=q_node, k=k_node, v=v_node, o=o_node,
-                           pos=node_idx[id(q_node)]))
+            o_node = fwd_first_weight_matmul(pv_node, consumers, init_names)
+            is_cross = v_node.input[0] in ctx_reach
+            if is_cross:
+                # q = context 미도달 측, k = 도달 측
+                q_node = pa if pa.input[0] not in ctx_reach else pb
+                k_node = pb if q_node is pa else pa
+            else:
+                # self: 소스 코드 순서 q → k (predict2.py 확인)
+                q_node, k_node = sorted([pa, pb], key=lambda n: node_idx[id(n)])
+            groups.append(dict(cross=is_cross, q=q_node, k=k_node, v=v_node, o=o_node,
+                               pos=node_idx[id(q_node)]))
 
     self_g = sorted([g for g in groups if not g["cross"]], key=lambda g: g["pos"])
     cross_g = sorted([g for g in groups if g["cross"]], key=lambda g: g["pos"])
@@ -282,6 +331,11 @@ def main():
     p.add_argument("--lora-bin", default=None,
                    help="lora.bin 파일명 (기본: <out 베이스>.lora.bin)")
     p.add_argument("--dump", action="store_true", help="식별 결과 전체 출력")
+    p.add_argument("--fuse-meta", default=None, dest="fuse_meta",
+                   help="fuse_attention.py가 남긴 .fuse_meta.json 경로. "
+                        "shard 후엔 파일명이 src와 달라 자동탐지 불가 → 명시 필요. "
+                        "예: out\\dit\\anima_dit_dyn32_q8a4f.onnx.fuse_meta.json. "
+                        "있으면 메타 기반 attention 식별, 없으면 Softmax 앵커 폴백.")
     args = p.parse_args()
 
     lora_bin = args.lora_bin or (os.path.splitext(os.path.basename(args.out))[0] + ".lora.bin")
@@ -290,7 +344,7 @@ def main():
     # graph-only 편집: external data를 메모리에 올리지 않음
     model = onnx.load(args.src, load_external_data=False)
     graph = model.graph
-    mapping, nb, init_shapes = identify_modules(graph)
+    mapping, nb, init_shapes = identify_modules(graph, fuse_meta=args.fuse_meta)
 
     producer, consumers = build_maps(graph)
     init_names = {i.name for i in graph.initializer}
