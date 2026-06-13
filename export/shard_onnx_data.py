@@ -9,7 +9,7 @@ ONNX 모델의 가중치를 N개의 샤드 파일로 분할.
 웹페이지(index.html)는 manifest를 자동 감지해서 샤드들을 모아 로드한다.
 
 사용 예:
-  python export/shard_onnx_data.py ^
+  python_embeded\\python.exe anima-onnx-export\\shard_onnx_data.py ^
     --src out\\dit\\anima_dit_dyn32_q8.onnx ^
     --out out\\dit\\anima_dit_dyn32_q8s.onnx --shard-mb 480
 """

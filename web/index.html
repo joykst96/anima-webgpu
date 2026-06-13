@@ -163,12 +163,15 @@ import { AutoTokenizer, env as hfEnv } from 'https://cdn.jsdelivr.net/npm/@huggi
 //   → DP4A MatMulNBits / FlashAttention 커널은 이 빌드에만 존재 (인수인계 사실 10, 14).
 // 미지원: 기존 JSEP 빌드 폴백 (동작 동일, 최적화 커널 없음).
 // EP 교체기라 latest 추적은 회귀 위험 → 버전 고정 (인수인계 '기타' 항목).
-const ORT_VER  = '1.26.0';
+const ORT_VER  = '1.26.0';                            // 안정버전 원복 (1.26 FA 검증용)
 const ORT_BASE = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_VER}/dist/`;
 const HAS_JSPI = typeof WebAssembly.Suspending === 'function';
 const ort = await import(ORT_BASE +
   (HAS_JSPI ? 'ort.jspi.bundle.min.mjs' : 'ort.webgpu.min.mjs'));
 ort.env.wasm.wasmPaths = ORT_BASE;
+window.ort = ort;                                 // 콘솔 디버깅용 노출 (FA 발동 확인)
+ort.env.wasm.proxy = false;                       // proxy worker 끔 → profiling 로그가 메인 콘솔로
+ort.env.webgpu.profiling = { mode: 'default' };   // 커널별 실행시간 콘솔 출력
 hfEnv.allowLocalModels = true;
 hfEnv.localModelPath = 'tokenizers/';   // prepare_tokenizers.py 산출물 위치
 
@@ -491,6 +494,7 @@ async function readFileBytes(file) { return new Uint8Array(await file.arrayBuffe
 
 async function loadSession(name, url, onProgress) {
   const opts = { executionProviders: ['webgpu'] };
+  if (name.startsWith('dit:')) opts.enableProfiling = true;   // FA 발동 확인용 커널 프로파일
 
   // 0) 사용자설정: 메모리 파일맵에서 직접 조립 (네트워크/OPFS 미사용)
   if (url === null && name.startsWith('dit:')) {
@@ -874,6 +878,12 @@ async function generate() {
 
     const sampler = $('sampler').value === 'er_sde' ? sampleErSde : sampleEuler;
     const xf = await sampler(denoise, x, sigmas, rand, onStep);
+
+    // ── FA 발동 확인: DiT 커널 프로파일 덤프 ──
+    try {
+      const prof = sess.dit.endProfiling && sess.dit.endProfiling();
+      console.log('[PROFILE] endProfiling 반환:', prof);
+    } catch (e) { console.warn('[PROFILE] endProfiling 실패', e); }
 
     log('VAE 디코드...', 'dim');
     const vo = await sess.vae.run({

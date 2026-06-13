@@ -10,7 +10,7 @@
 저장하므로, 웹에서도 flan-t5 대체품 대신 원본 토크나이저를 쓰게 됨.
 
 사용 예 (portable 루트에서):
-  python export/prepare_tokenizers.py --out tokenizers
+  python_embeded\\python.exe anima-onnx-export\\prepare_tokenizers.py --out tokenizers
 """
 import argparse
 import json

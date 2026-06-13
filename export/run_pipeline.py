@@ -7,7 +7,7 @@ End-to-end 검증: export된 ONNX 4종(Qwen3 인코더, LLMAdapter, DiT, VAE 디
 Anima 권장: er_sde + simple + 30스텝 (Turbo 머지본이면 euler + 8~12스텝 + cfg 1)
 
 사용 예 (ComfyUI portable 루트에서):
-  python export/run_pipeline.py ^
+  python_embeded\\python.exe anima-onnx-export\\run_pipeline.py ^
     --dit out\\dit\\anima_dit_1024.onnx ^
     --adapter out\\adapter\\anima_llm_adapter.onnx ^
     --te out\\text_encoder\\qwen3_06b.onnx ^
