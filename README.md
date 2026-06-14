@@ -16,8 +16,11 @@ This repo contains the full pipeline: PyTorch/ComfyUI → ONNX export scripts, w
 - OPFS caching: first visit downloads, later visits load from disk in seconds.
 - Two model variants in one page: base (er_sde · 30 steps · CFG 5) and Turbo-LoRA-merged (euler · 8 steps · CFG 1), plus a **Custom** option to load your own ONNX DiT directly from disk (mobile-friendly, no OPFS needed).
 - **Native WebGPU EP (JSPI build)** with DP4A int8 matmul (`accuracy_level=4`) — roughly 2× faster sampling than the JSEP build, with automatic fallback on older browsers.
+- **FlashAttention fusion (DiT)**: decomposed SDPA is fused into `com.microsoft.MultiHeadAttention` to trigger the JSPI EP's FA2 kernel. The attention score matrix is no longer materialized whole (O(S²)→O(S)), so resident VRAM drops by about half and above-1024 resolutions clear the DiT stage that previously OOM'd.
+- **VAE chunked attention**: the VAE decoder's mid-block self-attention is split along the query-token axis into 8 chunks, capping the score buffer at 1/8 (numerically identical). This fixes the OOM where the VAE hit the 2 GB single-buffer limit at high resolutions — **generation up to 1536² in the browser**.
 - **Runtime LoRA**: drop in any Anima `.safetensors` LoRA (kohya or `diffusion_model.` formats) with per-LoRA strength; multiple LoRAs are merged exactly via ΔW + SVD in a Web Worker (UI never blocks). No re-export.
 - **Prompt weighting** `(tag:1.2)` and **NegPip** (negative prompts under CFG=1 / Turbo), both faithful to ComfyUI.
+- **Result thumbnail stack**: each generation pushes a thumbnail into the result panel (session memory); click one to restore it to the canvas at full size — each kept with its own resolution.
 
 ## How it works
 
@@ -25,8 +28,8 @@ This repo contains the full pipeline: PyTorch/ComfyUI → ONNX export scripts, w
 |---|---|---|---|
 | Text encoding | Qwen3-0.6B-Base | ONNX fp16 | last hidden states |
 | Context adapter | Anima LLMAdapter | ONNX fp16 | dual tokenization: Qwen3 ids → hidden states, T5 ids → adapter queries; output zero-padded to 512×1024 |
-| Denoiser | Anima DiT 2B (Cosmos-Predict2) | ONNX, int8 weights (`accuracy_level=4` for DP4A) / fp32 activations, fp16 I/O | dynamic H/W axes, RoPE in-graph; optional NegPip + LoRA-slot inputs |
-| Decode | Qwen-Image (Wan 2.1) VAE decoder | ONNX fp32 | CausalConv3d folded to 2D for T=1 (Conv2d kernel path); Wan21 de-normalization baked in |
+| Denoiser | Anima DiT 2B (Cosmos-Predict2) | ONNX, int8 weights (`accuracy_level=4` for DP4A) / fp32 activations, fp16 I/O | dynamic H/W axes, RoPE in-graph; self/cross attention fused into `MultiHeadAttention` (FA2); optional NegPip + LoRA-slot inputs |
+| Decode | Qwen-Image (Wan 2.1) VAE decoder | ONNX fp32 | CausalConv3d folded to 2D for T=1 (Conv2d kernel path); Wan21 de-normalization baked in; mid-block attention split into 8 query-axis chunks to cap the score buffer |
 
 The sampler (Euler / ER-SDE-Solver) and σ schedule run in plain JavaScript; each step calls the DiT session once (CFG 1) or twice (CFG > 1).
 
@@ -66,29 +69,46 @@ python export/export_vae_decoder.py --comfyui /path/to/ComfyUI \
 
 Notes: `--size 512` on the VAE only sets the trace size (the graph is dynamic); fp32 VAE traced at 1024 can OOM a 16 GB card. `export_dit.py --verify` additionally runs an ONNX-vs-PyTorch comparison at two resolutions.
 
+**VAE attention chunk (high-resolution OOM fix)** — the Wan VAE decoder has a full-latent-resolution self-attention in its mid block, so the score matrix `(1,1,S,S)` reaches ~2.4 GB at 1280² (S=25600), past the browser's 2 GB single-buffer limit → OOM. `chunk_vae_attention.py` unrolls that SDPA into N query-token chunks (default 8) so each chunk builds only a partial score (softmax is row-wise, so this is **numerically identical**). K and V are shared. At 1536² (S=36864) each chunk's score is ~0.68 GB and clears.
+
+```bash
+python export/chunk_vae_attention.py \
+  --src out/vae/qwen_image_vae_decoder_dyn32_2d.onnx \
+  --out out/vae/qwen_image_vae_decoder_dyn32_2dc.onnx --chunks 8
+```
+
+> Note: fusing the VAE attention into `MultiHeadAttention` is a dead end — head_dim 384 exceeds the WebGPU FA2 kernel's workgroup-storage limit (32 KB; it needs 48 KB) and the shader fails to compile. Splitting the single head into multiple heads changes the math, so the score chunk is the correct route — plain MatMul+Softmax, no head_dim constraint.
+
 ## 2. Quantize, add features & shard the DiT
 
-The full DiT pipeline is: **quantize → NegPip → shard → LoRA slots**. NegPip must precede sharding (it edits the graph); LoRA slots are added *after* sharding (graph-only, reuses the same shards).
+The full DiT pipeline is: **quantize → FlashAttention fusion → NegPip → shard → LoRA slots**. Fusion runs right after quantization (before NegPip rewires v_proj); NegPip must precede sharding (it edits the graph); LoRA slots are added *after* sharding (graph-only, reuses the same shards). Because fusion absorbs the attention Softmax anchor, NegPip and LoRA slots identify attention from the `.fuse_meta.json` (q/k/v/o proj node names) that fusion emits (`--fuse-meta`), falling back to the old Softmax anchor when no meta is present.
 
 ```bash
 # int8 weight-only + accuracy_level=4 (enables the DP4A integer kernel → ~2× sampling)
 python export/quantize_dit.py --src out/dit/anima_dit_dyn32.onnx \
   --out out/dit/anima_dit_dyn32_q8a4.onnx --bits 8 --no-exclude --accuracy-level 4
 
-# NegPip: adds a negpip_mask input, rewires cross-attn v_proj (mask=1 ⇒ identical output)
-python export/add_negpip.py --src out/dit/anima_dit_dyn32_q8a4.onnx \
-  --out out/dit/anima_dit_dyn32_q8a4n.onnx
+# FlashAttention fusion: decomposed SDPA → com.microsoft.MultiHeadAttention. Emits .fuse_meta.json.
+python export/fuse_attention.py --src out/dit/anima_dit_dyn32_q8a4.onnx \
+  --out out/dit/anima_dit_dyn32_q8a4f.onnx
+
+# NegPip: adds a negpip_mask input, rewires cross-attn v_proj (mask=1 ⇒ identical output).
+#   Uses fuse_meta if present beside the source, else falls back to the Softmax anchor.
+python export/add_negpip.py --src out/dit/anima_dit_dyn32_q8a4f.onnx \
+  --out out/dit/anima_dit_dyn32_q8a4fn.onnx
 
 # shard weights into CDN/browser-friendly files
-python export/shard_onnx_data.py --src out/dit/anima_dit_dyn32_q8a4n.onnx \
-  --out out/dit/anima_dit_dyn32_q8a4ns.onnx --shard-mb 480
+python export/shard_onnx_data.py --src out/dit/anima_dit_dyn32_q8a4fn.onnx \
+  --out out/dit/anima_dit_dyn32_q8a4fns.onnx --shard-mb 400
 
 # LoRA slots: low-rank side-branches (rank 48) for runtime LoRA. Output reuses the shards above.
-python export/add_lora_slots.py --src out/dit/anima_dit_dyn32_q8a4ns.onnx \
-  --out out/dit/anima_dit_dyn32_q8a4nLs.onnx --rank 48
+#   Sharding changes the filename, so pass the fuse_meta path explicitly.
+python export/add_lora_slots.py --src out/dit/anima_dit_dyn32_q8a4fns.onnx \
+  --out out/dit/anima_dit_dyn32_q8a4fnLs.onnx --rank 48 \
+  --fuse-meta out/dit/anima_dit_dyn32_q8a4f.onnx.fuse_meta.json
 ```
 
-Keep **both** the non-slot (`q8a4ns`) and slot (`q8a4nLs`) graphs on the server: the page serves the faster non-slot graph when no LoRA is active and only switches to the slot graph (same shards, no extra download) when a LoRA is applied. Repeat the whole chain for the Turbo export.
+Keep **both** the non-slot (`q8a4fns`) and slot (`q8a4fnLs`) graphs on the server: the page serves the faster non-slot graph when no LoRA is active and only switches to the slot graph (same shards, no extra download) when a LoRA is applied. Repeat the whole chain for the Turbo export.
 
 Quantization alone (legacy / minimal):
 
@@ -136,12 +156,12 @@ Web-root layout:
 index.html
 tokenizers/{qwen3,t5}/
 out/
-├── dit/           per variant: *_q8a4ns.onnx (non-slot) and *_q8a4nLs.onnx (LoRA slots),
+├── dit/           per variant: *_q8a4fns.onnx (non-slot) and *_q8a4fnLs.onnx (LoRA slots),
 │                 each with .bin shards + .onnx.manifest.json; slot graphs also have
 │                 .onnx.lora_manifest.json. Shards are shared between the two graphs.
 ├── adapter/       anima_llm_adapter.onnx (+ .data)
 ├── text_encoder/  qwen3_06b_s.onnx + shards + manifest
-└── vae/           qwen_image_vae_decoder_dyn32_2d.onnx (+ .data)
+└── vae/           qwen_image_vae_decoder_dyn32_2dc.onnx (+ .data)
 ```
 
 Edit the `PATHS` / `MODELS` constants at the top of `web/index.html` if your filenames differ. Do **not** leave un-quantized source models in the web root.
@@ -154,6 +174,7 @@ A ready-to-run static server is in `deploy/` (`docker compose up -d`; nginx with
 - **NegPip** — under CFG=1 (Turbo), negative prompts are normally ignored. Check the NegPip box and the negative prompt is folded in as a negative-weight group; the slot model's `negpip_mask` flips the sign of those tokens' cross-attn values so the concept is subtracted. Requires a DiT built with `add_negpip.py`.
 - **Runtime LoRA** — add one or more `.safetensors` LoRAs with independent strengths, then press **Apply LoRA** (deferred so N LoRAs compile once, not N times). Conversion (safetensors parse + multi-LoRA ΔW/SVD merge) runs in a Web Worker with a progress bar; generation is disabled until it finishes. With a **single** LoRA the strength is a live graph input (`lora_scale`), so the slider takes effect on the next generation with no recompile; with **multiple** LoRAs the strength is baked into the SVD merge, so changing it re-runs the merge. Either way the graph stays rank-48. Unsupported keys (text-encoder LoRAs, LoKr) and out-of-slot modules are reported, not silently dropped. Requires a slot model from `add_lora_slots.py`.
 - **Custom model** — the *Custom* dropdown loads a DiT (`.onnx` + shards + manifests) you pick from disk, straight into memory (no OPFS, works on mobile). TE/adapter/VAE use the default paths.
+- **Result thumbnail stack** — each generation pushes a thumbnail into the result panel (session memory, cleared on refresh); click one to restore that image to the canvas at full size. Each entry keeps its own resolution snapshot, so mixed resolutions restore correctly. **Save PNG** acts on the current canvas (= last clicked/generated).
 - **GPU preference** — high-performance / low-power / default maps to WebGPU's `powerPreference` (the spec has no direct GPU-index selection); applied on page (re)load.
 
 ## Implementation notes (for porting elsewhere)
@@ -180,10 +201,13 @@ Hard-won facts about Anima's inference contract, verified against ComfyUI source
 9. **DP4A needs `accuracy_level=4`** as a node attribute (set by `quantize_dit.py --accuracy-level 4`), plus `K%128==0 && N%16==0 && block_size%32==0`. It dynamically int8-quantizes activations — a *different* accuracy trade-off from weight quantization, so verify image quality in the browser (the CPU EP used by `run_pipeline.py` never takes this path).
 10. **VAE `CausalConv3d` is fp32-only and rank-5** — ORT runs it on a slow naive conv3d kernel. For single images (T=1) it's mathematically identical to a 2D conv on the last time-tap; `export_vae_decoder.py` materializes 4D weights so the Conv2d kernel runs instead (folds the per-step decode to near-instant). Not valid for video (T>1).
 11. **RoPE uses `max(H, W, T)`** internally, a Python `int` comparison that the dynamo exporter freezes at trace time — so the traced H/W ordering bakes in and **landscape (W>H) resolutions fail with a Reshape error** while square/portrait pass. A non-square trace does *not* fix it (dynamo still won't split the symbols); `patch_comfy_for_export` in `common.py` monkeypatches the RoPE embedding to use independent per-axis `arange` (numerically identical). `export_dit.py --verify` now checks landscape cases.
+12. **The VAE decoder's mid-block attention is the high-resolution OOM culprit.** Its score matrix `(1,1,S,S)` is a single buffer at full latent resolution (S=16384 at 1024², 25600 at 1280²), hitting ~2.4 GB at 1280² — past the 2 GB limit. `MultiHeadAttention` fusion fails to compile because head_dim 384 exceeds the WebGPU FA2 workgroup limit (32 KB), and splitting the single head changes the math. The fix is a query-token chunk (`chunk_vae_attention.py`) — numerically identical since softmax is row-wise, while cutting the score buffer to 1/N. The page only generates up to 1536² and uses N=8.
 
 ## Performance (reference)
 
-On an RTX 5070 Ti, 1024×1024, with the JSPI build + DP4A + 2D VAE: **Turbo ≈ 11 s** (8 steps, CFG 1), **base ≈ 70 s** (30 steps, CFG 5 → 60 DiT passes) — roughly 3× slower than local ComfyUI (down from ~10×). DP4A roughly halves sampling time; folding the VAE to 2D made decode effectively instant. WebGPU still lacks fused attention in the kernels this graph triggers, so a gap vs native CUDA remains (the planned attention-fusion track targets this). Applying a LoRA adds ~9 s from the extra slot dispatches. The first generation at any new resolution is slower (shader specialization), then cached.
+On an RTX 5070 Ti, 1024×1024, with the JSPI build + DP4A + 2D VAE: **Turbo ≈ 11 s** (8 steps, CFG 1), **base ≈ 70 s** (30 steps, CFG 5 → 60 DiT passes) — roughly 3× slower than local ComfyUI (down from ~10×). DP4A roughly halves sampling time; folding the VAE to 2D made decode effectively instant. Applying a LoRA adds ~9 s from the extra slot dispatches. The first generation at any new resolution is slower (shader specialization), then cached.
+
+**The measured value of DiT FlashAttention fusion was memory, not speed.** Within the current resolution range total time is roughly flat (±a few seconds), but no longer materializing the score matrix halves resident DiT VRAM and lets above-1024 resolutions clear the DiT stage that OOM'd when unfused. With **VAE chunked attention** on top, the last bottleneck — the VAE's single-buffer score OOM at high resolution — is gone too: on an RTX 5070 Ti, **1280² ≈ 29 s and 1536² ≈ 58 s**.
 
 > Note: re-compiling the DiT repeatedly (e.g. toggling LoRAs many times) can leak GPU memory in current ORT Web until a page refresh — a known upstream issue. The page minimizes recompiles (deferred LoRA apply, single-resident sessions) to avoid it in normal use.
 

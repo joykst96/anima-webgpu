@@ -16,8 +16,11 @@
 - OPFS 캐싱: 첫 방문만 다운로드, 재방문은 디스크에서 수 초 내 로드.
 - 한 페이지에서 두 모델 변형 선택: 베이스(er_sde · 30스텝 · CFG 5), Turbo LoRA 머지본(euler · 8스텝 · CFG 1). 추가로 **사용자 설정** 옵션으로 자신의 ONNX DiT를 디스크에서 직접 로드 (모바일 친화적, OPFS 불필요).
 - **네이티브 WebGPU EP (JSPI 빌드)** + DP4A int8 matmul(`accuracy_level=4`) — JSEP 빌드 대비 샘플러 약 2배 빠름, 구형 브라우저는 자동 폴백.
+- **FlashAttention 융합 (DiT)**: 분해된 SDPA를 `com.microsoft.MultiHeadAttention`으로 묶어 JSPI EP의 FA2 커널을 발동. attention score 행렬을 통째로 들지 않게 되어(O(S²)→O(S)) VRAM 상주 사용량이 절반으로 떨어지고, 1024 버킷 초과 해상도가 DiT 단계에서 통과합니다.
+- **VAE chunked attention**: VAE 디코더의 mid-block self-attention을 쿼리 토큰축으로 8분할해 score 단일 버퍼를 1/8로 제한(수치 동치). 고해상도(예 1280²·1536²)에서 VAE가 2 GB 단일 버퍼 한계로 OOM 나던 문제를 해소 — **1536²까지 브라우저에서 생성**.
 - **런타임 LoRA**: 아무 Anima `.safetensors` LoRA(kohya 또는 `diffusion_model.` 포맷)를 강도와 함께 장착. 여러 개는 ΔW + SVD로 정확히 병합(Web Worker에서 — UI 안 멈춤). 재export 불필요.
 - **프롬프트 가중치** `(태그:1.2)`와 **NegPip**(CFG=1/터보에서 부정 프롬프트), 둘 다 ComfyUI 충실 구현.
+- **생성 결과 썸네일 스택**: 생성할 때마다 결과 패널에 썸네일이 쌓이고(세션 메모리), 클릭하면 캔버스에 다시 크게 표시 — 해상도별로 독립 보관.
 
 ## 동작 구조
 
@@ -25,8 +28,8 @@
 |---|---|---|---|
 | 텍스트 인코딩 | Qwen3-0.6B-Base | ONNX fp16 | last hidden states |
 | 컨텍스트 어댑터 | Anima LLMAdapter | ONNX fp16 | **이중 토큰화**: Qwen3 토큰 → 인코더 hidden states, T5 토큰 → 어댑터 쿼리. 출력은 512×1024로 zero-pad |
-| 디노이저 | Anima DiT 2B (Cosmos-Predict2) | ONNX, int8 가중치(DP4A용 `accuracy_level=4`) / fp32 활성, fp16 입출력 | H/W 동적 축, RoPE 그래프 내부; NegPip·LoRA 슬롯 입력 선택 |
-| 디코드 | Qwen-Image (Wan 2.1) VAE 디코더 | ONNX fp32 | T=1에서 CausalConv3d를 2D로 폴딩(Conv2d 커널 경로); Wan21 역정규화 베이킹 |
+| 디노이저 | Anima DiT 2B (Cosmos-Predict2) | ONNX, int8 가중치(DP4A용 `accuracy_level=4`) / fp32 활성, fp16 입출력 | H/W 동적 축, RoPE 그래프 내부; self/cross attention은 `MultiHeadAttention`으로 융합(FA2); NegPip·LoRA 슬롯 입력 선택 |
+| 디코드 | Qwen-Image (Wan 2.1) VAE 디코더 | ONNX fp32 | T=1에서 CausalConv3d를 2D로 폴딩(Conv2d 커널 경로); Wan21 역정규화 베이킹; mid-block attention은 쿼리축 8-chunk로 score 버퍼 제한 |
 
 샘플러(Euler / ER-SDE-Solver)와 시그마 스케줄은 순수 JavaScript로 돌고, 스텝마다 DiT 세션을 1회(CFG 1) 또는 2회(CFG > 1) 호출합니다.
 
@@ -66,29 +69,46 @@ python export/export_vae_decoder.py --comfyui /path/to/ComfyUI \
 
 참고: VAE의 `--size 512`는 trace 크기일 뿐이고(그래프는 동적), fp32 VAE를 1024로 trace하면 16GB 카드에서 OOM이 날 수 있습니다. `export_dit.py --verify`를 주면 두 해상도에서 ONNX vs PyTorch 출력 비교까지 수행합니다.
 
+**VAE attention chunk (고해상도 OOM 대응)** — Wan VAE 디코더의 mid-block에는 full-latent 해상도 self-attention이 있어, score 행렬 `(1,1,S,S)`가 1280²(S=25600)에서 ~2.4 GB로 브라우저 단일 버퍼 한계(2 GB)를 넘겨 OOM이 납니다. `chunk_vae_attention.py`가 이 SDPA를 쿼리 토큰축으로 N등분(기본 8)해 chunk별 부분 score만 만들도록 전개합니다(softmax는 행 단위라 **수치 동치**). K·V는 공유. 1536²(S=36864)에서 chunk당 score ~0.68 GB로 통과합니다.
+
+```bash
+python export/chunk_vae_attention.py \
+  --src out/vae/qwen_image_vae_decoder_dyn32_2d.onnx \
+  --out out/vae/qwen_image_vae_decoder_dyn32_2dc.onnx --chunks 8
+```
+
+> 참고: VAE attention을 `MultiHeadAttention`으로 융합하는 길은 막혔습니다 — head_dim 384가 WebGPU FA2 커널의 workgroup 스토리지 한계(32 KB)를 넘겨 셰이더 컴파일이 실패합니다(48 KB 필요). single-head를 multi-head로 쪼개면 수치가 달라지므로, score chunk가 정공법입니다. chunk는 일반 MatMul+Softmax라 head_dim 제약이 없습니다.
+
 ## 2. DiT 양자화 · 기능 추가 · 샤딩
 
-DiT 전체 파이프라인: **양자화 → NegPip → 샤딩 → LoRA 슬롯**. NegPip은 샤딩 전(그래프 편집), LoRA 슬롯은 샤딩 *후*(graph-only, 같은 샤드 재사용)에 추가합니다.
+DiT 전체 파이프라인: **양자화 → FlashAttention 융합 → NegPip → 샤딩 → LoRA 슬롯**. fuse는 양자화 직후(NegPip이 v_proj를 재배선하기 전)에 수행하고, NegPip은 샤딩 전(그래프 편집), LoRA 슬롯은 샤딩 *후*(graph-only, 같은 샤드 재사용)에 추가합니다. fuse가 attention의 Softmax 앵커를 흡수하므로, NegPip·LoRA 슬롯은 fuse가 남긴 `.fuse_meta.json`(q/k/v/o proj 노드명)으로 attention을 식별합니다(`--fuse-meta`). 메타가 없으면 기존 Softmax 앵커로 폴백합니다.
 
 ```bash
 # int8 weight-only + accuracy_level=4 (DP4A 정수 커널 발동 → 샘플러 약 2배)
 python export/quantize_dit.py --src out/dit/anima_dit_dyn32.onnx \
   --out out/dit/anima_dit_dyn32_q8a4.onnx --bits 8 --no-exclude --accuracy-level 4
 
-# NegPip: negpip_mask 입력 추가, cross-attn v_proj 재배선 (mask=1이면 출력 동일)
-python export/add_negpip.py --src out/dit/anima_dit_dyn32_q8a4.onnx \
-  --out out/dit/anima_dit_dyn32_q8a4n.onnx
+# FlashAttention 융합: 분해 SDPA → com.microsoft.MultiHeadAttention. .fuse_meta.json 생성.
+python export/fuse_attention.py --src out/dit/anima_dit_dyn32_q8a4.onnx \
+  --out out/dit/anima_dit_dyn32_q8a4f.onnx
+
+# NegPip: negpip_mask 입력 추가, cross-attn v_proj 재배선 (mask=1이면 출력 동일).
+#   fuse_meta가 옆에 있으면 메타 기반 식별, 없으면 Softmax 앵커 폴백.
+python export/add_negpip.py --src out/dit/anima_dit_dyn32_q8a4f.onnx \
+  --out out/dit/anima_dit_dyn32_q8a4fn.onnx
 
 # 가중치를 CDN/브라우저 친화적 샤드로 분할
-python export/shard_onnx_data.py --src out/dit/anima_dit_dyn32_q8a4n.onnx \
-  --out out/dit/anima_dit_dyn32_q8a4ns.onnx --shard-mb 480
+python export/shard_onnx_data.py --src out/dit/anima_dit_dyn32_q8a4fn.onnx \
+  --out out/dit/anima_dit_dyn32_q8a4fns.onnx --shard-mb 400
 
 # LoRA 슬롯: 런타임 LoRA용 저랭크 사이드브랜치(랭크 48). 위 샤드를 그대로 재사용.
-python export/add_lora_slots.py --src out/dit/anima_dit_dyn32_q8a4ns.onnx \
-  --out out/dit/anima_dit_dyn32_q8a4nLs.onnx --rank 48
+#   샤딩으로 파일명이 바뀌므로 fuse_meta 경로를 명시해야 함.
+python export/add_lora_slots.py --src out/dit/anima_dit_dyn32_q8a4fns.onnx \
+  --out out/dit/anima_dit_dyn32_q8a4fnLs.onnx --rank 48 \
+  --fuse-meta out/dit/anima_dit_dyn32_q8a4f.onnx.fuse_meta.json
 ```
 
-비슬롯(`q8a4ns`)과 슬롯(`q8a4nLs`) 그래프를 **둘 다** 서버에 두세요: 페이지는 LoRA가 없으면 더 빠른 비슬롯 그래프를 쓰고, LoRA를 장착할 때만 슬롯 그래프로 전환합니다(샤드 동일, 추가 다운로드 없음). Turbo export에도 전체 체인을 반복하세요.
+비슬롯(`q8a4fns`)과 슬롯(`q8a4fnLs`) 그래프를 **둘 다** 서버에 두세요: 페이지는 LoRA가 없으면 더 빠른 비슬롯 그래프를 쓰고, LoRA를 장착할 때만 슬롯 그래프로 전환합니다(샤드 동일, 추가 다운로드 없음). Turbo export에도 전체 체인을 반복하세요.
 
 최소 구성(레거시):
 
@@ -136,12 +156,12 @@ Qwen3와 진짜 `t5-v1_1` 토크나이저를 transformers.js가 요구하는 fas
 index.html
 tokenizers/{qwen3,t5}/
 out/
-├── dit/           변형별: *_q8a4ns.onnx(비슬롯) + *_q8a4nLs.onnx(LoRA 슬롯),
+├── dit/           변형별: *_q8a4fns.onnx(비슬롯) + *_q8a4fnLs.onnx(LoRA 슬롯),
 │                 각각 .bin 샤드 + .onnx.manifest.json; 슬롯 그래프는 .onnx.lora_manifest.json도.
 │                 샤드는 두 그래프가 공유.
 ├── adapter/       anima_llm_adapter.onnx (+ .data)
 ├── text_encoder/  qwen3_06b_s.onnx + 샤드 + manifest
-└── vae/           qwen_image_vae_decoder_dyn32_2d.onnx (+ .data)
+└── vae/           qwen_image_vae_decoder_dyn32_2dc.onnx (+ .data)
 ```
 
 파일명이 다르면 `web/index.html` 상단의 `PATHS` / `MODELS` 상수를 수정하세요. **양자화 전 원본 모델을 웹 루트에 두지 마세요.**
@@ -154,6 +174,7 @@ out/
 - **NegPip** — CFG=1(터보)에서는 부정 프롬프트가 무시됩니다. NegPip 체크 시 부정 프롬프트가 음수 가중치 그룹으로 병합되고, 슬롯 모델의 `negpip_mask`가 해당 토큰의 cross-attn value 부호를 뒤집어 개념을 빼냅니다. `add_negpip.py`로 만든 DiT 필요.
 - **런타임 LoRA** — `.safetensors` LoRA를 여러 개, 각자 강도로 추가한 뒤 **LoRA 반영**을 누릅니다(지연 적용 — N개를 N번이 아니라 1번에 컴파일). 변환(safetensors 파싱 + 멀티 LoRA ΔW/SVD 병합)은 Web Worker에서 진행바와 함께 돌고, 끝날 때까지 생성은 비활성화됩니다. **단일** LoRA는 강도가 그래프 입력(`lora_scale`)이라 슬라이더가 재컴파일 없이 다음 생성에 즉시 반영되고, **여러 개**일 때는 강도가 SVD 병합에 들어가 변경 시 재병합합니다. 어느 쪽이든 그래프는 랭크 48 유지. 미지원 키(텍스트 인코더 LoRA, LoKr)와 슬롯 밖 모듈은 조용히 버리지 않고 리포트합니다. `add_lora_slots.py`로 만든 슬롯 모델 필요.
 - **사용자 설정 모델** — *사용자 설정* 드롭다운으로 DiT(`.onnx` + 샤드 + manifest)를 디스크에서 골라 메모리에 직접 로드(OPFS 미사용, 모바일 동작). TE/어댑터/VAE는 기본 경로 사용.
+- **결과 썸네일 스택** — 생성할 때마다 결과 패널에 썸네일이 누적되고(세션 메모리, 새로고침 시 소멸), 클릭하면 그 이미지가 캔버스에 다시 크게 표시됩니다. 각 항목은 자신의 해상도 스냅샷을 독립 보관하므로, 해상도가 섞여도 클릭 시 정확히 복원됩니다. **PNG 저장**은 현재 캔버스(=마지막 클릭/생성) 기준으로 동작합니다.
 - **GPU 우선순위** — 고성능/절전/기본을 WebGPU `powerPreference`에 매핑(스펙상 GPU 번호 직접 지정 불가). 페이지 (재)로드 시 적용.
 
 ## 구현 노트 (다른 환경으로 포팅할 때)
@@ -180,10 +201,13 @@ ComfyUI 소스 대조로 검증한 Anima의 추론 계약:
 9. **DP4A는 노드 속성 `accuracy_level=4`가 필요합니다**(`quantize_dit.py --accuracy-level 4`). 추가로 `K%128==0 && N%16==0 && block_size%32==0`. 이는 활성화를 int8로 동적 양자화하는 것 — 가중치 양자화와는 *다른* 정확도 트레이드오프라 브라우저에서 이미지 품질을 확인하세요(`run_pipeline.py`의 CPU EP는 이 경로를 안 탑니다).
 10. **VAE `CausalConv3d`는 fp32 전용 rank-5**라 ORT가 느린 naive conv3d 커널로 돌립니다. 단일 이미지(T=1)에서는 마지막 시간탭의 2D conv와 수학적으로 동일 — `export_vae_decoder.py`가 가중치를 4D로 실체화해 Conv2d 커널이 돌게 만들어 스텝당 디코드를 거의 즉시로 만듭니다. 비디오(T>1)에는 사용 불가.
 11. **RoPE가 내부적으로 `max(H, W, T)`를 씁니다** — 파이썬 `int` 비교라 dynamo가 trace 시점 값으로 굳혀, trace 때의 H/W 대소관계가 박히고 **landscape(W>H) 해상도가 Reshape 에러로 실패**합니다(정사각형·portrait는 통과). 비정사각형 trace로도 안 고쳐지므로(dynamo가 심볼을 안 나눔), `common.py`의 `patch_comfy_for_export`가 RoPE 임베딩을 축별 독립 `arange`로 monkeypatch합니다(수치 동일). `export_dit.py --verify`가 이제 landscape 케이스도 검증합니다.
+12. **VAE 디코더의 mid-block attention이 고해상도 OOM의 원인**입니다. score 행렬 `(1,1,S,S)`가 full-latent 해상도(1024²면 S=16384, 1280²면 25600)에서 단일 버퍼로 잡혀, 1280²에서 ~2.4 GB로 2 GB 한계를 넘습니다. `MultiHeadAttention` 융합은 head_dim 384가 WebGPU FA2의 workgroup 한계(32 KB)를 초과해 컴파일이 실패하고, single-head를 쪼개면 수치가 달라집니다. 해법은 쿼리 토큰축 chunk(`chunk_vae_attention.py`) — softmax가 행 단위라 수치 동치이면서 score 버퍼를 1/N로 줄입니다. 이 페이지는 1536² 이하만 생성하도록 두고 N=8을 씁니다.
 
 ## 성능 (참고치)
 
-RTX 5070 Ti, 1024×1024, JSPI 빌드 + DP4A + 2D VAE 기준: **Turbo ≈ 11초**(8스텝, CFG 1), **베이스 ≈ 70초**(30스텝, CFG 5 → DiT 60회) — 로컬 ComfyUI 대비 약 3배(이전 ~10배에서 단축). DP4A가 샘플러 시간을 대략 절반으로 줄였고, VAE를 2D로 폴딩해 디코드가 사실상 즉시가 됐습니다. 이 그래프가 발동하는 커널엔 아직 fused attention이 없어 네이티브 CUDA와 격차가 남습니다(예정된 attention 융합 트랙의 목표). LoRA 장착 시 슬롯 디스패치로 ~9초 추가됩니다. 새 해상도의 첫 생성은 셰이더 특화 때문에 느리고 이후 캐시됩니다.
+RTX 5070 Ti, 1024×1024, JSPI 빌드 + DP4A + 2D VAE 기준: **Turbo ≈ 11초**(8스텝, CFG 1), **베이스 ≈ 70초**(30스텝, CFG 5 → DiT 60회) — 로컬 ComfyUI 대비 약 3배(이전 ~10배에서 단축). DP4A가 샘플러 시간을 대략 절반으로 줄였고, VAE를 2D로 폴딩해 디코드가 사실상 즉시가 됐습니다. LoRA 장착 시 슬롯 디스패치로 ~9초 추가됩니다. 새 해상도의 첫 생성은 셰이더 특화 때문에 느리고 이후 캐시됩니다.
+
+**FlashAttention 융합(DiT)의 실측 가치는 속도가 아니라 메모리였습니다.** 현 해상도 범위에서 총 생성 시간은 거의 동률(±수 초)이지만, attention score 행렬을 통째로 들지 않게 되어 DiT의 VRAM 상주 사용량이 절반으로 평탄해지고, unfused로는 OOM 나던 1024 버킷 초과 해상도가 DiT 단계에서 통과합니다. **VAE chunked attention**까지 적용해, 고해상도에서 VAE가 score 단일 버퍼로 OOM 나던 마지막 병목도 해소 — RTX 5070 Ti에서 **1280² ≈ 29초, 1536² ≈ 58초**로 생성됩니다.
 
 > 참고: DiT를 반복 재컴파일하면(예: LoRA를 여러 번 토글) 현재 ORT Web에서 페이지 새로고침 전까지 GPU 메모리가 누수될 수 있습니다 — 알려진 업스트림 이슈. 페이지는 재컴파일을 최소화(LoRA 지연 반영, 단일 상주 세션)해 정상 사용에선 피하도록 했습니다.
 
