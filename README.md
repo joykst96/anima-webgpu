@@ -20,7 +20,6 @@ This repo contains the full pipeline: PyTorch/ComfyUI → ONNX export scripts, w
 - **VAE chunked attention**: the VAE decoder's mid-block self-attention is split along the query-token axis into 8 chunks, capping the score buffer at 1/8 (numerically identical). This fixes the OOM where the VAE hit the 2 GB single-buffer limit at high resolutions — **generation up to 1536² in the browser**.
 - **Runtime LoRA**: drop in any Anima `.safetensors` LoRA (kohya or `diffusion_model.` formats) with per-LoRA strength; multiple LoRAs are merged exactly via ΔW + SVD in a Web Worker (UI never blocks). No re-export.
 - **Prompt weighting** `(tag:1.2)` and **NegPip** (negative prompts under CFG=1 / Turbo), both faithful to ComfyUI.
-- **Result thumbnail stack**: each generation pushes a thumbnail into the result panel (session memory); click one to restore it to the canvas at full size — each kept with its own resolution.
 
 ## How it works
 
@@ -39,7 +38,7 @@ The sampler (Euler / ER-SDE-Solver) and σ schedule run in plain JavaScript; eac
 
 **Serving** — any static file server. HTTPS is mandatory in production (WebGPU and OPFS require a secure context; `localhost` is exempt for testing).
 
-**Client** — a WebGPU browser (desktop Chrome/Edge), GPU with `shader-f16` support, ~6 GB VRAM recommended. First visit downloads ~2.5 GB (then cached in OPFS).
+**Client** — a WebGPU browser (desktop Chrome/Edge), GPU with `shader-f16` support, ~8 GB VRAM recommended. First visit downloads ~2.5 GB (then cached in OPFS).
 
 ## 1. Convert the models
 
@@ -110,6 +109,47 @@ python export/add_lora_slots.py --src out/dit/anima_dit_dyn32_q8a4fns.onnx \
 
 Keep **both** the non-slot (`q8a4fns`) and slot (`q8a4fnLs`) graphs on the server: the page serves the faster non-slot graph when no LoRA is active and only switches to the slot graph (same shards, no extra download) when a LoRA is applied. Repeat the whole chain for the Turbo export.
 
+**Batch automation** — running the six steps × two variants by hand for every checkpoint gets tedious. `export/build_dit.bat` (Windows, ComfyUI portable) runs the full `export_dit → quantize → fuse → negpip → shard → lora-slots` chain for both base and Turbo in one go:
+
+```bat
+REM from the ComfyUI portable root:
+export\build_dit.bat ComfyUI\models\diffusion_models\my-finetune.safetensors myft
+```
+
+This emits `myft_dit_dyn32_q8a4fns/fnLs.onnx` and `myft_dit_turbo32_*` (with shards + manifests). The Turbo variant merges the Turbo LoRA at export time (`TURBO_LORA` path is set at the top of the script). Re-run it per checkpoint whenever you rebuild; register the output in the `MODELS` map in `index.html`.
+
+### Adding models to the page
+
+Once the DiT files are in `out/dit/`, register the model in **two places** in `index.html`. The two must use the **same key**, or the model fails to load.
+
+**1. The `MODELS` map** (search `const MODELS`) — add a base/Turbo pair:
+
+```js
+mymodel: {
+  label: "My Model",
+  dit:     "out/dit/mymodel_dit_dyn32_q8a4fns.onnx",
+  ditLora: "out/dit/mymodel_dit_dyn32_q8a4fnLs.onnx",
+  steps: 30, cfg: 5.0, sampler: "er_sde", scheduler: "simple",
+},
+mymodel_turbo: {
+  label: "My Model+Turbo",
+  dit:     "out/dit/mymodel_dit_turbo32_q8a4fns.onnx",
+  ditLora: "out/dit/mymodel_dit_turbo32_q8a4fnLs.onnx",
+  steps: 8, cfg: 1.0, sampler: "euler", scheduler: "simple",
+},
+```
+
+Keys are free-form (`[A-Za-z0-9_]`); `dit`/`ditLora` paths must match the actual filenames. Base uses 30 steps / CFG 5 / er_sde; Turbo uses 8 steps / CFG 1 / euler.
+
+**2. The model dropdown** (search `id="modelSel"`) — add one `<option>` per key:
+
+```html
+<option value="mymodel">My Model (base · 30 steps · CFG 5)</option>
+<option value="mymodel_turbo">My Model+Turbo (8 steps · CFG 1)</option>
+```
+
+The `value` must equal the `MODELS` key exactly.
+
 Quantization alone (legacy / minimal):
 
 ```bash
@@ -174,8 +214,6 @@ A ready-to-run static server is in `deploy/` (`docker compose up -d`; nginx with
 - **NegPip** — under CFG=1 (Turbo), negative prompts are normally ignored. Check the NegPip box and the negative prompt is folded in as a negative-weight group; the slot model's `negpip_mask` flips the sign of those tokens' cross-attn values so the concept is subtracted. Requires a DiT built with `add_negpip.py`.
 - **Runtime LoRA** — add one or more `.safetensors` LoRAs with independent strengths, then press **Apply LoRA** (deferred so N LoRAs compile once, not N times). Conversion (safetensors parse + multi-LoRA ΔW/SVD merge) runs in a Web Worker with a progress bar; generation is disabled until it finishes. With a **single** LoRA the strength is a live graph input (`lora_scale`), so the slider takes effect on the next generation with no recompile; with **multiple** LoRAs the strength is baked into the SVD merge, so changing it re-runs the merge. Either way the graph stays rank-48. Unsupported keys (text-encoder LoRAs, LoKr) and out-of-slot modules are reported, not silently dropped. Requires a slot model from `add_lora_slots.py`.
 - **Custom model** — the *Custom* dropdown loads a DiT (`.onnx` + shards + manifests) you pick from disk, straight into memory (no OPFS, works on mobile). TE/adapter/VAE use the default paths.
-- **Result thumbnail stack** — each generation pushes a thumbnail into the result panel (session memory, cleared on refresh); click one to restore that image to the canvas at full size. Each entry keeps its own resolution snapshot, so mixed resolutions restore correctly. **Save PNG** acts on the current canvas (= last clicked/generated).
-- **GPU preference** — high-performance / low-power / default maps to WebGPU's `powerPreference` (the spec has no direct GPU-index selection); applied on page (re)load.
 
 ## Implementation notes (for porting elsewhere)
 
