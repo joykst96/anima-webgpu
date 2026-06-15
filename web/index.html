@@ -1,1107 +1,2478 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="ko">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<link rel="icon" href="data:,">
-<title>Anima WebGPU — 브라우저 로컬 이미지 생성</title>
-<style>
-  :root {
-    --bg: #0f1115; --panel: #181b22; --border: #2a2e38;
-    --text: #e6e8ee; --dim: #8b91a0; --accent: #7aa2f7; --ok: #9ece6a; --err: #f7768e;
-  }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0; background: var(--bg); color: var(--text);
-    font: 14px/1.5 "Segoe UI", "Malgun Gothic", sans-serif;
-  }
-  .wrap { max-width: 1100px; margin: 0 auto; padding: 24px 16px; }
-  h1 { font-size: 20px; margin: 0 0 4px; }
-  .sub { color: var(--dim); font-size: 13px; margin-bottom: 20px; }
-  .grid { display: grid; grid-template-columns: 420px 1fr; gap: 16px; }
-  @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
-  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
-  .panel h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--dim); margin: 0 0 12px; }
-  label { display: block; font-size: 12px; color: var(--dim); margin: 10px 0 4px; }
-  textarea, input, select {
-    width: 100%; background: #11141a; color: var(--text);
-    border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; font: inherit;
-  }
-  textarea { resize: vertical; min-height: 64px; }
-  .row { display: flex; gap: 10px; }
-  .row > div { flex: 1; }
-  button {
-    width: 100%; margin-top: 14px; padding: 11px; border: 0; border-radius: 8px;
-    background: var(--accent); color: #0b0e14; font-weight: 600; font-size: 14px; cursor: pointer;
-  }
-  button:disabled { background: #3a4154; color: #767e92; cursor: not-allowed; }
-  button.secondary { background: #2a2e38; color: var(--text); }
-  .bar { height: 6px; background: #11141a; border-radius: 3px; overflow: hidden; margin-top: 6px; }
-  .bar > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .15s; }
-  #log {
-    margin-top: 12px; max-height: 180px; overflow-y: auto; font: 12px/1.6 Consolas, monospace;
-    background: #11141a; border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px;
-    white-space: pre-wrap;
-  }
-  #log .ok { color: var(--ok); } #log .err { color: var(--err); } #log .dim { color: var(--dim); }
-  #canvas { width: 100%; border-radius: 8px; background: #11141a; display: block; }
-  #gallery { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
-  #gallery:empty { display: none; }
-  #gallery .thumb {
-    position: relative; width: 64px; height: 64px; border-radius: 6px; overflow: hidden;
-    border: 1px solid var(--border); cursor: pointer; padding: 0; background: #11141a;
-    flex: 0 0 auto; transition: border-color .12s;
-  }
-  #gallery .thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
-  #gallery .thumb:hover { border-color: var(--accent); }
-  #gallery .thumb.active { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
-  .stats { color: var(--dim); font-size: 12px; margin-top: 8px; }
-  details { margin-top: 10px; }
-  summary { cursor: pointer; color: var(--dim); font-size: 12px; }
-</style>
-</head>
-<body>
-<div class="wrap">
-  <h1>Anima — 브라우저 로컬 생성</h1>
-  <div class="sub">모든 연산이 이 기기의 GPU(WebGPU)에서 실행됩니다. 프롬프트는 서버로 전송되지 않습니다.</div>
-
-  <div class="grid">
-    <div>
-      <div class="panel">
-        <h2>1. 모델 로드</h2>
-        <div id="gpuInfo" class="stats">WebGPU 확인 중...</div>
-        <label>모델</label>
-        <select id="modelSel">
-          <option value="anima">Anima (베이스 · 30스텝 · CFG 5)</option>
-          <option value="turbo" selected>Anima + Turbo v0.2 (8스텝 · CFG 1)</option>
-          <option value="custom">사용자 설정 (직접 모델 지정)</option>
-        </select>
-        <label style="margin-top:8px">GPU 우선순위</label>
-        <select id="gpuPref">
-          <option value="high-performance" selected>고성능 GPU 우선</option>
-          <option value="low-power">절전 GPU 우선</option>
-          <option value="default">브라우저 기본</option>
-        </select>
-        <div style="font-size:11px;color:var(--dim,#888);margin-top:2px">
-          WebGPU는 GPU 번호 직접 지정을 지원하지 않음 — 전력 선호도로 어댑터를 고름. 변경 후 새로고침 시 적용.</div>
-        <div id="customPanel" style="display:none;margin:8px 0;padding:10px;border:1px solid var(--line,#333);border-radius:6px">
-          <label>DiT 모델 파일 (.onnx + 샤드 .bin + manifest 모두 선택)</label>
-          <input id="customDitFiles" type="file" multiple accept=".onnx,.bin,.json">
-          <div style="font-size:11px;color:var(--dim,#888);margin:2px 0 0">
-            OPFS 캐시 대신 메모리에서 직접 로드 (모바일·개발용). TE/어댑터/VAE는 기본 경로 사용.</div>
-        </div>
-        <button id="btnLoad">모델 로드 (최초 1회 다운로드, 이후 캐시)</button>
-        <div style="margin-top:8px"><label>LoRA (.safetensors · 여러 개 가능)</label></div>
-        <div id="loraList"></div>
-        <div style="display:flex;gap:8px;align-items:center;margin-top:4px">
-          <button id="btnLoraAdd" style="font-size:12px;padding:3px 10px;width:auto">+ LoRA 추가</button>
-          <button id="btnLoraApply" style="font-size:12px;padding:3px 10px;width:auto" disabled>LoRA 반영</button>
-          <div id="loraStat" style="font-size:11px;color:var(--dim,#888);flex:1"></div>
-        </div>
-        <button id="btnClearCache" class="secondary">캐시 비우기</button>
-        <div class="bar"><i id="loadBar"></i></div>
-        <div id="loadStat" class="stats"></div>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="icon" href="data:," />
+    <title>Anima WebGPU — 브라우저 로컬 이미지 생성</title>
+    <style>
+      :root {
+        --bg: #0f1115;
+        --panel: #181b22;
+        --border: #2a2e38;
+        --text: #e6e8ee;
+        --dim: #8b91a0;
+        --accent: #7aa2f7;
+        --ok: #9ece6a;
+        --err: #f7768e;
+        --warn: #e0af68;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        font:
+          14px/1.5 "Segoe UI",
+          "Malgun Gothic",
+          sans-serif;
+      }
+      .wrap {
+        max-width: 1100px;
+        margin: 0 auto;
+        padding: 24px 16px;
+      }
+      h1 {
+        font-size: 20px;
+        margin: 0 0 4px;
+      }
+      .sub {
+        color: var(--dim);
+        font-size: 13px;
+        margin-bottom: 20px;
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: 420px 1fr;
+        gap: 16px;
+        align-items: start;
+      }
+      @media (max-width: 900px) {
+        .grid {
+          grid-template-columns: 1fr;
+        }
+      }
+      /* PC 뷰: 결과 패널이 스크롤을 따라오게 (프롬프트 수정 중에도 결과가 보이도록) */
+      @media (min-width: 901px) {
+        #resultPanel {
+          position: sticky;
+          top: 16px;
+          max-height: calc(100vh - 32px);
+          overflow-y: auto;
+          scrollbar-width: none;
+        } /* Firefox: 스크롤바 숨김 */
+        #resultPanel::-webkit-scrollbar {
+          display: none;
+        } /* Chrome/Edge/Safari: 숨김 (휠 스크롤은 유지) */
+      }
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        padding: 16px;
+      }
+      .panel h2 {
+        font-size: 13px;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: var(--dim);
+        margin: 0 0 12px;
+      }
+      label {
+        display: block;
+        font-size: 12px;
+        color: var(--dim);
+        margin: 10px 0 4px;
+      }
+      textarea,
+      input,
+      select {
+        width: 100%;
+        background: #11141a;
+        color: var(--text);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 8px 10px;
+        font: inherit;
+      }
+      textarea {
+        resize: vertical;
+        min-height: 64px;
+      }
+      .row {
+        display: flex;
+        gap: 10px;
+      }
+      .row > div {
+        flex: 1;
+      }
+      button {
+        width: 100%;
+        margin-top: 14px;
+        padding: 11px;
+        border: 0;
+        border-radius: 8px;
+        background: var(--accent);
+        color: #0b0e14;
+        font-weight: 600;
+        font-size: 14px;
+        cursor: pointer;
+      }
+      button:disabled {
+        background: #3a4154;
+        color: #767e92;
+        cursor: not-allowed;
+      }
+      button.secondary {
+        background: #2a2e38;
+        color: var(--text);
+      }
+      .bar {
+        height: 6px;
+        background: #11141a;
+        border-radius: 3px;
+        overflow: hidden;
+        margin-top: 6px;
+      }
+      .bar > i {
+        display: block;
+        height: 100%;
+        width: 0;
+        background: var(--accent);
+        transition: width 0.15s;
+      }
+      #log {
+        margin-top: 12px;
+        max-height: 180px;
+        overflow-y: auto;
+        font:
+          12px/1.6 Consolas,
+          monospace;
+        background: #11141a;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 8px 10px;
+        white-space: pre-wrap;
+      }
+      #log .ok {
+        color: var(--ok);
+      }
+      #log .err {
+        color: var(--err);
+      }
+      #log .dim {
+        color: var(--dim);
+      }
+      #canvas {
+        width: 100%;
+        border-radius: 8px;
+        background: #11141a;
+        display: block;
+      }
+      #gallery {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-top: 12px;
+      }
+      #gallery:empty {
+        display: none;
+      }
+      .chips {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+      }
+      .chips button.chip {
+        width: auto;
+        flex: 0 0 auto;
+        padding: 5px 10px;
+        font-size: 12px;
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        background: #11141a;
+        color: var(--dim);
+        cursor: pointer;
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        line-height: 1;
+        transition:
+          border-color 0.12s,
+          color 0.12s;
+      }
+      .chips button.chip:hover {
+        border-color: var(--accent);
+        color: var(--text);
+      }
+      .chips button.chip.active {
+        border-color: var(--accent);
+        color: var(--text);
+        background: #1a2030;
+      }
+      .chip .ratio-ico {
+        display: inline-block;
+        border: 1.5px solid currentColor;
+        border-radius: 2px;
+        opacity: 0.8;
+        flex: 0 0 auto;
+      }
+      #gallery .thumb {
+        position: relative;
+        width: 64px;
+        height: 64px;
+        border-radius: 6px;
+        overflow: hidden;
+        border: 1px solid var(--border);
+        cursor: pointer;
+        padding: 0;
+        background: #11141a;
+        flex: 0 0 auto;
+        transition: border-color 0.12s;
+      }
+      #gallery .thumb img {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+        display: block;
+      }
+      #gallery .thumb:hover {
+        border-color: var(--accent);
+      }
+      #gallery .thumb.active {
+        border-color: var(--accent);
+        box-shadow: 0 0 0 1px var(--accent);
+      }
+      #gallery .thumb .del {
+        position: absolute;
+        top: 2px;
+        right: 2px;
+        width: 17px;
+        height: 17px;
+        padding: 0;
+        border: none;
+        border-radius: 50%;
+        background: rgba(220, 40, 60, 0.92);
+        color: #fff;
+        font-size: 12px;
+        line-height: 1;
+        cursor: pointer;
+        display: none;
+        align-items: center;
+        justify-content: center;
+        flex: 0 0 auto;
+      }
+      #gallery .thumb:hover .del {
+        display: inline-flex;
+      }
+      #queueList {
+        margin-top: 8px;
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+      }
+      #queueList:empty {
+        display: none;
+      }
+      .accordion .acc-head {
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        user-select: none;
+        margin: 0;
+      }
+      .accordion .acc-arrow {
+        font-size: 14px;
+        color: var(--dim);
+        transition: transform 0.15s;
+      }
+      .accordion.collapsed .acc-arrow {
+        transform: rotate(-90deg);
+      }
+      .accordion .acc-body {
+        margin-top: 10px;
+      }
+      .accordion.collapsed .acc-body {
+        display: none;
+      }
+      #queueList .qitem {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 11px;
+        color: var(--dim);
+        background: #11141a;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 4px 8px;
+      }
+      #queueList .qitem.running {
+        border-color: var(--accent);
+        color: var(--text);
+      }
+      #queueList .qitem.removable {
+        cursor: pointer;
+        transition:
+          border-color 0.12s,
+          color 0.12s,
+          background 0.12s;
+      }
+      #queueList .qitem.removable:hover {
+        border-color: #c0283c;
+        color: #f7768e;
+        background: #1a1015;
+      }
+      #queueList .qitem .qmeta {
+        flex: 1;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      #queueList .qitem .qhint {
+        flex: 0 0 auto;
+        font-size: 10px;
+        color: #c0283c;
+        opacity: 0;
+        transition: opacity 0.12s;
+      }
+      #queueList .qitem.removable:hover .qhint {
+        opacity: 1;
+      }
+      .stats {
+        color: var(--dim);
+        font-size: 12px;
+        margin-top: 8px;
+      }
+      details {
+        margin-top: 10px;
+      }
+      summary {
+        cursor: pointer;
+        color: var(--dim);
+        font-size: 12px;
+      }
+      /* 라이트박스 모달 */
+      #lightbox {
+        display: none; position: fixed; inset: 0; z-index: 1000;
+        background: rgba(0,0,0,.92); align-items: center; justify-content: center;
+      }
+      #lightbox.open { display: flex; }
+      #lightbox #lbImg {
+        max-width: 92vw; max-height: 88vh; object-fit: contain;
+        border-radius: 6px; box-shadow: 0 8px 40px rgba(0,0,0,.6);
+      }
+      /* 화면에 맞춰 늘리기 ON: 작은 이미지도 화면 채우게 (비율 유지) */
+      #lightbox.fit #lbImg { width: 92vw; height: 88vh; object-fit: contain; max-width: none; max-height: none; }
+      #lightbox #lbFit {
+        position: absolute; top: 20px; left: 20px; z-index: 2;
+        display: flex; align-items: center; gap: 6px;
+        font-size: 12px; color: rgba(255,255,255,.85); cursor: pointer;
+        background: rgba(255,255,255,.08); padding: 6px 12px; border-radius: 14px; user-select: none;
+      }
+      #lightbox #lbFit input { width: auto; margin: 0; cursor: pointer; }
+      #lightbox #lbClose {
+        position: absolute; top: 16px; right: 20px; width: 40px; height: 40px;
+        font-size: 26px; line-height: 1; border: none; border-radius: 50%;
+        background: rgba(255,255,255,.12); color: #fff; cursor: pointer; padding: 0;
+        display: flex; align-items: center; justify-content: center;
+      }
+      #lightbox #lbClose:hover { background: rgba(255,255,255,.25); }
+      #lightbox .lb-nav {
+        position: absolute; top: 50%; transform: translateY(-50%);
+        width: 52px; height: 80px; font-size: 40px; line-height: 1; padding: 0;
+        border: none; border-radius: 8px; background: rgba(255,255,255,.08);
+        color: #fff; cursor: pointer; display: flex; align-items: center; justify-content: center;
+      }
+      #lightbox .lb-nav:hover { background: rgba(255,255,255,.2); }
+      #lightbox #lbPrev { left: 16px; }
+      #lightbox #lbNext { right: 16px; }
+      #lightbox .lb-nav:disabled { opacity: .25; cursor: default; }
+      #lightbox #lbMeta {
+        position: absolute; bottom: 18px; left: 50%; transform: translateX(-50%);
+        font-size: 12px; color: rgba(255,255,255,.8); background: rgba(0,0,0,.5);
+        padding: 5px 14px; border-radius: 12px; white-space: nowrap;
+      }
+      #canvas { cursor: zoom-in; }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div style="display: flex; align-items: center; gap: 12px">
+        <h1 style="margin: 0; flex: 1">Anima — 브라우저 로컬 생성</h1>
+        <button
+          id="btnGenTop"
+          disabled
+          style="
+            width: auto;
+            font-size: 13px;
+            padding: 7px 16px;
+            flex: 0 0 auto;
+          "
+        >
+          생성
+        </button>
+        <button
+          id="btnCancelTop"
+          style="
+            width: auto;
+            font-size: 13px;
+            padding: 7px 14px;
+            flex: 0 0 auto;
+            background: #c0283c;
+            display: none;
+          "
+        >
+          ■ 중단
+        </button>
+      </div>
+      <div class="sub">
+        모든 연산이 이 기기의 GPU(WebGPU)에서 실행됩니다. 프롬프트는 서버로
+        전송되지 않습니다.
       </div>
 
-      <div class="panel" style="margin-top:16px">
-        <h2>2. 생성</h2>
-        <label>긍정 프롬프트</label>
-        <textarea id="prompt">masterpiece, best quality, score_7, safe</textarea>
-        <label style="display:flex;align-items:center;gap:8px">부정 프롬프트
-          <span style="margin-left:auto;display:flex;align-items:center;gap:5px;font-weight:normal;font-size:12px">
-            <input id="negpipChk" type="checkbox" style="width:auto;margin:0">NegPip
-            <input id="negpipW" type="number" value="-1.0" step="0.1" max="-0.1" min="-3"
-                   style="width:64px" title="부정 프롬프트에 줄 음수 가중치">
-          </span>
-        </label>
-        <textarea id="negative">worst quality, low quality, score_1, score_2, score_3, artist name</textarea>
-        <div style="color:var(--dim,#888);font-size:11px;margin:2px 0 6px">
-          (태그:1.2) 가중치 문법 지원 · NegPip 체크 시 CFG=1(터보)에서도 부정 프롬프트 적용</div>
-        <div class="row">
-          <div><label>가로 (px, 16배수)</label><input id="width" type="number" value="1024" step="16" min="512" max="1536"></div>
-          <div><label>세로 (px, 16배수)</label><input id="height" type="number" value="1024" step="16" min="512" max="1536"></div>
-        </div>
-        <div class="row">
-          <div><label>스텝</label><input id="steps" type="number" value="30" min="1" max="60"></div>
-          <div><label>CFG</label><input id="cfg" type="number" value="4.0" step="0.5" min="1"></div>
-          <div><label>시드 (-1 랜덤)</label><input id="seed" type="number" value="-1"></div>
-        </div>
-        <div class="row">
-          <div><label>샘플러</label>
-            <select id="sampler"><option value="er_sde">er_sde</option><option value="euler">euler</option></select></div>
-          <div><label>스케줄러</label>
-            <select id="scheduler"><option value="simple">simple</option><option value="normal">normal</option></select></div>
-        </div>
-        <button id="btnGen" disabled>생성</button>
-        <div class="bar"><i id="genBar"></i></div>
-        <div id="genStat" class="stats"></div>
-      </div>
+      <div class="grid">
+        <div>
+          <div class="panel accordion" id="panelModel">
+            <h2 class="acc-head">
+              1. 모델 로드 <span class="acc-arrow">⌄</span>
+            </h2>
+            <div class="acc-body">
+              <div id="gpuInfo" class="stats">WebGPU 확인 중...</div>
+              <label>모델</label>
+              <select id="modelSel">
+                <option value="anima">Anima (베이스 · 30스텝 · CFG 5)</option>
+                <option value="turbo" selected>
+                  Anima + Turbo v0.2 (8스텝 · CFG 1)
+                </option>
+                <option value="custom">사용자 설정 (직접 모델 지정)</option>
+              </select>
+              <div
+                id="customPanel"
+                style="
+                  display: none;
+                  margin: 8px 0;
+                  padding: 10px;
+                  border: 1px solid var(--line, #333);
+                  border-radius: 6px;
+                "
+              >
+                <label
+                  >DiT 모델 파일 (.onnx + 샤드 .bin + manifest 모두 선택)</label
+                >
+                <input
+                  id="customDitFiles"
+                  type="file"
+                  multiple
+                  accept=".onnx,.bin,.json"
+                />
+                <div
+                  style="
+                    font-size: 11px;
+                    color: var(--dim, #888);
+                    margin: 2px 0 0;
+                  "
+                >
+                  OPFS 캐시 대신 메모리에서 직접 로드 (모바일·개발용).
+                  TE/어댑터/VAE는 기본 경로 사용.
+                </div>
+              </div>
+              <button id="btnLoad">
+                모델 로드 (최초 1회 다운로드, 이후 캐시)
+              </button>
+              <button id="btnClearCache" class="secondary">캐시 비우기</button>
+              <div class="bar"><i id="loadBar"></i></div>
+              <div id="loadStat" class="stats"></div>
+            </div>
+          </div>
 
-      <div id="log"></div>
+          <div class="panel accordion" id="panelLora" style="margin-top: 16px">
+            <h2 class="acc-head">2. LoRA <span class="acc-arrow">⌄</span></h2>
+            <div class="acc-body">
+              <div
+                style="
+                  font-size: 11px;
+                  color: var(--dim, #888);
+                  margin: 0 0 6px;
+                "
+              >
+                .safetensors · 여러 개 가능
+              </div>
+              <div id="loraList"></div>
+              <div
+                style="
+                  display: flex;
+                  gap: 8px;
+                  align-items: center;
+                  margin-top: 4px;
+                "
+              >
+                <button
+                  id="btnLoraAdd"
+                  style="font-size: 12px; padding: 3px 10px; width: auto"
+                >
+                  + LoRA 추가
+                </button>
+                <button
+                  id="btnLoraApply"
+                  style="font-size: 12px; padding: 3px 10px; width: auto"
+                  disabled
+                >
+                  LoRA 반영
+                </button>
+                <div
+                  id="loraStat"
+                  style="font-size: 11px; color: var(--dim, #888); flex: 1"
+                ></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel" style="margin-top: 16px">
+            <h2
+              style="
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+              "
+            >
+              3. 생성
+              <span
+                style="
+                  display: flex;
+                  align-items: center;
+                  gap: 5px;
+                  font-weight: normal;
+                  font-size: 12px;
+                  color: var(--dim);
+                "
+              >
+                <input
+                  id="previewChk"
+                  type="checkbox"
+                  checked
+                  style="width: auto; margin: 0"
+                />프리뷰 보기
+              </span>
+            </h2>
+            <label>긍정 프롬프트</label>
+            <textarea id="prompt">
+masterpiece, best quality, score_7, safe</textarea
+            >
+            <label style="display: flex; align-items: center; gap: 8px"
+              >부정 프롬프트
+              <span
+                style="
+                  margin-left: auto;
+                  display: flex;
+                  align-items: center;
+                  gap: 5px;
+                  font-weight: normal;
+                  font-size: 12px;
+                "
+              >
+                <input
+                  id="negpipChk"
+                  type="checkbox"
+                  style="width: auto; margin: 0"
+                />NegPip
+                <input
+                  id="negpipW"
+                  type="number"
+                  value="-1.0"
+                  step="0.1"
+                  max="-0.1"
+                  min="-3"
+                  style="width: 64px"
+                  title="부정 프롬프트에 줄 음수 가중치"
+                />
+              </span>
+            </label>
+            <textarea id="negative">
+worst quality, low quality, score_1, score_2, score_3, artist name</textarea
+            >
+            <label>해상도 프리셋</label>
+            <div id="resBucketChips" class="chips"></div>
+            <div id="resRatioChips" class="chips" style="margin-top: 5px"></div>
+            <div class="row" style="margin-top: 6px">
+              <div>
+                <label>가로 (px, 16배수)</label
+                ><input
+                  id="width"
+                  type="number"
+                  value="1024"
+                  step="16"
+                  min="384"
+                  max="2048"
+                />
+              </div>
+              <div>
+                <label>세로 (px, 16배수)</label
+                ><input
+                  id="height"
+                  type="number"
+                  value="1024"
+                  step="16"
+                  min="384"
+                  max="2048"
+                />
+              </div>
+            </div>
+            <div class="row">
+              <div>
+                <label>스텝</label
+                ><input id="steps" type="number" value="30" min="1" max="60" />
+              </div>
+              <div>
+                <label>CFG</label
+                ><input id="cfg" type="number" value="4.0" step="0.5" min="1" />
+              </div>
+              <div>
+                <label>시드 (-1 랜덤)</label
+                ><input id="seed" type="number" value="-1" />
+              </div>
+            </div>
+            <div class="row">
+              <div>
+                <label>샘플러</label>
+                <select id="sampler">
+                  <option value="er_sde">er_sde</option>
+                  <option value="euler">euler</option>
+                </select>
+              </div>
+              <div>
+                <label>스케줄러</label>
+                <select id="scheduler">
+                  <option value="simple">simple</option>
+                  <option value="normal">normal</option>
+                </select>
+              </div>
+            </div>
+            <div style="display: flex; gap: 8px; align-items: stretch">
+              <button id="btnGen" disabled style="flex: 1">
+                생성 (큐에 추가)
+              </button>
+              <button
+                id="btnCancel"
+                style="
+                  flex: 0 0 auto;
+                  width: auto;
+                  padding: 0 14px;
+                  background: #c0283c;
+                  display: none;
+                "
+              >
+                ■ 중단
+              </button>
+            </div>
+            <div class="bar"><i id="genBar"></i></div>
+            <div id="genStat" class="stats"></div>
+            <div id="queueList"></div>
+          </div>
+
+          <div id="log"></div>
+        </div>
+
+        <div class="panel" id="resultPanel">
+          <h2>결과</h2>
+          <canvas id="canvas" width="1024" height="1024"></canvas>
+          <div
+            style="
+              display: flex;
+              gap: 8px;
+              align-items: stretch;
+              margin-top: 6px;
+            "
+          >
+            <button id="btnSave" class="secondary" disabled style="flex: 8">
+              현재 이미지 저장
+            </button>
+            <button id="btnSaveAll" class="secondary" disabled style="flex: 2">
+              전체 저장
+            </button>
+          </div>
+          <div id="gallery"></div>
+          <div class="stats">
+            모든 연산은 방문자 기기의 GPU에서 실행되며, 프롬프트와 생성 결과는
+            서버로 전송되지 않습니다.
+          </div>
+          <div
+            class="stats"
+            style="
+              margin-top: 14px;
+              padding-top: 12px;
+              border-top: 1px solid var(--border);
+              font-size: 11px;
+              line-height: 1.7;
+            "
+          >
+            This page distributes a <b>modified</b> version of the Anima model
+            (ONNX conversion, int8 weight quantization, and Turbo LoRA merge).
+            This is an unofficial project and is not endorsed, approved, or
+            validated by CircleStone Labs.<br />
+            “The CircleStone Model is licensed by CircleStone Labs LLC under the
+            <a
+              href="https://huggingface.co/circlestone-labs/Anima/blob/main/LICENSE.md"
+              style="color: var(--accent)"
+              >CircleStone Non-Commercial License</a
+            >. Copyright CircleStone Labs LLC. IN NO EVENT SHALL CIRCLESTONE
+            LABS LLC BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+            WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+            OUT OF OR IN CONNECTION WITH USE OF THIS MODEL.”<br />
+            Rights to use the model and derivatives are granted directly by
+            CircleStone Labs LLC to you under the above license (non-commercial
+            use only). Built on NVIDIA Cosmos (NVIDIA Open Model License). Text
+            encoder: Qwen3-0.6B-Base (Apache 2.0).
+          </div>
+        </div>
+      </div>
     </div>
 
-    <div class="panel">
-      <h2>결과</h2>
-      <canvas id="canvas" width="1024" height="1024"></canvas>
-      <button id="btnSave" class="secondary" disabled>PNG 저장</button>
-      <div id="gallery"></div>
-      <div class="stats">
-        모든 연산은 방문자 기기의 GPU에서 실행되며, 프롬프트와 생성 결과는 서버로 전송되지 않습니다.
-      </div>
-      <div class="stats" style="margin-top:14px; padding-top:12px; border-top:1px solid var(--border); font-size:11px; line-height:1.7">
-        This page distributes a <b>modified</b> version of the Anima model (ONNX conversion,
-        int8 weight quantization, and Turbo LoRA merge). This is an unofficial project and is
-        not endorsed, approved, or validated by CircleStone Labs.<br>
-        “The CircleStone Model is licensed by CircleStone Labs LLC under the
-        <a href="https://huggingface.co/circlestone-labs/Anima/blob/main/LICENSE.md" style="color:var(--accent)">CircleStone
-        Non-Commercial License</a>. Copyright CircleStone Labs LLC.
-        IN NO EVENT SHALL CIRCLESTONE LABS LLC BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-        LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF
-        OR IN CONNECTION WITH USE OF THIS MODEL.”<br>
-        Rights to use the model and derivatives are granted directly by CircleStone Labs LLC
-        to you under the above license (non-commercial use only). Built on NVIDIA Cosmos
-        (NVIDIA Open Model License). Text encoder: Qwen3-0.6B-Base (Apache 2.0).
-      </div>
+    <div id="lightbox" role="dialog" aria-modal="true">
+      <label id="lbFit" title="저해상도 이미지를 화면 크기로 늘리기">
+        <input id="lbFitChk" type="checkbox">화면에 맞춰 늘리기
+      </label>
+      <button id="lbClose" title="닫기 (Esc)">×</button>
+      <button id="lbPrev" class="lb-nav" title="이전 (←)">‹</button>
+      <img id="lbImg" alt="">
+      <button id="lbNext" class="lb-nav" title="다음 (→)">›</button>
+      <div id="lbMeta"></div>
     </div>
-  </div>
-</div>
 
-<script type="module">
-import { AutoTokenizer, env as hfEnv } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers';
+    <script type="module">
+      import {
+        AutoTokenizer,
+        env as hfEnv,
+      } from "https://cdn.jsdelivr.net/npm/@huggingface/transformers";
 
-// ── ORT 로드 ──
-// JSPI 지원 브라우저(Chrome 137+): 네이티브 C++ WebGPU EP 빌드(jspi).
-//   → DP4A MatMulNBits / FlashAttention 커널은 이 빌드에만 존재 (인수인계 사실 10, 14).
-// 미지원: 기존 JSEP 빌드 폴백 (동작 동일, 최적화 커널 없음).
-// EP 교체기라 latest 추적은 회귀 위험 → 버전 고정 (인수인계 '기타' 항목).
-const ORT_VER  = '1.26.0';                            // 고정 (EP 교체기라 latest 추적은 회귀 위험)
-const ORT_BASE = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_VER}/dist/`;
-const HAS_JSPI = typeof WebAssembly.Suspending === 'function';
-const ort = await import(ORT_BASE +
-  (HAS_JSPI ? 'ort.jspi.bundle.min.mjs' : 'ort.webgpu.min.mjs'));
-ort.env.wasm.wasmPaths = ORT_BASE;
-ort.env.wasm.proxy = false;                       // WebGPU EP는 메인 스레드 상주 (검증된 구성)
-hfEnv.allowLocalModels = true;
-hfEnv.localModelPath = 'tokenizers/';   // prepare_tokenizers.py 산출물 위치
+      // ── ORT 로드 ──
+      // JSPI 지원 브라우저(Chrome 137+): 네이티브 C++ WebGPU EP 빌드(jspi).
+      //   → DP4A MatMulNBits / FlashAttention 커널은 이 빌드에만 존재 (인수인계 사실 10, 14).
+      // 미지원: 기존 JSEP 빌드 폴백 (동작 동일, 최적화 커널 없음).
+      // EP 교체기라 latest 추적은 회귀 위험 → 버전 고정 (인수인계 '기타' 항목).
+      const ORT_VER = "1.26.0"; // 고정 (EP 교체기라 latest 추적은 회귀 위험)
+      const ORT_BASE = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_VER}/dist/`;
+      const HAS_JSPI = typeof WebAssembly.Suspending === "function";
+      const ort = await import(
+        ORT_BASE + (HAS_JSPI ? "ort.jspi.bundle.min.mjs" : "ort.webgpu.min.mjs")
+      );
+      ort.env.wasm.wasmPaths = ORT_BASE;
+      ort.env.wasm.proxy = false; // WebGPU EP는 메인 스레드 상주 (검증된 구성)
+      hfEnv.allowLocalModels = true;
+      hfEnv.localModelPath = "tokenizers/"; // prepare_tokenizers.py 산출물 위치
 
-const TOK_FALLBACK = { qwen3: 'Qwen/Qwen3-0.6B-Base', t5: 'Xenova/flan-t5-small' };
-async function loadTokenizer(id) {
-  try { return await AutoTokenizer.from_pretrained(id); }
-  catch (e) {
-    const fb = TOK_FALLBACK[id];
-    if (!fb) throw e;
-    log(`  (로컬 토크나이저 '${id}' 없음 → HF '${fb}' 폴백)`, 'dim');
-    return await AutoTokenizer.from_pretrained(fb);
-  }
-}
-
-// ── 배포 구성: 경로/모델 설정은 여기서 수정 ──
-const PATHS = {
-  te:      'out/text_encoder/qwen3_06b_s.onnx',
-  adapter: 'out/adapter/anima_llm_adapter.onnx',
-  vae:     'out/vae/qwen_image_vae_decoder_dyn32_2dc.onnx',
-};
-const MODELS = {
-  anima: { label: 'Anima',            dit: 'out/dit/anima_dit_dyn32_q8a4fns.onnx', ditLora: 'out/dit/anima_dit_dyn32_q8a4fnLs.onnx',
-           steps: 30, cfg: 5.0, sampler: 'er_sde', scheduler: 'simple' },
-  turbo: { label: 'Anima+Turbo v0.2', dit: 'out/dit/anima_dit_turbo32_q8a4fns.onnx', ditLora: 'out/dit/anima_dit_turbo32_q8a4fnLs.onnx',
-           steps: 8,  cfg: 1.0, sampler: 'euler',  scheduler: 'simple' },
-  custom: { label: '사용자 설정', dit: null, ditLora: null,
-           steps: 8,  cfg: 1.0, sampler: 'euler',  scheduler: 'simple' },
-};
-
-// 사용자설정: 직접 선택한 DiT 파일들 (파일명 → File). loadSession이 URL 대신 사용.
-const customFiles = new Map();
-let gpuPreference = 'high-performance';
-
-const SHIFT = 3.0, CTX_LEN = 512, CTX_DIM = 1024, LAT_C = 16;
-
-const $ = id => document.getElementById(id);
-const log = (msg, cls = '') => {
-  const el = $('log');
-  el.innerHTML += `<span class="${cls}">${msg}</span>\n`;
-  el.scrollTop = el.scrollHeight;
-};
-
-// ───────── fp16 ↔ fp32 ─────────
-// 최신 ORT Web은 브라우저가 네이티브 Float16Array를 지원하면 fp16 텐서 .data를
-// 비트패턴(Uint16Array)이 아닌 Float16Array(실제 float)로 반환한다. 양쪽 모두 대응.
-const HAS_F16 = typeof Float16Array !== 'undefined';
-
-function toF32(data) {
-  if (HAS_F16 && data instanceof Float16Array) return Float32Array.from(data);
-  if (data instanceof Float32Array) return data;
-  return f16ToF32(data);  // Uint16Array 비트패턴
-}
-
-function makeF16Tensor(f32, dims) {
-  const payload = HAS_F16 ? new Float16Array(f32) : f32ToF16(f32);
-  return new ort.Tensor('float16', payload, dims);
-}
-
-function f16ToF32(u16) {
-  const out = new Float32Array(u16.length);
-  for (let i = 0; i < u16.length; i++) {
-    const h = u16[i], s = (h & 0x8000) << 16, e = (h >> 10) & 0x1f, m = h & 0x3ff;
-    let bits;
-    if (e === 0) bits = m === 0 ? s : (() => { // subnormal
-      let mm = m, ee = -1; do { mm <<= 1; ee++; } while (!(mm & 0x400));
-      return s | ((127 - 15 - ee) << 23) | ((mm & 0x3ff) << 13);
-    })();
-    else if (e === 31) bits = s | 0x7f800000 | (m << 13);
-    else bits = s | ((e - 15 + 127) << 23) | (m << 13);
-    out[i] = new Float32Array(new Uint32Array([bits]).buffer)[0];
-  }
-  return out;
-}
-const _f32buf = new Float32Array(1), _u32buf = new Uint32Array(_f32buf.buffer);
-function f32ToF16(f32) {
-  const out = new Uint16Array(f32.length);
-  for (let i = 0; i < f32.length; i++) {
-    _f32buf[0] = f32[i];
-    const x = _u32buf[0], s = (x >>> 16) & 0x8000;
-    const e = (x >>> 23) & 0xff;
-    let m = x & 0x7fffff;
-    if (e === 255) { out[i] = s | 0x7c00 | (m ? 0x200 : 0); continue; }  // inf/nan
-    const he = e - 127 + 15;                       // fp16 지수로 리바이어스
-    if (he >= 31) out[i] = s | 0x7c00;             // overflow → inf
-    else if (he <= 0) {                            // subnormal/underflow
-      if (he < -10) out[i] = s;
-      else {
-        m = (m | 0x800000) >> (1 - he);            // implicit 1 복원 후 시프트
-        out[i] = s | ((m + 0x1000) >> 13);         // round-to-nearest
-      }
-    } else {
-      out[i] = (s | (he << 10) | (m >> 13)) + ((m >> 12) & 1);  // round
-    }
-  }
-  return out;
-}
-
-// ───────── 시드 RNG + 가우시안 ─────────
-function mulberry32(seed) {
-  let a = seed >>> 0;
-  return () => {
-    a |= 0; a = (a + 0x6D2B79F5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-function gaussianFill(arr, rand) {
-  for (let i = 0; i < arr.length; i += 2) {
-    const u1 = Math.max(rand(), 1e-12), u2 = rand();
-    const r = Math.sqrt(-2 * Math.log(u1)), th = 2 * Math.PI * u2;
-    arr[i] = r * Math.cos(th);
-    if (i + 1 < arr.length) arr[i + 1] = r * Math.sin(th);
-  }
-}
-
-// ───────── 스케줄러 (run_pipeline.py 포팅) ─────────
-const shiftSigma = t => SHIFT * t / (1 + (SHIFT - 1) * t);
-function simpleSchedule(steps) {
-  const table = Array.from({ length: 1000 }, (_, j) => shiftSigma((j + 1) / 1000));
-  const ss = table.length / steps, sigs = [];
-  for (let x = 0; x < steps; x++) sigs.push(table[table.length - 1 - Math.floor(x * ss)]);
-  sigs.push(0); return sigs;
-}
-function normalSchedule(steps) {
-  const sigs = [];
-  for (let i = 0; i <= steps; i++) sigs.push(shiftSigma(1 - i / steps));
-  return sigs;
-}
-
-// ───────── 샘플러 (run_pipeline.py 포팅) ─────────
-async function sampleEuler(denoise, x, sigmas, rand, onStep) {
-  for (let i = 0; i < sigmas.length - 1; i++) {
-    const s = sigmas[i], sn = sigmas[i + 1];
-    const den = await denoise(x, s);
-    if (sn === 0) x.set(den);
-    else for (let k = 0; k < x.length; k++) x[k] += (sn - s) * (x[k] - den[k]) / s;
-    onStep(i, s, sn);
-  }
-  return x;
-}
-
-async function sampleErSde(denoise, x, sigmas, rand, onStep, sNoise = 1.0, maxStage = 3) {
-  sigmas = sigmas.slice();
-  if (sigmas[0] >= 1.0) sigmas[0] = shiftSigma(1 - 1e-4);  // logit 발산 방지
-  const ns = l => l * (Math.exp(Math.pow(l, 0.3)) + 10);
-  const lam = sigmas.map(s => s / (1 - s));                 // CONST: λ = σ/(1-σ)
-  const NI = 200;
-  let oldDen = null, oldDenD = null;
-  const noise = new Float32Array(x.length);
-
-  for (let i = 0; i < sigmas.length - 1; i++) {
-    const den = await denoise(x, sigmas[i]);
-    const stage = Math.min(maxStage, i + 1);
-    if (sigmas[i + 1] === 0) { x.set(den); }
-    else {
-      const ls = lam[i], lt = lam[i + 1];
-      const aS = sigmas[i] / ls, aT = sigmas[i + 1] / lt;   // = 1-σ
-      const rA = aT / aS, r = ns(lt) / ns(ls);
-      const c1 = rA * r, c2 = aT * (1 - r);
-      for (let k = 0; k < x.length; k++) x[k] = c1 * x[k] + c2 * den[k];
-
-      if (stage >= 2) {
-        const dt = lt - ls, step = -dt / NI;
-        let sInt = 0, sUInt = 0;
-        for (let p = 0; p < NI; p++) {
-          const pos = lt + p * step, sp = ns(pos);
-          sInt += 1 / sp; sUInt += (pos - ls) / sp;
+      const TOK_FALLBACK = {
+        qwen3: "Qwen/Qwen3-0.6B-Base",
+        t5: "Xenova/flan-t5-small",
+      };
+      async function loadTokenizer(id) {
+        try {
+          return await AutoTokenizer.from_pretrained(id);
+        } catch (e) {
+          const fb = TOK_FALLBACK[id];
+          if (!fb) throw e;
+          log(`  (로컬 토크나이저 '${id}' 없음 → HF '${fb}' 폴백)`, "dim");
+          return await AutoTokenizer.from_pretrained(fb);
         }
-        sInt *= step; sUInt *= step;
-        const dCoef = 1 / (ls - lam[i - 1]);
-        const c3 = aT * (dt + sInt * ns(lt));
-        const denD = new Float32Array(x.length);
-        for (let k = 0; k < x.length; k++) {
-          denD[k] = (den[k] - oldDen[k]) * dCoef;
-          x[k] += c3 * denD[k];
+      }
+
+      // ── 배포 구성: 경로/모델 설정은 여기서 수정 ──
+      const PATHS = {
+        te: "out/text_encoder/qwen3_06b_s.onnx",
+        adapter: "out/adapter/anima_llm_adapter.onnx",
+        vae: "out/vae/qwen_image_vae_decoder_dyn32_2dc.onnx",
+      };
+      const MODELS = {
+        anima: {
+          label: "Anima",
+          dit: "out/dit/anima_dit_dyn32_q8a4fns.onnx",
+          ditLora: "out/dit/anima_dit_dyn32_q8a4fnLs.onnx",
+          steps: 30,
+          cfg: 5.0,
+          sampler: "er_sde",
+          scheduler: "simple",
+        },
+        turbo: {
+          label: "Anima+Turbo v0.2",
+          dit: "out/dit/anima_dit_turbo32_q8a4fns.onnx",
+          ditLora: "out/dit/anima_dit_turbo32_q8a4fnLs.onnx",
+          steps: 8,
+          cfg: 1.0,
+          sampler: "euler",
+          scheduler: "simple",
+        },
+
+        // 모델 추가: 아래에 base/turbo 항목을 등록하고 <select id="modelSel">에도
+        // 같은 key로 <option>을 추가한다. 자세한 양식은 README "Adding models" 참고.
+
+        custom: {
+          label: "사용자 설정 (직접 모델 지정)",
+          dit: null,
+          ditLora: null,
+          steps: 8,
+          cfg: 1.0,
+          sampler: "euler",
+          scheduler: "simple",
+        },
+      };
+
+      // 사용자설정: 직접 선택한 DiT 파일들 (파일명 → File). loadSession이 URL 대신 사용.
+      const customFiles = new Map();
+      let gpuPreference = "high-performance"; // 고정 (GPU 선호도 UI 제거 — 대부분 환경서 무시됨)
+
+      const SHIFT = 3.0,
+        CTX_LEN = 512,
+        CTX_DIM = 1024,
+        LAT_C = 16;
+
+      const $ = (id) => document.getElementById(id);
+      const log = (msg, cls = "") => {
+        const el = $("log");
+        el.innerHTML += `<span class="${cls}">${msg}</span>\n`;
+        el.scrollTop = el.scrollHeight;
+      };
+
+      // ───────── fp16 ↔ fp32 ─────────
+      // 최신 ORT Web은 브라우저가 네이티브 Float16Array를 지원하면 fp16 텐서 .data를
+      // 비트패턴(Uint16Array)이 아닌 Float16Array(실제 float)로 반환한다. 양쪽 모두 대응.
+      const HAS_F16 = typeof Float16Array !== "undefined";
+
+      function toF32(data) {
+        if (HAS_F16 && data instanceof Float16Array)
+          return Float32Array.from(data);
+        if (data instanceof Float32Array) return data;
+        return f16ToF32(data); // Uint16Array 비트패턴
+      }
+
+      function makeF16Tensor(f32, dims) {
+        const payload = HAS_F16 ? new Float16Array(f32) : f32ToF16(f32);
+        return new ort.Tensor("float16", payload, dims);
+      }
+
+      function f16ToF32(u16) {
+        const out = new Float32Array(u16.length);
+        for (let i = 0; i < u16.length; i++) {
+          const h = u16[i],
+            s = (h & 0x8000) << 16,
+            e = (h >> 10) & 0x1f,
+            m = h & 0x3ff;
+          let bits;
+          if (e === 0)
+            bits =
+              m === 0
+                ? s
+                : (() => {
+                    // subnormal
+                    let mm = m,
+                      ee = -1;
+                    do {
+                      mm <<= 1;
+                      ee++;
+                    } while (!(mm & 0x400));
+                    return s | ((127 - 15 - ee) << 23) | ((mm & 0x3ff) << 13);
+                  })();
+          else if (e === 31) bits = s | 0x7f800000 | (m << 13);
+          else bits = s | ((e - 15 + 127) << 23) | (m << 13);
+          out[i] = new Float32Array(new Uint32Array([bits]).buffer)[0];
         }
-        if (stage >= 3) {
-          const uCoef = 1 / ((ls - lam[i - 2]) / 2);
-          const c4 = aT * (dt * dt / 2 + sUInt * ns(lt));
-          for (let k = 0; k < x.length; k++)
-            x[k] += c4 * (denD[k] - oldDenD[k]) * uCoef;
+        return out;
+      }
+      const _f32buf = new Float32Array(1),
+        _u32buf = new Uint32Array(_f32buf.buffer);
+      function f32ToF16(f32) {
+        const out = new Uint16Array(f32.length);
+        for (let i = 0; i < f32.length; i++) {
+          _f32buf[0] = f32[i];
+          const x = _u32buf[0],
+            s = (x >>> 16) & 0x8000;
+          const e = (x >>> 23) & 0xff;
+          let m = x & 0x7fffff;
+          if (e === 255) {
+            out[i] = s | 0x7c00 | (m ? 0x200 : 0);
+            continue;
+          } // inf/nan
+          const he = e - 127 + 15; // fp16 지수로 리바이어스
+          if (he >= 31)
+            out[i] = s | 0x7c00; // overflow → inf
+          else if (he <= 0) {
+            // subnormal/underflow
+            if (he < -10) out[i] = s;
+            else {
+              m = (m | 0x800000) >> (1 - he); // implicit 1 복원 후 시프트
+              out[i] = s | ((m + 0x1000) >> 13); // round-to-nearest
+            }
+          } else {
+            out[i] = (s | (he << 10) | (m >> 13)) + ((m >> 12) & 1); // round
+          }
         }
-        oldDenD = denD;
+        return out;
       }
-      if (sNoise > 0) {
-        const v = Math.max(lt * lt - ls * ls * r * r, 0);
-        const c5 = aT * sNoise * Math.sqrt(v);
-        gaussianFill(noise, rand);
-        for (let k = 0; k < x.length; k++) x[k] += c5 * noise[k];
+
+      // ───────── 시드 RNG + 가우시안 ─────────
+      function mulberry32(seed) {
+        let a = seed >>> 0;
+        return () => {
+          a |= 0;
+          a = (a + 0x6d2b79f5) | 0;
+          let t = Math.imul(a ^ (a >>> 15), 1 | a);
+          t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+          return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+        };
       }
-    }
-    oldDen = den;
-    onStep(i, sigmas[i], sigmas[i + 1]);
-  }
-  return x;
-}
-
-// ───────── 모델 로드 ─────────
-let sess = {}, tok = {};
-
-async function fetchWithProgress(url, onProgress) {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`${url} → HTTP ${res.status}`);
-  const total = +res.headers.get('Content-Length') || 0;
-  const reader = res.body.getReader(), chunks = [];
-  let got = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    chunks.push(value); got += value.length;
-    if (total) onProgress(got / total);
-  }
-  const buf = new Uint8Array(got);
-  let off = 0;
-  for (const c of chunks) { buf.set(c, off); off += c.length; }
-  return buf;
-}
-
-// ───────── OPFS 캐시 ─────────
-// 가중치를 디스크(Origin Private File System)에 저장 → 재방문 시 다운로드 0.
-// 검증: 서버 Content-Length와 캐시 파일 크기 대조 (불일치 시 재다운로드).
-let opfsDir = null;
-async function getOpfs() {
-  if (opfsDir !== null) return opfsDir;
-  try {
-    const root = await navigator.storage.getDirectory();
-    opfsDir = await root.getDirectoryHandle('anima-cache', { create: true });
-  } catch { opfsDir = false; }  // 미지원/거부 → 캐시 없이 동작
-  return opfsDir;
-}
-const cacheName = url => url.replace(/[^a-zA-Z0-9._-]/g, '_');
-
-async function cachedFetch(url, onProgress) {
-  const dir = await getOpfs();
-  if (!dir) return fetchWithProgress(url, onProgress);
-
-  const name = cacheName(url);
-  let expected = -1;
-  try {
-    const head = await fetch(url, { method: 'HEAD' });
-    if (head.ok) expected = +head.headers.get('Content-Length') || -1;
-  } catch { /* 오프라인 등 — 캐시가 있으면 그걸 신뢰 */ }
-
-  try {
-    const fh = await dir.getFileHandle(name);
-    const file = await fh.getFile();
-    if (file.size > 0 && (expected < 0 || file.size === expected)) {
-      const buf = new Uint8Array(await file.arrayBuffer());
-      onProgress(1);
-      log(`  (캐시 히트: ${(file.size / 2 ** 20).toFixed(0)}MB)`, 'ok');
-      return buf;
-    }
-  } catch { /* 캐시 없음 */ }
-
-  const buf = await fetchWithProgress(url, onProgress);
-  try {
-    const fh = await dir.getFileHandle(name, { create: true });
-    const w = await fh.createWritable();
-    await w.write(buf);
-    await w.close();
-  } catch (e) {
-    log(`  (캐시 저장 실패 — 무시하고 진행: ${e.message})`, 'dim');
-  }
-  return buf;
-}
-
-async function clearCache() {
-  const dir = await getOpfs();
-  if (!dir) { log('OPFS 미지원 환경', 'dim'); return; }
-  let n = 0;
-  for await (const key of dir.keys()) { await dir.removeEntry(key); n++; }
-  log(`캐시 ${n}개 파일 삭제됨`, 'ok');
-}
-
-
-// ───────── LoRA (런타임 슬롯 주입) ─────────
-const lora = { items: [], lastReport: '', dirty: false };   // items: [{file, fileName, src, weight, id}]
-let loraSeq = 0;
-
-async function reloadDit() {
-  const key = $('modelSel').value;
-  if (!ditSessions[key]) return;          // 미로드 상태면 다음 로드 때 자동 반영
-  if (sess.dit === ditSessions[key]) sess.dit = null;
-  try { await ditSessions[key].release(); } catch (e) { console.warn(e); }
-  delete ditSessions[key];
-  await new Promise(r => setTimeout(r, 300));         // GPU 버퍼 반납 정리 시간
-  await loadAll();
-}
-
-const LORA_WORKER_SRC = "let svdDecompose = null;\nconst svdReady = import('https://cdn.jsdelivr.net/npm/svd-js@1.1.1/build-es/svd.js').then(m => { svdDecompose = m.default; });\n\nfunction f16ToF32(u16){const out=new Float32Array(u16.length);for(let i=0;i<u16.length;i++){const h=u16[i],s=(h&0x8000)<<16,e=(h>>10)&0x1f,m=h&0x3ff;let bits;if(e===0)bits=m===0?s:(()=>{let mm=m,ee=-1;do{mm<<=1;ee++;}while(!(mm&0x400));return s|((127-15-ee)<<23)|((mm&0x3ff)<<13);})();else if(e===31)bits=s|0x7f800000|(m<<13);else bits=s|((e-15+127)<<23)|(m<<13);out[i]=new Float32Array(new Uint32Array([bits]).buffer)[0];}return out;}\n\n// safetensors: [u64 헤더길이][JSON 헤더][텐서 데이터]\nfunction parseSafetensors(arrayBuffer) {\n  const dv = new DataView(arrayBuffer);\n  const hlen = Number(dv.getBigUint64(0, true));\n  const header = JSON.parse(new TextDecoder().decode(new Uint8Array(arrayBuffer, 8, hlen)));\n  const base = 8 + hlen;\n  const tensors = new Map();\n  for (const [k, v] of Object.entries(header)) {\n    if (k === '__metadata__') continue;\n    tensors.set(k, { dtype: v.dtype, shape: v.shape,\n                     off: base + v.data_offsets[0], len: v.data_offsets[1] - v.data_offsets[0] });\n  }\n  return { tensors, buffer: arrayBuffer };\n}\n\nfunction readTensorF32(srcFile, t) {\n  // slice 복사로 TypedArray 정렬 보장 (safetensors 오프셋은 정렬 미보장)\n  const bytes = srcFile.buffer.slice(t.off, t.off + t.len);\n  if (t.dtype === 'F32') return new Float32Array(bytes);\n  const u16 = new Uint16Array(bytes);\n  if (t.dtype === 'BF16') {\n    const out = new Float32Array(u16.length);\n    const u32 = new Uint32Array(1), f32v = new Float32Array(u32.buffer);\n    for (let i = 0; i < u16.length; i++) { u32[0] = u16[i] << 16; out[i] = f32v[0]; }\n    return out;\n  }\n  if (t.dtype === 'F16') return f16ToF32(u16);\n  throw new Error(`지원하지 않는 dtype: ${t.dtype}`);\n}\n\nconst LORA_SUFFIXES = [\n  ['.lora_down.weight', 'down'], ['.lora_up.weight', 'up'],\n  ['.lora_A.weight', 'down'], ['.lora_B.weight', 'up'],\n  ['.lora_down', 'down'], ['.lora_up', 'up'],\n  ['.lora_A', 'down'], ['.lora_B', 'up'], ['.alpha', 'alpha'],\n];\nconst LORA_PREFIXES = ['lora_unet_', 'diffusion_model.', 'model.diffusion_model.',\n                       'transformer.', 'lora_transformer_', 'base_model.model.', 'unet.'];\n\nfunction classifyLoraKey(k) {\n  if (k.startsWith('lora_te')) return { skip: 'te' };\n  let role = null, base = k;\n  for (const [suf, r] of LORA_SUFFIXES)\n    if (k.endsWith(suf)) { base = k.slice(0, -suf.length); role = r; break; }\n  if (!role) return { skip: 'unknown' };              // lokr_* 등\n  for (const p of LORA_PREFIXES)\n    if (base.startsWith(p)) { base = base.slice(p.length); break; }\n  return { mod: base.replace(/\\./g, '_'), role };     // blocks_0_self_attn_q_proj\n}\n\n// 멀티 LoRA를 manifest 슬롯 레이아웃의 fp32 버퍼로 병합 변환.\n// 모듈별로 ΔW = Σ_i s_i·up_i·down_i 를 rank R로 정확 분해 (ΔW 미실체화,\n// 스택 [up...]·[down...] 의 2단 그람 고유분해 thin SVD). A(K,R)=V·√Σ 형태가 아니라\n// 슬롯 규약(y += B(Ax))에 맞춰 A=Vᵀ스케일, B=UΣ 로 재구성.\n\n// 한 모듈의 LoRA 기여 목록 → (A: K×R, B: R×N) Float32. svd-js 2단 thin-SVD.\n// ΔW = M(N×rt)·P(rt×K) 를 rank R로 정확 절단 분해. ΔW 미실체화.\nfunction mergeModule(contribs, K, N, R) {\n  const rt = contribs.reduce((s, c) => s + c.r, 0);\n  if (rt === 0) return null;\n  // M (N×rt) = [up_i·s_i],  P (rt×K) = [down_i]\n  const M = Array.from({ length: N }, () => new Array(rt).fill(0));\n  const P = Array.from({ length: rt }, () => new Float64Array(K));\n  let col = 0;\n  for (const c of contribs) {\n    for (let n = 0; n < N; n++) for (let j = 0; j < c.r; j++) M[n][col + j] = c.up[n * c.r + j] * c.scale;\n    for (let j = 0; j < c.r; j++) for (let k = 0; k < K; k++) P[col + j][k] = c.down[j * K + k];\n    col += c.r;\n  }\n  // (1) M = Um(N×rt) Σm Wmᵀ.  svd-js는 m≥n 요구 — N≥rt는 일반 성립.\n  const { u: Um, v: Wm, q: Sm } = svdDecompose(M, true, true);\n  // (2) Y = Σm·Wmᵀ·P  (rt×K)\n  const Y = [];\n  for (let i = 0; i < rt; i++) {\n    const row = new Array(K).fill(0);\n    for (let k = 0; k < K; k++) { let s = 0; for (let j = 0; j < rt; j++) s += Wm[j][i] * P[j][k]; row[k] = Sm[i] * s; }\n    Y.push(row);\n  }\n  // Yᵀ(K×rt) SVD → u=Vk(K×rt: ΔW의 우특이), v=Wy(rt×rt), q=Sy\n  const Yt = [];\n  for (let k = 0; k < K; k++) { const r = new Array(rt); for (let i = 0; i < rt; i++) r[i] = Y[i][k]; Yt.push(r); }\n  const { u: Vk, v: Wy, q: Sy } = svdDecompose(Yt, true, true);\n  // 상위 R개 (svd-js q 미정렬)\n  const idx = [...Sy.keys()].sort((a, b) => Sy[b] - Sy[a]).slice(0, R);\n  const A = new Float32Array(K * R), B = new Float32Array(R * N);\n  // ΔW = (Um·Wy)·Σy·Vkᵀ → B = (Um·Wy·Σy)ᵀ, A = Vk\n  for (let jj = 0; jj < idx.length; jj++) {\n    const c = idx[jj], sv = Sy[c];\n    if (sv < 1e-12) continue;\n    for (let k = 0; k < K; k++) A[k * R + jj] = Vk[k][c];\n    for (let n = 0; n < N; n++) { let s = 0; for (let r = 0; r < rt; r++) s += Um[n][r] * Wy[r][c]; B[jj * N + n] = s * sv; }\n  }\n  return { A, B };\n}\n\n// 단일 LoRA: SVD 불필요. down/up을 슬롯 레이아웃에 직접 배치 (scale 미적용 —\n// 강도는 그래프 입력 lora_scale이 런타임에 곱하므로 재컴파일 없이 슬라이더 즉시 반영).\n// alpha/r0 정규화만 B에 흡수. r0>R이면 상위 R랭크만 (절단, 드묾).\nfunction convertLoraSingle(item, manifest) {\n  const R = manifest.rank;\n  const total = manifest.entries.reduce((m, e) => Math.max(m, e.B.offset + R * e.N * 4), 0);\n  const out = new Float32Array(total / 4);\n  const mods = new Map(); let skipTe = 0, skipUnknown = 0;\n  for (const [k, t] of item.src.tensors) {\n    const c = classifyLoraKey(k);\n    if (c.skip) { c.skip === 'te' ? skipTe++ : skipUnknown++; continue; }\n    if (!mods.has(c.mod)) mods.set(c.mod, {});\n    mods.get(c.mod)[c.role] = t;\n  }\n  let applied = 0, missing = 0, mismatch = 0, trunc = 0; const seen = new Set();\n  let _done = 0; const _tot = manifest.entries.length;\n  for (const e of manifest.entries) {\n    if ((++_done & 63) === 0) self.postMessage({ type:'progress', value: 0.1 + 0.85*_done/_tot });\n    const km = e.key.match(/^b(\\d+)_(.+)$/);\n    const srcMod = `blocks_${km[1]}_${km[2]}`;\n    const ent = mods.get(srcMod);\n    if (!ent || !ent.down || !ent.up) { missing++; continue; }\n    const r0 = ent.down.shape[0], K = ent.down.shape[1], N = ent.up.shape[0];\n    if (K !== e.K || N !== e.N || ent.up.shape[1] !== r0) { mismatch++; continue; }\n    seen.add(srcMod);\n    const down = readTensorF32(item.src, ent.down);   // (r0, K)\n    const up = readTensorF32(item.src, ent.up);       // (N, r0)\n    const alpha = ent.alpha ? readTensorF32(item.src, ent.alpha)[0] : r0;\n    const scale = alpha / r0;                          // 강도(weight)는 lora_scale이 처리 — 여기선 제외\n    const rUse = Math.min(r0, R);\n    if (r0 > R) trunc++;\n    const aBase = e.A.offset / 4, bBase = e.B.offset / 4;\n    // A(K,R) = downᵀ 제로패딩,  B(R,N) = upᵀ·scale 제로패딩\n    for (let j = 0; j < rUse; j++) { const dRow = j * K; for (let k = 0; k < K; k++) out[aBase + k * R + j] = down[dRow + k]; }\n    for (let n = 0; n < N; n++) { const uRow = n * r0; for (let j = 0; j < rUse; j++) out[bBase + j * N + n] = up[uRow + j] * scale; }\n    applied++;\n  }\n  const notes = [];\n  if (missing) notes.push(`빈 슬롯 ${missing}`);\n  const extra = [...mods.keys()].filter(x => !seen.has(x)).length;\n  if (extra) notes.push(`슬롯 밖 모듈 ${extra}`);\n  if (skipTe) notes.push(`TE 키 ${skipTe} 무시`);\n  if (skipUnknown) notes.push(`미지원 키 ${skipUnknown}`);\n  if (trunc) notes.push(`랭크 절단 ${trunc}`);\n  if (mismatch) notes.push(`차원 불일치 ${mismatch}`);\n  return { bytes: new Uint8Array(out.buffer),\n           report: { applied, total: manifest.entries.length, notes: notes.join(' · ') } };\n}\n\nfunction convertLoraMulti(items, manifest) {\n  const R = manifest.rank;\n  const total = manifest.entries.reduce((m, e) => Math.max(m, e.B.offset + R * e.N * 4), 0);\n  const out = new Float32Array(total / 4);\n  // 각 LoRA를 모듈맵으로 미리 분해\n  const perLora = items.map(it => {\n    const mods = new Map(); let skipTe = 0, skipUnknown = 0;\n    for (const [k, t] of it.src.tensors) {\n      const c = classifyLoraKey(k);\n      if (c.skip) { c.skip === 'te' ? skipTe++ : skipUnknown++; continue; }\n      if (!mods.has(c.mod)) mods.set(c.mod, {});\n      mods.get(c.mod)[c.role] = t;\n    }\n    return { it, mods, skipTe, skipUnknown, seen: new Set() };\n  });\n  let appliedSlots = 0, missingAll = 0, mismatch = 0, trunc = 0;\n  let _done = 0; const _tot = manifest.entries.length;\n  for (const e of manifest.entries) {\n    if ((++_done & 31) === 0) self.postMessage({ type:'progress', value: 0.1 + 0.85*_done/_tot });\n    const km = e.key.match(/^b(\\d+)_(.+)$/);\n    const srcMod = `blocks_${km[1]}_${km[2]}`;\n    const contribs = [];\n    for (const pl of perLora) {\n      const ent = pl.mods.get(srcMod);\n      if (!ent || !ent.down || !ent.up) continue;\n      const r0 = ent.down.shape[0], K = ent.down.shape[1], N = ent.up.shape[0];\n      if (K !== e.K || N !== e.N || ent.up.shape[1] !== r0) { mismatch++; continue; }\n      pl.seen.add(srcMod);\n      const alpha = ent.alpha ? readTensorF32(pl.it.src, ent.alpha)[0] : r0;\n      contribs.push({ r: r0, down: readTensorF32(pl.it.src, ent.down),\n                      up: readTensorF32(pl.it.src, ent.up),\n                      scale: (alpha / r0) * pl.it.weight });\n      if (r0 > R) trunc++;\n    }\n    if (contribs.length === 0) { missingAll++; continue; }\n    const merged = mergeModule(contribs, e.K, e.N, R);\n    if (!merged) { missingAll++; continue; }\n    const aBase = e.A.offset / 4, bBase = e.B.offset / 4;\n    out.set(merged.A, aBase);\n    out.set(merged.B, bBase);\n    appliedSlots++;\n  }\n  const notes = [];\n  if (missingAll) notes.push(`빈 슬롯 ${missingAll}`);\n  let teTot = 0, unkTot = 0, extraTot = 0;\n  for (const pl of perLora) {\n    teTot += pl.skipTe; unkTot += pl.skipUnknown;\n    extraTot += [...pl.mods.keys()].filter(m => !pl.seen.has(m)).length;\n  }\n  if (extraTot) notes.push(`슬롯 밖 모듈 ${extraTot}`);\n  if (teTot) notes.push(`TE 키 ${teTot} 무시`);\n  if (unkTot) notes.push(`미지원 키 ${unkTot}`);\n  if (trunc) notes.push(`랭크 절단 ${trunc}`);\n  if (mismatch) notes.push(`차원 불일치 ${mismatch}`);\n  return { bytes: new Uint8Array(out.buffer),\n           report: { applied: appliedSlots, total: manifest.entries.length, notes: notes.join(' · ') } };\n}\n\nself.onmessage = async (ev) => {\n  const { manifest, loras } = ev.data;\n  try {\n    await svdReady;\n    const items = loras.map(l => ({ src: parseSafetensors(l.buffer), weight: l.weight, fileName: l.fileName }));\n    self.postMessage({ type:'progress', value: 0.05 });\n    // 단일 LoRA는 SVD 없이 직접 배치 (강도는 그래프 lora_scale) → 즉시 + 정확\n    const { bytes, report } = (items.length === 1)\n      ? convertLoraSingle(items[0], manifest)\n      : convertLoraMulti(items, manifest);\n    self.postMessage({ type:'done', bytes, report }, [bytes.buffer]);\n  } catch (e) { self.postMessage({ type:'error', message: e.message }); }\n};\n";
-
-// ───────── LoRA 변환 Worker (svd-js, 메인 비차단) ─────────
-let _loraWorker = null;
-function getLoraWorker() {
-  if (_loraWorker) return _loraWorker;
-  const blob = new Blob([LORA_WORKER_SRC], { type: 'application/javascript' });
-  _loraWorker = new Worker(URL.createObjectURL(blob), { type: 'module' });
-  return _loraWorker;
-}
-function buildLoraBinAsync(manifest, active, onProg) {
-  return new Promise((resolve, reject) => {
-    const wk = getLoraWorker();
-    const handle = (ev) => {
-      const m = ev.data;
-      if (m.type === 'progress') onProg && onProg(m.value);
-      else if (m.type === 'done') { wk.removeEventListener('message', handle); resolve({ bytes: m.bytes, report: m.report }); }
-      else if (m.type === 'error') { wk.removeEventListener('message', handle); reject(new Error(m.message)); }
-    };
-    wk.addEventListener('message', handle);
-    const loras = active.map(i => ({ fileName: i.fileName, weight: i.weight, buffer: i.src.buffer }));
-    wk.postMessage({ manifest, loras });
-  });
-}
-
-// 파일명에서 디렉터리 제거 (manifest는 베이스명으로 샤드를 참조)
-function baseName(p) { return p.split('/').pop(); }
-
-async function readFileBytes(file) { return new Uint8Array(await file.arrayBuffer()); }
-
-async function loadSession(name, url, onProgress) {
-  const opts = { executionProviders: ['webgpu'] };
-
-  // 0) 사용자설정: 메모리 파일맵에서 직접 조립 (네트워크/OPFS 미사용)
-  if (url === null && name.startsWith('dit:')) {
-    const onnxFile = [...customFiles.keys()].find(n => n.endsWith('.onnx') && !n.endsWith('.data'));
-    if (!onnxFile) throw new Error('.onnx 파일이 선택되지 않았습니다');
-    log(`${name} (사용자 파일: ${onnxFile})...`, 'dim');
-    const graph = await readFileBytes(customFiles.get(onnxFile));
-    const maniName = onnxFile + '.manifest.json';
-    if (customFiles.has(maniName)) {
-      const mani = JSON.parse(new TextDecoder().decode(await readFileBytes(customFiles.get(maniName))));
-      const ext = [];
-      for (const sName of mani.shards) {
-        const fh = customFiles.get(sName) || customFiles.get(baseName(sName));
-        if (!fh) throw new Error(`샤드 누락: ${sName} (선택 목록에 포함되었는지 확인)`);
-        ext.push({ path: baseName(sName), data: await readFileBytes(fh) });
+      function gaussianFill(arr, rand) {
+        for (let i = 0; i < arr.length; i += 2) {
+          const u1 = Math.max(rand(), 1e-12),
+            u2 = rand();
+          const r = Math.sqrt(-2 * Math.log(u1)),
+            th = 2 * Math.PI * u2;
+          arr[i] = r * Math.cos(th);
+          if (i + 1 < arr.length) arr[i + 1] = r * Math.sin(th);
+        }
       }
-      opts.externalData = ext;
-    } else if (customFiles.has(onnxFile + '.data')) {
-      opts.externalData = [{ path: onnxFile + '.data',
-                             data: await readFileBytes(customFiles.get(onnxFile + '.data')) }];
-    }
-    // 사용자 모델의 LoRA manifest (선택)
-    const lmanName = onnxFile + '.lora_manifest.json';
-    let lman = customFiles.has(lmanName)
-      ? JSON.parse(new TextDecoder().decode(await readFileBytes(customFiles.get(lmanName)))) : null;
-    if (lman) {
-      const total = lman.entries.reduce((m, e) => Math.max(m, e.B.offset + lman.rank * e.N * 4), 0);
-      const active = lora.items.filter(i => i.src);
-      let bytes;
-      if (active.length) {
-        log(`LoRA 병합 (Worker, ${active.length}개)...`, 'dim');
-        const c = await buildLoraBinAsync(lman, active, f => {
-          $('loadBar').style.width = (f * 100) + '%'; $('loadStat').textContent = `LoRA 병합 ${(f * 100) | 0}%`; });
-        bytes = c.bytes;
-        lora.lastReport = `${active.length}개 LoRA — ${c.report.applied}/${c.report.total} 슬롯`;
-      } else bytes = new Uint8Array(total);
-      (opts.externalData = opts.externalData || []).push({ path: lman.bin, data: bytes });
-    }
-    log(`${name} 컴파일...`, 'dim');
-    const s = await ort.InferenceSession.create(graph, opts);
-    s.loraManifest = lman;
-    onProgress(1); log(`${name} OK`, 'ok');
-    return s;
-  }
 
-  log(`${name} 그래프 다운로드...`, 'dim');
-  const graph = await cachedFetch(url, f => onProgress(f * 0.05));
+      // ───────── 스케줄러 (run_pipeline.py 포팅) ─────────
+      const shiftSigma = (t) => (SHIFT * t) / (1 + (SHIFT - 1) * t);
+      function simpleSchedule(steps) {
+        const table = Array.from({ length: 1000 }, (_, j) =>
+          shiftSigma((j + 1) / 1000),
+        );
+        const ss = table.length / steps,
+          sigs = [];
+        for (let x = 0; x < steps; x++)
+          sigs.push(table[table.length - 1 - Math.floor(x * ss)]);
+        sigs.push(0);
+        return sigs;
+      }
+      function normalSchedule(steps) {
+        const sigs = [];
+        for (let i = 0; i <= steps; i++) sigs.push(shiftSigma(1 - i / steps));
+        return sigs;
+      }
 
-  // 1) 샤드 manifest 우선 (shard_onnx_data.py 산출물 — ArrayBuffer 2GB 상한 우회)
-  const maniRes = await fetch(url + '.manifest.json').catch(() => null);
-  if (maniRes && maniRes.ok) {
-    const mani = await maniRes.json();
-    const dir = url.slice(0, url.lastIndexOf('/') + 1);
-    const ext = [];
-    for (let i = 0; i < mani.shards.length; i++) {
-      const sName = mani.shards[i];
-      log(`${name} 샤드 ${i + 1}/${mani.shards.length} (${sName})...`, 'dim');
-      const data = await cachedFetch(dir + sName, f =>
-        onProgress(0.05 + ((i + f) / mani.shards.length) * 0.85));
-      ext.push({ path: sName, data });
-    }
-    opts.externalData = ext;
-  } else {
-    // 2) 단일 .data 폴백 (dynamo exporter 기본 산출물)
-    const dataUrl = url + '.data';
-    const probe = await fetch(dataUrl, { method: 'HEAD' }).catch(() => null);
-    if (probe && probe.ok) {
-      log(`${name} 가중치 다운로드 (${dataUrl.split('/').pop()})...`, 'dim');
-      const data = await cachedFetch(dataUrl, f => onProgress(0.05 + f * 0.85));
-      opts.externalData = [{ path: dataUrl.split('/').pop(), data }];
-    }
-  }
-  // LoRA 슬롯 manifest가 있으면 lora.bin을 변환본 또는 제로 버퍼로 주입
-  let lman = null;
-  const lres = await fetch(url + '.lora_manifest.json').catch(() => null);
-  if (lres && lres.ok) {
-    lman = await lres.json();
-    const total = lman.entries.reduce((m, e) => Math.max(m, e.B.offset + lman.rank * e.N * 4), 0);
-    let bytes;
-    const active = lora.items.filter(i => i.src);
-    if (active.length) {
-      log(`LoRA 병합 (Worker, ${active.length}개)...`, 'dim');
-      const c = await buildLoraBinAsync(lman, active, f => {
-        $('loadBar').style.width = (f * 100) + '%';
-        $('loadStat').textContent = `LoRA 병합 ${(f * 100) | 0}%`;
+      // ───────── 샘플러 (run_pipeline.py 포팅) ─────────
+      // ───────── latent → RGB 프리뷰 (Wan2.1 16채널 근사, VAE 미사용) ─────────
+      // 계수 출처: ComfyUI latent_formats.py (Wan/Qwen 16ch). denoised latent를 latent 해상도로
+      // 빠르게 RGB 근사 → 생성 중 캔버스에 표시 (VAE 호출 없음).
+      const LATENT_RGB = [
+        // 16×3 (R,G,B)
+        [-0.1299, -0.1692, 0.2932],
+        [0.0671, 0.0406, 0.0442],
+        [0.3568, 0.2548, 0.1747],
+        [0.0372, 0.2344, 0.142],
+        [0.0313, 0.0189, -0.0328],
+        [0.0296, -0.0956, -0.0665],
+        [-0.3477, -0.4059, -0.2925],
+        [0.0166, 0.1902, 0.1975],
+        [-0.0412, 0.0267, -0.1364],
+        [-0.1293, 0.074, 0.1636],
+        [0.068, 0.3019, 0.1128],
+        [0.0032, 0.0581, 0.0639],
+        [-0.1251, 0.0927, 0.1699],
+        [0.006, -0.0633, 0.0005],
+        [0.3477, 0.2275, 0.295],
+        [0.1984, 0.0913, 0.1861],
+      ];
+      const LATENT_RGB_BIAS = [-0.1835, -0.0868, -0.336];
+
+      // latentF32: (1,16,1,H,W) 평면 packed. latent 해상도(H×W) RGB 근사를 캔버스에 표시.
+      function previewLatent(latentF32, H, W) {
+        const plane = H * W;
+        const im = new ImageData(W, H);
+        for (let p = 0; p < plane; p++) {
+          let r = LATENT_RGB_BIAS[0],
+            g = LATENT_RGB_BIAS[1],
+            b = LATENT_RGB_BIAS[2];
+          for (let c = 0; c < 16; c++) {
+            const v = latentF32[c * plane + p];
+            r += v * LATENT_RGB[c][0];
+            g += v * LATENT_RGB[c][1];
+            b += v * LATENT_RGB[c][2];
+          }
+          // factors 출력은 대략 ±0.5 범위 — 그대로 ×255면 채도가 과함. 진폭을 줄여 완화.
+          im.data[p * 4] = Math.min(255, Math.max(0, (r * 0.5 + 0.5) * 255));
+          im.data[p * 4 + 1] = Math.min(
+            255,
+            Math.max(0, (g * 0.5 + 0.5) * 255),
+          );
+          im.data[p * 4 + 2] = Math.min(
+            255,
+            Math.max(0, (b * 0.5 + 0.5) * 255),
+          );
+          im.data[p * 4 + 3] = 255;
+        }
+        const cv = $("canvas");
+        cv.width = W;
+        cv.height = H;
+        cv.getContext("2d").putImageData(im, 0, 0);
+      }
+
+      async function sampleEuler(denoise, x, sigmas, rand, onStep) {
+        for (let i = 0; i < sigmas.length - 1; i++) {
+          const s = sigmas[i],
+            sn = sigmas[i + 1];
+          const den = await denoise(x, s);
+          if (sn === 0) x.set(den);
+          else
+            for (let k = 0; k < x.length; k++)
+              x[k] += ((sn - s) * (x[k] - den[k])) / s;
+          if ((await onStep(i, s, sn, den)) === false) return null; // 중단
+        }
+        return x;
+      }
+
+      async function sampleErSde(
+        denoise,
+        x,
+        sigmas,
+        rand,
+        onStep,
+        sNoise = 1.0,
+        maxStage = 3,
+      ) {
+        sigmas = sigmas.slice();
+        if (sigmas[0] >= 1.0) sigmas[0] = shiftSigma(1 - 1e-4); // logit 발산 방지
+        const ns = (l) => l * (Math.exp(Math.pow(l, 0.3)) + 10);
+        const lam = sigmas.map((s) => s / (1 - s)); // CONST: λ = σ/(1-σ)
+        const NI = 200;
+        let oldDen = null,
+          oldDenD = null;
+        const noise = new Float32Array(x.length);
+
+        for (let i = 0; i < sigmas.length - 1; i++) {
+          const den = await denoise(x, sigmas[i]);
+          const stage = Math.min(maxStage, i + 1);
+          if (sigmas[i + 1] === 0) {
+            x.set(den);
+          } else {
+            const ls = lam[i],
+              lt = lam[i + 1];
+            const aS = sigmas[i] / ls,
+              aT = sigmas[i + 1] / lt; // = 1-σ
+            const rA = aT / aS,
+              r = ns(lt) / ns(ls);
+            const c1 = rA * r,
+              c2 = aT * (1 - r);
+            for (let k = 0; k < x.length; k++) x[k] = c1 * x[k] + c2 * den[k];
+
+            if (stage >= 2) {
+              const dt = lt - ls,
+                step = -dt / NI;
+              let sInt = 0,
+                sUInt = 0;
+              for (let p = 0; p < NI; p++) {
+                const pos = lt + p * step,
+                  sp = ns(pos);
+                sInt += 1 / sp;
+                sUInt += (pos - ls) / sp;
+              }
+              sInt *= step;
+              sUInt *= step;
+              const dCoef = 1 / (ls - lam[i - 1]);
+              const c3 = aT * (dt + sInt * ns(lt));
+              const denD = new Float32Array(x.length);
+              for (let k = 0; k < x.length; k++) {
+                denD[k] = (den[k] - oldDen[k]) * dCoef;
+                x[k] += c3 * denD[k];
+              }
+              if (stage >= 3) {
+                const uCoef = 1 / ((ls - lam[i - 2]) / 2);
+                const c4 = aT * ((dt * dt) / 2 + sUInt * ns(lt));
+                for (let k = 0; k < x.length; k++)
+                  x[k] += c4 * (denD[k] - oldDenD[k]) * uCoef;
+              }
+              oldDenD = denD;
+            }
+            if (sNoise > 0) {
+              const v = Math.max(lt * lt - ls * ls * r * r, 0);
+              const c5 = aT * sNoise * Math.sqrt(v);
+              gaussianFill(noise, rand);
+              for (let k = 0; k < x.length; k++) x[k] += c5 * noise[k];
+            }
+          }
+          oldDen = den;
+          if ((await onStep(i, sigmas[i], sigmas[i + 1], den)) === false)
+            return null; // 중단
+        }
+        return x;
+      }
+
+      // ───────── 모델 로드 ─────────
+      let sess = {},
+        tok = {};
+
+      async function fetchWithProgress(url, onProgress) {
+        const res = await fetch(url);
+        if (!res.ok) throw new Error(`${url} → HTTP ${res.status}`);
+        const total = +res.headers.get("Content-Length") || 0;
+        const reader = res.body.getReader(),
+          chunks = [];
+        let got = 0;
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          chunks.push(value);
+          got += value.length;
+          if (total) onProgress(got / total);
+        }
+        const buf = new Uint8Array(got);
+        let off = 0;
+        for (const c of chunks) {
+          buf.set(c, off);
+          off += c.length;
+        }
+        return buf;
+      }
+
+      // ───────── OPFS 캐시 ─────────
+      // 가중치를 디스크(Origin Private File System)에 저장 → 재방문 시 다운로드 0.
+      // 검증: 서버 Content-Length와 캐시 파일 크기 대조 (불일치 시 재다운로드).
+      let opfsDir = null;
+      async function getOpfs() {
+        if (opfsDir !== null) return opfsDir;
+        try {
+          const root = await navigator.storage.getDirectory();
+          opfsDir = await root.getDirectoryHandle("anima-cache", {
+            create: true,
+          });
+        } catch {
+          opfsDir = false;
+        } // 미지원/거부 → 캐시 없이 동작
+        return opfsDir;
+      }
+      const cacheName = (url) => url.replace(/[^a-zA-Z0-9._-]/g, "_");
+
+      async function cachedFetch(url, onProgress) {
+        const dir = await getOpfs();
+        if (!dir) return fetchWithProgress(url, onProgress);
+
+        const name = cacheName(url);
+        let expected = -1;
+        try {
+          const head = await fetch(url, { method: "HEAD" });
+          if (head.ok) expected = +head.headers.get("Content-Length") || -1;
+        } catch {
+          /* 오프라인 등 — 캐시가 있으면 그걸 신뢰 */
+        }
+
+        try {
+          const fh = await dir.getFileHandle(name);
+          const file = await fh.getFile();
+          if (file.size > 0 && (expected < 0 || file.size === expected)) {
+            const buf = new Uint8Array(await file.arrayBuffer());
+            onProgress(1);
+            log(`  (캐시 히트: ${(file.size / 2 ** 20).toFixed(0)}MB)`, "ok");
+            return buf;
+          }
+        } catch {
+          /* 캐시 없음 */
+        }
+
+        const buf = await fetchWithProgress(url, onProgress);
+        try {
+          const fh = await dir.getFileHandle(name, { create: true });
+          const w = await fh.createWritable();
+          await w.write(buf);
+          await w.close();
+        } catch (e) {
+          log(`  (캐시 저장 실패 — 무시하고 진행: ${e.message})`, "dim");
+        }
+        return buf;
+      }
+
+      async function clearCache() {
+        const dir = await getOpfs();
+        if (!dir) {
+          log("OPFS 미지원 환경", "dim");
+          return;
+        }
+        let n = 0;
+        for await (const key of dir.keys()) {
+          await dir.removeEntry(key);
+          n++;
+        }
+        log(`캐시 ${n}개 파일 삭제됨`, "ok");
+      }
+
+      // ───────── LoRA (런타임 슬롯 주입) ─────────
+      const lora = { items: [], lastReport: "", dirty: false }; // items: [{file, fileName, src, weight, id}]
+      let loraSeq = 0;
+
+      async function reloadDit() {
+        const key = $("modelSel").value;
+        if (!ditSessions[key]) return; // 미로드 상태면 다음 로드 때 자동 반영
+        if (sess.dit === ditSessions[key]) sess.dit = null;
+        try {
+          await ditSessions[key].release();
+        } catch (e) {
+          console.warn(e);
+        }
+        delete ditSessions[key];
+        await new Promise((r) => setTimeout(r, 300)); // GPU 버퍼 반납 정리 시간
+        await loadAll();
+      }
+
+      const LORA_WORKER_SRC =
+        "let svdDecompose = null;\nconst svdReady = import('https://cdn.jsdelivr.net/npm/svd-js@1.1.1/build-es/svd.js').then(m => { svdDecompose = m.default; });\n\nfunction f16ToF32(u16){const out=new Float32Array(u16.length);for(let i=0;i<u16.length;i++){const h=u16[i],s=(h&0x8000)<<16,e=(h>>10)&0x1f,m=h&0x3ff;let bits;if(e===0)bits=m===0?s:(()=>{let mm=m,ee=-1;do{mm<<=1;ee++;}while(!(mm&0x400));return s|((127-15-ee)<<23)|((mm&0x3ff)<<13);})();else if(e===31)bits=s|0x7f800000|(m<<13);else bits=s|((e-15+127)<<23)|(m<<13);out[i]=new Float32Array(new Uint32Array([bits]).buffer)[0];}return out;}\n\n// safetensors: [u64 헤더길이][JSON 헤더][텐서 데이터]\nfunction parseSafetensors(arrayBuffer) {\n  const dv = new DataView(arrayBuffer);\n  const hlen = Number(dv.getBigUint64(0, true));\n  const header = JSON.parse(new TextDecoder().decode(new Uint8Array(arrayBuffer, 8, hlen)));\n  const base = 8 + hlen;\n  const tensors = new Map();\n  for (const [k, v] of Object.entries(header)) {\n    if (k === '__metadata__') continue;\n    tensors.set(k, { dtype: v.dtype, shape: v.shape,\n                     off: base + v.data_offsets[0], len: v.data_offsets[1] - v.data_offsets[0] });\n  }\n  return { tensors, buffer: arrayBuffer };\n}\n\nfunction readTensorF32(srcFile, t) {\n  // slice 복사로 TypedArray 정렬 보장 (safetensors 오프셋은 정렬 미보장)\n  const bytes = srcFile.buffer.slice(t.off, t.off + t.len);\n  if (t.dtype === 'F32') return new Float32Array(bytes);\n  const u16 = new Uint16Array(bytes);\n  if (t.dtype === 'BF16') {\n    const out = new Float32Array(u16.length);\n    const u32 = new Uint32Array(1), f32v = new Float32Array(u32.buffer);\n    for (let i = 0; i < u16.length; i++) { u32[0] = u16[i] << 16; out[i] = f32v[0]; }\n    return out;\n  }\n  if (t.dtype === 'F16') return f16ToF32(u16);\n  throw new Error(`지원하지 않는 dtype: ${t.dtype}`);\n}\n\nconst LORA_SUFFIXES = [\n  ['.lora_down.weight', 'down'], ['.lora_up.weight', 'up'],\n  ['.lora_A.weight', 'down'], ['.lora_B.weight', 'up'],\n  ['.lora_down', 'down'], ['.lora_up', 'up'],\n  ['.lora_A', 'down'], ['.lora_B', 'up'], ['.alpha', 'alpha'],\n];\nconst LORA_PREFIXES = ['lora_unet_', 'diffusion_model.', 'model.diffusion_model.',\n                       'transformer.', 'lora_transformer_', 'base_model.model.', 'unet.'];\n\nfunction classifyLoraKey(k) {\n  if (k.startsWith('lora_te')) return { skip: 'te' };\n  let role = null, base = k;\n  for (const [suf, r] of LORA_SUFFIXES)\n    if (k.endsWith(suf)) { base = k.slice(0, -suf.length); role = r; break; }\n  if (!role) return { skip: 'unknown' };              // lokr_* 등\n  for (const p of LORA_PREFIXES)\n    if (base.startsWith(p)) { base = base.slice(p.length); break; }\n  return { mod: base.replace(/\\./g, '_'), role };     // blocks_0_self_attn_q_proj\n}\n\n// 멀티 LoRA를 manifest 슬롯 레이아웃의 fp32 버퍼로 병합 변환.\n// 모듈별로 ΔW = Σ_i s_i·up_i·down_i 를 rank R로 정확 분해 (ΔW 미실체화,\n// 스택 [up...]·[down...] 의 2단 그람 고유분해 thin SVD). A(K,R)=V·√Σ 형태가 아니라\n// 슬롯 규약(y += B(Ax))에 맞춰 A=Vᵀ스케일, B=UΣ 로 재구성.\n\n// 한 모듈의 LoRA 기여 목록 → (A: K×R, B: R×N) Float32. svd-js 2단 thin-SVD.\n// ΔW = M(N×rt)·P(rt×K) 를 rank R로 정확 절단 분해. ΔW 미실체화.\nfunction mergeModule(contribs, K, N, R) {\n  const rt = contribs.reduce((s, c) => s + c.r, 0);\n  if (rt === 0) return null;\n  // M (N×rt) = [up_i·s_i],  P (rt×K) = [down_i]\n  const M = Array.from({ length: N }, () => new Array(rt).fill(0));\n  const P = Array.from({ length: rt }, () => new Float64Array(K));\n  let col = 0;\n  for (const c of contribs) {\n    for (let n = 0; n < N; n++) for (let j = 0; j < c.r; j++) M[n][col + j] = c.up[n * c.r + j] * c.scale;\n    for (let j = 0; j < c.r; j++) for (let k = 0; k < K; k++) P[col + j][k] = c.down[j * K + k];\n    col += c.r;\n  }\n  // (1) M = Um(N×rt) Σm Wmᵀ.  svd-js는 m≥n 요구 — N≥rt는 일반 성립.\n  const { u: Um, v: Wm, q: Sm } = svdDecompose(M, true, true);\n  // (2) Y = Σm·Wmᵀ·P  (rt×K)\n  const Y = [];\n  for (let i = 0; i < rt; i++) {\n    const row = new Array(K).fill(0);\n    for (let k = 0; k < K; k++) { let s = 0; for (let j = 0; j < rt; j++) s += Wm[j][i] * P[j][k]; row[k] = Sm[i] * s; }\n    Y.push(row);\n  }\n  // Yᵀ(K×rt) SVD → u=Vk(K×rt: ΔW의 우특이), v=Wy(rt×rt), q=Sy\n  const Yt = [];\n  for (let k = 0; k < K; k++) { const r = new Array(rt); for (let i = 0; i < rt; i++) r[i] = Y[i][k]; Yt.push(r); }\n  const { u: Vk, v: Wy, q: Sy } = svdDecompose(Yt, true, true);\n  // 상위 R개 (svd-js q 미정렬)\n  const idx = [...Sy.keys()].sort((a, b) => Sy[b] - Sy[a]).slice(0, R);\n  const A = new Float32Array(K * R), B = new Float32Array(R * N);\n  // ΔW = (Um·Wy)·Σy·Vkᵀ → B = (Um·Wy·Σy)ᵀ, A = Vk\n  for (let jj = 0; jj < idx.length; jj++) {\n    const c = idx[jj], sv = Sy[c];\n    if (sv < 1e-12) continue;\n    for (let k = 0; k < K; k++) A[k * R + jj] = Vk[k][c];\n    for (let n = 0; n < N; n++) { let s = 0; for (let r = 0; r < rt; r++) s += Um[n][r] * Wy[r][c]; B[jj * N + n] = s * sv; }\n  }\n  return { A, B };\n}\n\n// 단일 LoRA: SVD 불필요. down/up을 슬롯 레이아웃에 직접 배치 (scale 미적용 —\n// 강도는 그래프 입력 lora_scale이 런타임에 곱하므로 재컴파일 없이 슬라이더 즉시 반영).\n// alpha/r0 정규화만 B에 흡수. r0>R이면 상위 R랭크만 (절단, 드묾).\nfunction convertLoraSingle(item, manifest) {\n  const R = manifest.rank;\n  const total = manifest.entries.reduce((m, e) => Math.max(m, e.B.offset + R * e.N * 4), 0);\n  const out = new Float32Array(total / 4);\n  const mods = new Map(); let skipTe = 0, skipUnknown = 0;\n  for (const [k, t] of item.src.tensors) {\n    const c = classifyLoraKey(k);\n    if (c.skip) { c.skip === 'te' ? skipTe++ : skipUnknown++; continue; }\n    if (!mods.has(c.mod)) mods.set(c.mod, {});\n    mods.get(c.mod)[c.role] = t;\n  }\n  let applied = 0, missing = 0, mismatch = 0, trunc = 0; const seen = new Set();\n  let _done = 0; const _tot = manifest.entries.length;\n  for (const e of manifest.entries) {\n    if ((++_done & 63) === 0) self.postMessage({ type:'progress', value: 0.1 + 0.85*_done/_tot });\n    const km = e.key.match(/^b(\\d+)_(.+)$/);\n    const srcMod = `blocks_${km[1]}_${km[2]}`;\n    const ent = mods.get(srcMod);\n    if (!ent || !ent.down || !ent.up) { missing++; continue; }\n    const r0 = ent.down.shape[0], K = ent.down.shape[1], N = ent.up.shape[0];\n    if (K !== e.K || N !== e.N || ent.up.shape[1] !== r0) { mismatch++; continue; }\n    seen.add(srcMod);\n    const down = readTensorF32(item.src, ent.down);   // (r0, K)\n    const up = readTensorF32(item.src, ent.up);       // (N, r0)\n    const alpha = ent.alpha ? readTensorF32(item.src, ent.alpha)[0] : r0;\n    const scale = alpha / r0;                          // 강도(weight)는 lora_scale이 처리 — 여기선 제외\n    const rUse = Math.min(r0, R);\n    if (r0 > R) trunc++;\n    const aBase = e.A.offset / 4, bBase = e.B.offset / 4;\n    // A(K,R) = downᵀ 제로패딩,  B(R,N) = upᵀ·scale 제로패딩\n    for (let j = 0; j < rUse; j++) { const dRow = j * K; for (let k = 0; k < K; k++) out[aBase + k * R + j] = down[dRow + k]; }\n    for (let n = 0; n < N; n++) { const uRow = n * r0; for (let j = 0; j < rUse; j++) out[bBase + j * N + n] = up[uRow + j] * scale; }\n    applied++;\n  }\n  const notes = [];\n  if (missing) notes.push(`빈 슬롯 ${missing}`);\n  const extra = [...mods.keys()].filter(x => !seen.has(x)).length;\n  if (extra) notes.push(`슬롯 밖 모듈 ${extra}`);\n  if (skipTe) notes.push(`TE 키 ${skipTe} 무시`);\n  if (skipUnknown) notes.push(`미지원 키 ${skipUnknown}`);\n  if (trunc) notes.push(`랭크 절단 ${trunc}`);\n  if (mismatch) notes.push(`차원 불일치 ${mismatch}`);\n  return { bytes: new Uint8Array(out.buffer),\n           report: { applied, total: manifest.entries.length, notes: notes.join(' · ') } };\n}\n\nfunction convertLoraMulti(items, manifest) {\n  const R = manifest.rank;\n  const total = manifest.entries.reduce((m, e) => Math.max(m, e.B.offset + R * e.N * 4), 0);\n  const out = new Float32Array(total / 4);\n  // 각 LoRA를 모듈맵으로 미리 분해\n  const perLora = items.map(it => {\n    const mods = new Map(); let skipTe = 0, skipUnknown = 0;\n    for (const [k, t] of it.src.tensors) {\n      const c = classifyLoraKey(k);\n      if (c.skip) { c.skip === 'te' ? skipTe++ : skipUnknown++; continue; }\n      if (!mods.has(c.mod)) mods.set(c.mod, {});\n      mods.get(c.mod)[c.role] = t;\n    }\n    return { it, mods, skipTe, skipUnknown, seen: new Set() };\n  });\n  let appliedSlots = 0, missingAll = 0, mismatch = 0, trunc = 0;\n  let _done = 0; const _tot = manifest.entries.length;\n  for (const e of manifest.entries) {\n    if ((++_done & 31) === 0) self.postMessage({ type:'progress', value: 0.1 + 0.85*_done/_tot });\n    const km = e.key.match(/^b(\\d+)_(.+)$/);\n    const srcMod = `blocks_${km[1]}_${km[2]}`;\n    const contribs = [];\n    for (const pl of perLora) {\n      const ent = pl.mods.get(srcMod);\n      if (!ent || !ent.down || !ent.up) continue;\n      const r0 = ent.down.shape[0], K = ent.down.shape[1], N = ent.up.shape[0];\n      if (K !== e.K || N !== e.N || ent.up.shape[1] !== r0) { mismatch++; continue; }\n      pl.seen.add(srcMod);\n      const alpha = ent.alpha ? readTensorF32(pl.it.src, ent.alpha)[0] : r0;\n      contribs.push({ r: r0, down: readTensorF32(pl.it.src, ent.down),\n                      up: readTensorF32(pl.it.src, ent.up),\n                      scale: (alpha / r0) * pl.it.weight });\n      if (r0 > R) trunc++;\n    }\n    if (contribs.length === 0) { missingAll++; continue; }\n    const merged = mergeModule(contribs, e.K, e.N, R);\n    if (!merged) { missingAll++; continue; }\n    const aBase = e.A.offset / 4, bBase = e.B.offset / 4;\n    out.set(merged.A, aBase);\n    out.set(merged.B, bBase);\n    appliedSlots++;\n  }\n  const notes = [];\n  if (missingAll) notes.push(`빈 슬롯 ${missingAll}`);\n  let teTot = 0, unkTot = 0, extraTot = 0;\n  for (const pl of perLora) {\n    teTot += pl.skipTe; unkTot += pl.skipUnknown;\n    extraTot += [...pl.mods.keys()].filter(m => !pl.seen.has(m)).length;\n  }\n  if (extraTot) notes.push(`슬롯 밖 모듈 ${extraTot}`);\n  if (teTot) notes.push(`TE 키 ${teTot} 무시`);\n  if (unkTot) notes.push(`미지원 키 ${unkTot}`);\n  if (trunc) notes.push(`랭크 절단 ${trunc}`);\n  if (mismatch) notes.push(`차원 불일치 ${mismatch}`);\n  return { bytes: new Uint8Array(out.buffer),\n           report: { applied: appliedSlots, total: manifest.entries.length, notes: notes.join(' · ') } };\n}\n\nself.onmessage = async (ev) => {\n  const { manifest, loras } = ev.data;\n  try {\n    await svdReady;\n    const items = loras.map(l => ({ src: parseSafetensors(l.buffer), weight: l.weight, fileName: l.fileName }));\n    self.postMessage({ type:'progress', value: 0.05 });\n    // 단일 LoRA는 SVD 없이 직접 배치 (강도는 그래프 lora_scale) → 즉시 + 정확\n    const { bytes, report } = (items.length === 1)\n      ? convertLoraSingle(items[0], manifest)\n      : convertLoraMulti(items, manifest);\n    self.postMessage({ type:'done', bytes, report }, [bytes.buffer]);\n  } catch (e) { self.postMessage({ type:'error', message: e.message }); }\n};\n";
+
+      // ───────── LoRA 변환 Worker (svd-js, 메인 비차단) ─────────
+      let _loraWorker = null;
+      function getLoraWorker() {
+        if (_loraWorker) return _loraWorker;
+        const blob = new Blob([LORA_WORKER_SRC], {
+          type: "application/javascript",
+        });
+        _loraWorker = new Worker(URL.createObjectURL(blob), { type: "module" });
+        return _loraWorker;
+      }
+      function buildLoraBinAsync(manifest, active, onProg) {
+        return new Promise((resolve, reject) => {
+          const wk = getLoraWorker();
+          const handle = (ev) => {
+            const m = ev.data;
+            if (m.type === "progress") onProg && onProg(m.value);
+            else if (m.type === "done") {
+              wk.removeEventListener("message", handle);
+              resolve({ bytes: m.bytes, report: m.report });
+            } else if (m.type === "error") {
+              wk.removeEventListener("message", handle);
+              reject(new Error(m.message));
+            }
+          };
+          wk.addEventListener("message", handle);
+          const loras = active.map((i) => ({
+            fileName: i.fileName,
+            weight: i.weight,
+            buffer: i.src.buffer,
+          }));
+          wk.postMessage({ manifest, loras });
+        });
+      }
+
+      // 파일명에서 디렉터리 제거 (manifest는 베이스명으로 샤드를 참조)
+      function baseName(p) {
+        return p.split("/").pop();
+      }
+
+      async function readFileBytes(file) {
+        return new Uint8Array(await file.arrayBuffer());
+      }
+
+      async function loadSession(name, url, onProgress) {
+        const opts = { executionProviders: ["webgpu"] };
+
+        // 0) 사용자설정: 메모리 파일맵에서 직접 조립 (네트워크/OPFS 미사용)
+        if (url === null && name.startsWith("dit:")) {
+          const onnxFile = [...customFiles.keys()].find(
+            (n) => n.endsWith(".onnx") && !n.endsWith(".data"),
+          );
+          if (!onnxFile) throw new Error(".onnx 파일이 선택되지 않았습니다");
+          log(`${name} (사용자 파일: ${onnxFile})...`, "dim");
+          const graph = await readFileBytes(customFiles.get(onnxFile));
+          const maniName = onnxFile + ".manifest.json";
+          if (customFiles.has(maniName)) {
+            const mani = JSON.parse(
+              new TextDecoder().decode(
+                await readFileBytes(customFiles.get(maniName)),
+              ),
+            );
+            const ext = [];
+            for (const sName of mani.shards) {
+              const fh =
+                customFiles.get(sName) || customFiles.get(baseName(sName));
+              if (!fh)
+                throw new Error(
+                  `샤드 누락: ${sName} (선택 목록에 포함되었는지 확인)`,
+                );
+              ext.push({
+                path: baseName(sName),
+                data: await readFileBytes(fh),
+              });
+            }
+            opts.externalData = ext;
+          } else if (customFiles.has(onnxFile + ".data")) {
+            opts.externalData = [
+              {
+                path: onnxFile + ".data",
+                data: await readFileBytes(customFiles.get(onnxFile + ".data")),
+              },
+            ];
+          }
+          // 사용자 모델의 LoRA manifest (선택)
+          const lmanName = onnxFile + ".lora_manifest.json";
+          let lman = customFiles.has(lmanName)
+            ? JSON.parse(
+                new TextDecoder().decode(
+                  await readFileBytes(customFiles.get(lmanName)),
+                ),
+              )
+            : null;
+          if (lman) {
+            const total = lman.entries.reduce(
+              (m, e) => Math.max(m, e.B.offset + lman.rank * e.N * 4),
+              0,
+            );
+            const active = lora.items.filter((i) => i.src);
+            let bytes;
+            if (active.length) {
+              log(`LoRA 병합 (Worker, ${active.length}개)...`, "dim");
+              const c = await buildLoraBinAsync(lman, active, (f) => {
+                $("loadBar").style.width = f * 100 + "%";
+                $("loadStat").textContent = `LoRA 병합 ${(f * 100) | 0}%`;
+              });
+              bytes = c.bytes;
+              lora.lastReport = `${active.length}개 LoRA — ${c.report.applied}/${c.report.total} 슬롯`;
+            } else bytes = new Uint8Array(total);
+            (opts.externalData = opts.externalData || []).push({
+              path: lman.bin,
+              data: bytes,
+            });
+          }
+          log(`${name} 컴파일...`, "dim");
+          const s = await ort.InferenceSession.create(graph, opts);
+          s.loraManifest = lman;
+          onProgress(1);
+          log(`${name} OK`, "ok");
+          return s;
+        }
+
+        log(`${name} 그래프 다운로드...`, "dim");
+        const graph = await cachedFetch(url, (f) => onProgress(f * 0.05));
+
+        // 1) 샤드 manifest 우선 (shard_onnx_data.py 산출물 — ArrayBuffer 2GB 상한 우회)
+        const maniRes = await fetch(url + ".manifest.json").catch(() => null);
+        if (maniRes && maniRes.ok) {
+          const mani = await maniRes.json();
+          const dir = url.slice(0, url.lastIndexOf("/") + 1);
+          const ext = [];
+          for (let i = 0; i < mani.shards.length; i++) {
+            const sName = mani.shards[i];
+            log(
+              `${name} 샤드 ${i + 1}/${mani.shards.length} (${sName})...`,
+              "dim",
+            );
+            const data = await cachedFetch(dir + sName, (f) =>
+              onProgress(0.05 + ((i + f) / mani.shards.length) * 0.85),
+            );
+            ext.push({ path: sName, data });
+          }
+          opts.externalData = ext;
+        } else {
+          // 2) 단일 .data 폴백 (dynamo exporter 기본 산출물)
+          const dataUrl = url + ".data";
+          const probe = await fetch(dataUrl, { method: "HEAD" }).catch(
+            () => null,
+          );
+          if (probe && probe.ok) {
+            log(
+              `${name} 가중치 다운로드 (${dataUrl.split("/").pop()})...`,
+              "dim",
+            );
+            const data = await cachedFetch(dataUrl, (f) =>
+              onProgress(0.05 + f * 0.85),
+            );
+            opts.externalData = [{ path: dataUrl.split("/").pop(), data }];
+          }
+        }
+        // LoRA 슬롯 manifest가 있으면 lora.bin을 변환본 또는 제로 버퍼로 주입
+        let lman = null;
+        const lres = await fetch(url + ".lora_manifest.json").catch(() => null);
+        if (lres && lres.ok) {
+          lman = await lres.json();
+          const total = lman.entries.reduce(
+            (m, e) => Math.max(m, e.B.offset + lman.rank * e.N * 4),
+            0,
+          );
+          let bytes;
+          const active = lora.items.filter((i) => i.src);
+          if (active.length) {
+            log(`LoRA 병합 (Worker, ${active.length}개)...`, "dim");
+            const c = await buildLoraBinAsync(lman, active, (f) => {
+              $("loadBar").style.width = f * 100 + "%";
+              $("loadStat").textContent = `LoRA 병합 ${(f * 100) | 0}%`;
+            });
+            bytes = c.bytes;
+            lora.lastReport =
+              `${active.length}개 LoRA — ${c.report.applied}/${c.report.total} 슬롯 적용` +
+              (c.report.notes ? ` (${c.report.notes})` : "");
+            log(lora.lastReport, c.report.applied ? "ok" : "err");
+          } else {
+            bytes = new Uint8Array(total); // 제로 = LoRA 없음 (다운로드 0)
+          }
+          (opts.externalData = opts.externalData || []).push({
+            path: lman.bin,
+            data: bytes,
+          });
+        }
+        log(`${name} 컴파일 (셰이더 빌드)...`, "dim");
+        const s = await ort.InferenceSession.create(graph, opts);
+        s.loraManifest = lman;
+        onProgress(1);
+        log(`${name} OK`, "ok");
+        return s;
+      }
+
+      let sharedLoaded = false;
+      const ditSessions = {};
+
+      function applyModelSettings() {
+        const m = MODELS[$("modelSel").value];
+        $("steps").value = m.steps;
+        $("cfg").value = m.cfg;
+        $("sampler").value = m.sampler;
+        $("scheduler").value = m.scheduler;
+      }
+
+      function updateModelUI() {
+        const key = $("modelSel").value;
+        $("customPanel").style.display = key === "custom" ? "" : "none";
+        const cfg = MODELS[key].cfg;
+        const chk = $("negpipChk"),
+          nw = $("negpipW"),
+          neg = $("negative");
+        // base(CFG>1): NegPip 무의미 → 비활성. base+turbo(CFG=1): NegPip 미체크면 부정칸 비활성.
+        if (cfg > 1) {
+          chk.checked = false;
+          chk.disabled = true;
+          nw.disabled = true;
+          neg.disabled = false;
+          chk.parentElement.title =
+            "CFG>1에서는 일반 부정 프롬프트가 동작하므로 NegPip 불필요";
+        } else {
+          chk.disabled = false;
+          nw.disabled = !chk.checked;
+          neg.disabled = !chk.checked; // CFG=1: NegPip 없으면 부정 프롬프트 무시되므로 비활성
+          neg.placeholder = chk.checked
+            ? ""
+            : "CFG=1에서는 NegPip 체크 시에만 부정 프롬프트가 적용됩니다";
+          chk.parentElement.title = "";
+        }
+      }
+
+      function onModelChange() {
+        applyModelSettings();
+        // 터보(CFG=1) 전환 시 NegPip 자동 활성화 — 안 켜면 부정 프롬프트가 무시되므로.
+        // (모델 전환 순간에만. 이후 사용자가 직접 끄는 건 updateModelUI가 존중.)
+        if (MODELS[$("modelSel").value].cfg <= 1) $("negpipChk").checked = true;
+        updateModelUI();
+        const key = $("modelSel").value;
+        if (ditSessions[key]) {
+          sess.dit = ditSessions[key];
+          $("btnGen").disabled = false;
+          $("btnGenTop").disabled = false;
+          $("loadStat").textContent = `${MODELS[key].label} 준비됨`;
+        } else {
+          $("btnGen").disabled = true;
+          $("btnGenTop").disabled = true;
+          $("loadStat").textContent =
+            `${MODELS[key].label} 가중치 필요 — 모델 로드 버튼 클릭`;
+        }
+      }
+
+      async function loadAll() {
+        $("btnLoad").disabled = true;
+        const t0 = performance.now();
+        try {
+          if (!tok.qwen) {
+            log("토크나이저 로드 중...", "dim");
+            tok.qwen = await loadTokenizer("qwen3");
+            tok.t5 = await loadTokenizer("t5");
+            log("토크나이저 OK", "ok");
+          }
+
+          const key = $("modelSel").value;
+          if (
+            key === "custom" &&
+            ![...customFiles.keys()].some(
+              (n) => n.endsWith(".onnx") && !n.endsWith(".data"),
+            )
+          ) {
+            log("사용자 설정: DiT .onnx 파일을 먼저 선택하세요", "err");
+            $("btnLoad").disabled = false;
+            return;
+          }
+
+          // 단일 상주 정책: 다른 DiT가 VRAM에 있으면 새 모델 로드 전에 내린다.
+          // (가중치는 OPFS에 남아 있어 재전환 시 다운로드 없이 컴파일만 다시 함)
+          for (const k of Object.keys(ditSessions)) {
+            if (k !== key) {
+              log(`${MODELS[k].label} VRAM 해제...`, "dim");
+              if (sess.dit === ditSessions[k]) sess.dit = null;
+              try {
+                await ditSessions[k].release();
+              } catch (e) {
+                console.warn("release 실패:", e);
+              }
+              delete ditSessions[k];
+              await new Promise((r) => setTimeout(r, 300)); // GPU 버퍼 반납 정리 시간
+            }
+          }
+
+          const items = [];
+          if (!sharedLoaded)
+            items.push(
+              ["te", PATHS.te],
+              ["adapter", PATHS.adapter],
+              ["vae", PATHS.vae],
+            );
+          if (!ditSessions[key]) {
+            // LoRA 장착 시에만 슬롯 스켈레톤 사용 — 샤드는 동일 파일이라 추가 다운로드 없음.
+            // 비장착 기본 상태는 슬롯 디스패치 오버헤드가 없는 빠른 그래프로.
+            const hasLora = lora.items.some((i) => i.src);
+            const ditUrl =
+              key === "custom"
+                ? null
+                : hasLora && MODELS[key].ditLora
+                  ? MODELS[key].ditLora
+                  : MODELS[key].dit;
+            items.push([`dit:${key}`, ditUrl]);
+          }
+
+          for (let i = 0; i < items.length; i++) {
+            const [name, url] = items[i];
+            const s = await loadSession(name, url, (f) => {
+              $("loadBar").style.width = ((i + f) / items.length) * 100 + "%";
+              $("loadStat").textContent = `${name} ${(f * 100) | 0}%`;
+            });
+            if (name.startsWith("dit:")) ditSessions[key] = s;
+            else sess[name] = s;
+          }
+          sharedLoaded = true;
+          sess.dit = ditSessions[key];
+          if (lora.items.some((i) => i.src)) {
+            lora.dirty = false;
+            const ab = $("btnLoraApply");
+            if (ab) {
+              ab.disabled = true;
+              ab.textContent = "LoRA 반영";
+            }
+            $("loraStat").textContent = sess.dit.loraManifest
+              ? lora.lastReport
+              : "이 모델엔 LoRA 슬롯이 없음 (슬롯 빌드 필요)";
+          }
+          log(
+            `로드 완료 (${((performance.now() - t0) / 1000).toFixed(1)}s)`,
+            "ok",
+          );
+          $("btnGen").disabled = false;
+          $("btnGenTop").disabled = false;
+          $("loadStat").textContent = `${MODELS[key].label} 준비됨`;
+        } catch (e) {
+          log("로드 실패: " + e.message, "err");
+          console.error(e);
+        }
+        $("btnLoad").disabled = false;
+      }
+
+      // ───────── 추론 ─────────
+      // ───────── 프롬프트 가중치 ─────────
+      // ComfyUI 호환: (x) = ×1.1, (x:w) = ×w, 중첩은 곱, \( \) 는 리터럴 괄호
+      function parsePromptWeights(text) {
+        const out = []; // {text, weight}
+        const starts = []; // '(' 가 열린 시점의 out 길이
+        let buf = "";
+        const flush = () => {
+          if (buf) {
+            out.push({ text: buf, weight: 1 });
+            buf = "";
+          }
+        };
+        for (let i = 0; i < text.length; i++) {
+          const c = text[i];
+          if (c === "\\" && (text[i + 1] === "(" || text[i + 1] === ")")) {
+            buf += text[i + 1];
+            i++;
+            continue;
+          }
+          if (c === "(") {
+            flush();
+            starts.push(out.length);
+            continue;
+          }
+          if (c === ")") {
+            let w = 1.1;
+            const m = buf.match(/^([\s\S]*?):([+-]?\d+(?:\.\d+)?)\s*$/);
+            if (m && starts.length) {
+              buf = m[1];
+              w = parseFloat(m[2]);
+            }
+            flush();
+            const s = starts.pop();
+            if (s !== undefined)
+              for (let k = s; k < out.length; k++) out[k].weight *= w;
+            continue;
+          }
+          buf += c;
+        }
+        flush();
+        return out;
+      }
+
+      async function encodePrompt(text, negpipOK) {
+        const segs = parsePromptWeights(text);
+        const clean = segs.map((s) => s.text).join(""); // 가중치 문법 제거본
+
+        const q = tok.qwen(clean);
+        const ids = q.input_ids.data,
+          mask = q.attention_mask.data; // BigInt64Array
+        const teOut = await sess.te.run({
+          input_ids: new ort.Tensor("int64", ids, [1, ids.length]),
+          attention_mask: new ort.Tensor("int64", mask, [1, mask.length]),
+        });
+        const hidden = teOut[Object.keys(teOut)[0]]; // fp16 (1,S,1024)
+
+        // T5: 세그먼트별 토크나이즈 → 토큰 단위 가중치 벡터 (EOS는 마지막에 1회)
+        const eosIds = Array.from(tok.t5("").input_ids.data);
+        const EOS_ID = eosIds.length ? eosIds[eosIds.length - 1] : null;
+        const t5arr = [],
+          tw = [];
+        for (const sgm of segs) {
+          if (!sgm.text) continue;
+          const enc = Array.from(tok.t5(sgm.text).input_ids.data);
+          if (EOS_ID !== null && enc.length && enc[enc.length - 1] === EOS_ID)
+            enc.pop();
+          for (const id of enc) {
+            t5arr.push(id);
+            tw.push(sgm.weight);
+          }
+        }
+        for (const id of eosIds) {
+          t5arr.push(id);
+          tw.push(1);
+        }
+        if (t5arr.length > CTX_LEN) {
+          t5arr.length = CTX_LEN;
+          tw.length = CTX_LEN;
+        }
+        const t5ids = BigInt64Array.from(t5arr);
+
+        const adOut = await sess.adapter.run({
+          qwen_hidden_states: hidden,
+          t5_input_ids: new ort.Tensor("int64", t5ids, [1, t5ids.length]),
+        });
+        const ctx = adOut[Object.keys(adOut)[0]]; // fp16 (1,S,1024)
+
+        // 가중치 적용 — ComfyUI Anima 동일 지점: out = out * t5xxl_weights (512 패딩 전)
+        let cdata = ctx.data;
+        let hasW = false,
+          hasNeg = false;
+        for (const w of tw) {
+          if (w !== 1) hasW = true;
+          if (w < 0) hasNeg = true;
+        }
+        if (hasNeg && !negpipOK)
+          log("이 모델엔 NegPip 입력이 없음 — 음수 가중치를 0으로 처리", "dim");
+        if (hasW) {
+          const S = Math.min(tw.length, (cdata.length / CTX_DIM) | 0);
+          const f = HAS_F16 ? cdata : f16ToF32(cdata); // 사실 3: u16 비트패턴 분기
+          for (let t = 0; t < S; t++) {
+            // NegPip: 크기 |w|는 context에, 부호는 negpip_mask로 분리 (참조 구현과 동일)
+            let w = negpipOK ? Math.abs(tw[t]) : Math.max(0, tw[t]);
+            if (w === 1) continue;
+            const off = t * CTX_DIM;
+            for (let d = 0; d < CTX_DIM; d++) f[off + d] *= w;
+          }
+          cdata = HAS_F16 ? f : f32ToF16(f);
+        }
+
+        const padded = HAS_F16
+          ? new Float16Array(CTX_LEN * CTX_DIM)
+          : new Uint16Array(CTX_LEN * CTX_DIM); // zero-pad → 512
+        padded.set(cdata.subarray(0, Math.min(cdata.length, padded.length)));
+
+        // negpip 마스크: 토큰별 부호(±1), 패딩 구간은 1
+        let npMask = null;
+        if (negpipOK) {
+          const mf = new Float32Array(CTX_LEN).fill(1);
+          for (let t = 0; t < Math.min(tw.length, CTX_LEN); t++)
+            if (tw[t] < 0) mf[t] = -1;
+          npMask = makeF16Tensor(mf, [1, CTX_LEN, 1]);
+        }
+        return {
+          ctx: new ort.Tensor("float16", padded, [1, CTX_LEN, CTX_DIM]),
+          mask: npMask,
+        };
+      }
+
+      // ───────── 생성 결과 갤러리 (세션 메모리 — 새로고침 시 소멸) ─────────
+      // 각 항목: { id, url(dataURL), w, h, meta }. localStorage 미사용(아티팩트/프라이버시).
+      const gallery = [];
+      let galleryId = 0;
+
+      function renderThumb(item) {
+        const btn = document.createElement("button");
+        btn.className = "thumb";
+        btn.title = item.meta;
+        btn.dataset.gid = item.id;
+        const img = document.createElement("img");
+        img.src = item.url;
+        img.alt = item.meta;
+        btn.appendChild(img);
+        // 우상단 빨간 × 삭제 (썸네일 클릭과 분리)
+        const del = document.createElement("span");
+        del.className = "del";
+        del.textContent = "×";
+        del.title = "이 결과 삭제";
+        del.onclick = (e) => {
+          e.stopPropagation();
+          removeFromGallery(item);
+        };
+        btn.appendChild(del);
+        btn.onclick = () => showFromGallery(item);
+        return btn;
+      }
+
+      // 썸네일 클릭 → 메인 캔버스에 다시 크게 표시. 이후 'PNG 저장'은 이 이미지를 저장.
+      function showFromGallery(item) {
+        const cv = $("canvas");
+        const draw = () => {
+          cv.width = item.w;
+          cv.height = item.h;
+          cv.getContext("2d").drawImage(im2, 0, 0);
+          $("btnSave").disabled = false;
+          $("genStat").textContent = item.meta;
+          markActiveThumb(item.id);
+        };
+        const im2 = new Image();
+        im2.onload = draw;
+        im2.src = item.url;
+      }
+
+      // item.id 기준으로 active 표시 (삭제로 인덱스 어긋나도 안전)
+      function markActiveThumb(id) {
+        [...$("gallery").children].forEach((el) =>
+          el.classList.toggle("active", el.dataset.gid === String(id)),
+        );
+      }
+
+      // ───────── 라이트박스 모달 (크게 보기 + 방향키 순회) ─────────
+      let lbIndex = -1;   // gallery 배열 인덱스
+
+      function openLightbox(item) {
+        const idx = gallery.indexOf(item);
+        if (idx < 0) return;
+        lbIndex = idx;
+        renderLightbox();
+        $("lightbox").classList.add("open");
+      }
+
+      function renderLightbox() {
+        const item = gallery[lbIndex];
+        if (!item) { closeLightbox(); return; }
+        $("lbImg").src = item.url;
+        $("lbMeta").textContent =
+          `${item.meta}   ·   ${lbIndex + 1} / ${gallery.length}`;
+        // 스택은 최신이 앞(idx 0). ‹ 이전 = 더 최신, › 다음 = 더 오래된 것.
+        $("lbPrev").disabled = lbIndex <= 0;
+        $("lbNext").disabled = lbIndex >= gallery.length - 1;
+      }
+
+      function lbStep(d) {
+        const n = lbIndex + d;
+        if (n < 0 || n >= gallery.length) return;
+        lbIndex = n;
+        renderLightbox();
+      }
+
+      function closeLightbox() {
+        $("lightbox").classList.remove("open");
+        lbIndex = -1;
+      }
+
+      $("lbClose").onclick = closeLightbox;
+      $("lbPrev").onclick = () => lbStep(-1);
+      $("lbNext").onclick = () => lbStep(1);
+      // '화면에 맞춰 늘리기' 토글 — 저해상도 이미지를 화면 크기로 업스케일(비율 유지).
+      $("lbFitChk").onchange = (e) => {
+        $("lightbox").classList.toggle("fit", e.target.checked);
+      };
+      $("lbFit").onclick = (e) => e.stopPropagation();  // 라벨 클릭이 배경닫기로 안 가게
+      // 배경(이미지·버튼 외) 클릭 시 닫기
+      $("lightbox").onclick = (e) => { if (e.target.id === "lightbox") closeLightbox(); };
+      // 메인 캔버스 클릭 → 현재 보이는 이미지를 모달로. 갤러리에 있으면 그 위치부터 순회.
+      $("canvas").onclick = () => {
+        if (!gallery.length) return;
+        // 현재 active 썸네일(=캔버스에 그려진 것)을 찾고, 없으면 최신(0).
+        const activeEl = [...$("gallery").children].find((c) =>
+          c.classList.contains("active"));
+        const item = activeEl
+          ? gallery.find((g) => String(g.id) === activeEl.dataset.gid)
+          : gallery[0];
+        if (item) openLightbox(item);
+      };
+      // 키보드: 모달 열렸을 때 ←/→ 순회, Esc 닫기
+      window.addEventListener("keydown", (e) => {
+        if (!$("lightbox").classList.contains("open")) return;
+        if (e.key === "ArrowLeft") { e.preventDefault(); lbStep(-1); }
+        else if (e.key === "ArrowRight") { e.preventDefault(); lbStep(1); }
+        else if (e.key === "Escape") { e.preventDefault(); closeLightbox(); }
       });
-      bytes = c.bytes;
-      lora.lastReport = `${active.length}개 LoRA — ${c.report.applied}/${c.report.total} 슬롯 적용`
-        + (c.report.notes ? ` (${c.report.notes})` : '');
-      log(lora.lastReport, c.report.applied ? 'ok' : 'err');
-    } else {
-      bytes = new Uint8Array(total);                  // 제로 = LoRA 없음 (다운로드 0)
-    }
-    (opts.externalData = opts.externalData || []).push({ path: lman.bin, data: bytes });
-  }
-  log(`${name} 컴파일 (셰이더 빌드)...`, 'dim');
-  const s = await ort.InferenceSession.create(graph, opts);
-  s.loraManifest = lman;
-  onProgress(1);
-  log(`${name} OK`, 'ok');
-  return s;
-}
 
-let sharedLoaded = false;
-const ditSessions = {};
-
-function applyModelSettings() {
-  const m = MODELS[$('modelSel').value];
-  $('steps').value = m.steps;
-  $('cfg').value = m.cfg;
-  $('sampler').value = m.sampler;
-  $('scheduler').value = m.scheduler;
-}
-
-function updateModelUI() {
-  const key = $('modelSel').value;
-  $('customPanel').style.display = key === 'custom' ? '' : 'none';
-  const cfg = MODELS[key].cfg;
-  const chk = $('negpipChk'), nw = $('negpipW'), neg = $('negative');
-  // base(CFG>1): NegPip 무의미 → 비활성. base+turbo(CFG=1): NegPip 미체크면 부정칸 비활성.
-  if (cfg > 1) {
-    chk.checked = false; chk.disabled = true; nw.disabled = true;
-    neg.disabled = false;
-    chk.parentElement.title = 'CFG>1에서는 일반 부정 프롬프트가 동작하므로 NegPip 불필요';
-  } else {
-    chk.disabled = false; nw.disabled = !chk.checked;
-    neg.disabled = !chk.checked;     // CFG=1: NegPip 없으면 부정 프롬프트 무시되므로 비활성
-    neg.placeholder = chk.checked ? '' : 'CFG=1에서는 NegPip 체크 시에만 부정 프롬프트가 적용됩니다';
-    chk.parentElement.title = '';
-  }
-}
-
-function onModelChange() {
-  applyModelSettings();
-  updateModelUI();
-  const key = $('modelSel').value;
-  if (ditSessions[key]) {
-    sess.dit = ditSessions[key];
-    $('btnGen').disabled = false;
-    $('loadStat').textContent = `${MODELS[key].label} 준비됨`;
-  } else {
-    $('btnGen').disabled = true;
-    $('loadStat').textContent = `${MODELS[key].label} 가중치 필요 — 모델 로드 버튼 클릭`;
-  }
-}
-
-async function loadAll() {
-  $('btnLoad').disabled = true;
-  const t0 = performance.now();
-  try {
-    if (!tok.qwen) {
-      log('토크나이저 로드 중...', 'dim');
-      tok.qwen = await loadTokenizer('qwen3');
-      tok.t5 = await loadTokenizer('t5');
-      log('토크나이저 OK', 'ok');
-    }
-
-    const key = $('modelSel').value;
-    if (key === 'custom' && ![...customFiles.keys()].some(n => n.endsWith('.onnx') && !n.endsWith('.data'))) {
-      log('사용자 설정: DiT .onnx 파일을 먼저 선택하세요', 'err');
-      $('btnLoad').disabled = false; return;
-    }
-
-    // 단일 상주 정책: 다른 DiT가 VRAM에 있으면 새 모델 로드 전에 내린다.
-    // (가중치는 OPFS에 남아 있어 재전환 시 다운로드 없이 컴파일만 다시 함)
-    for (const k of Object.keys(ditSessions)) {
-      if (k !== key) {
-        log(`${MODELS[k].label} VRAM 해제...`, 'dim');
-        if (sess.dit === ditSessions[k]) sess.dit = null;
-        try { await ditSessions[k].release(); }
-        catch (e) { console.warn('release 실패:', e); }
-        delete ditSessions[k];
-        await new Promise(r => setTimeout(r, 300));   // GPU 버퍼 반납 정리 시간
+      // 개별 삭제: 배열 + DOM 모두 item 기준 제거.
+      function removeFromGallery(item) {
+        const idx = gallery.indexOf(item);
+        if (idx >= 0) gallery.splice(idx, 1);
+        const el = [...$("gallery").children].find(
+          (c) => c.dataset.gid === String(item.id),
+        );
+        if (el) el.remove();
+        updateGalleryBar();
       }
-    }
 
-    const items = [];
-    if (!sharedLoaded)
-      items.push(['te', PATHS.te], ['adapter', PATHS.adapter], ['vae', PATHS.vae]);
-    if (!ditSessions[key]) {
-      // LoRA 장착 시에만 슬롯 스켈레톤 사용 — 샤드는 동일 파일이라 추가 다운로드 없음.
-      // 비장착 기본 상태는 슬롯 디스패치 오버헤드가 없는 빠른 그래프로.
-      const hasLora = lora.items.some(i => i.src);
-      const ditUrl = key === 'custom' ? null
-        : ((hasLora && MODELS[key].ditLora) ? MODELS[key].ditLora : MODELS[key].dit);
-      items.push([`dit:${key}`, ditUrl]);
-    }
+      // 생성 직후 캔버스 내용을 갤러리에 추가 (스택: 최신이 앞).
+      function pushToGallery(canvas, meta) {
+        const item = {
+          id: ++galleryId,
+          url: canvas.toDataURL("image/png"),
+          w: canvas.width,
+          h: canvas.height,
+          meta,
+        };
+        gallery.unshift(item);
+        const g = $("gallery");
+        g.insertBefore(renderThumb(item), g.firstChild);
+        markActiveThumb(item.id);
+        updateGalleryBar();
+      }
 
-    for (let i = 0; i < items.length; i++) {
-      const [name, url] = items[i];
-      const s = await loadSession(name, url, f => {
-        $('loadBar').style.width = ((i + f) / items.length * 100) + '%';
-        $('loadStat').textContent = `${name} ${(f * 100) | 0}%`;
+      // 갤러리 1장 이상이면 '전체 저장' 버튼 활성 + 개수 표시.
+      function updateGalleryBar() {
+        const btn = $("btnSaveAll");
+        if (!btn) return;
+        btn.disabled = gallery.length < 1;
+        btn.textContent =
+          gallery.length > 0 ? `전체 저장 (${gallery.length})` : "전체 저장";
+      }
+
+      // 전체 결과를 ZIP으로 묶어 다운로드. JSZip은 다운로드 시점에만 CDN에서 동적 로드.
+      let _jszipLoading = null;
+      function loadJSZip() {
+        if (window.JSZip) return Promise.resolve(window.JSZip);
+        if (_jszipLoading) return _jszipLoading;
+        _jszipLoading = new Promise((resolve, reject) => {
+          const s = document.createElement("script");
+          s.src = "https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js";
+          s.onload = () =>
+            window.JSZip
+              ? resolve(window.JSZip)
+              : reject(new Error("JSZip 전역 없음"));
+          s.onerror = () => reject(new Error("JSZip 스크립트 로드 실패"));
+          document.head.appendChild(s);
+        });
+        return _jszipLoading;
+      }
+
+      async function downloadAllZip(btn) {
+        if (gallery.length < 1) return;
+        const orig = btn.textContent;
+        btn.disabled = true;
+        btn.textContent = "ZIP 준비 중...";
+        try {
+          const JSZip = await loadJSZip();
+          const zip = new JSZip();
+          // 최신이 앞이므로 역순으로 번호 매겨 시간순 정렬 (001=가장 오래된 것)
+          const ordered = [...gallery].reverse();
+          ordered.forEach((it, i) => {
+            const base64 = it.url.split(",")[1];
+            const name = `anima_${String(i + 1).padStart(3, "0")}_${it.w}x${it.h}.png`;
+            zip.file(name, base64, { base64: true });
+          });
+          const blob = await zip.generateAsync({ type: "blob" });
+          const a = document.createElement("a");
+          a.href = URL.createObjectURL(blob);
+          a.download = `anima_gallery_${gallery.length}_${Date.now()}.zip`;
+          a.click();
+          URL.revokeObjectURL(a.href);
+          btn.textContent = orig;
+        } catch (e) {
+          log("ZIP 저장 실패: " + e.message, "err");
+          btn.textContent = orig;
+        } finally {
+          btn.disabled = false;
+        }
+      }
+
+      // ───────── 생성 큐 + 러너 ─────────
+      const genQueue = []; // 대기 작업 (파라미터 스냅샷)
+      let curJob = null; // 실행 중 작업
+      let curCancel = false; // 현재 작업 중단 신호
+      let jobSeq = 0;
+
+      // '생성' = 현재 설정을 스냅샷해 큐에 추가. 비어있으면 러너가 즉시 시작.
+      function enqueueGenerate() {
+        const pxW = +$("width").value,
+          pxH = +$("height").value;
+        if (pxW % 16 || pxH % 16) {
+          log("해상도는 16의 배수여야 함", "err");
+          return;
+        }
+        if (Math.max(pxW, pxH) > 2048 || Math.min(pxW, pxH) < 384) {
+          log(
+            "해상도는 384~2048px 범위여야 함 (큰 해상도는 VRAM에 따라 실패)",
+            "err",
+          );
+          return;
+        }
+        let seed = +$("seed").value;
+        if (seed < 0) seed = (Math.random() * 0x7fffffff) | 0;
+        const job = {
+          id: ++jobSeq,
+          pxW,
+          pxH,
+          seed,
+          steps: +$("steps").value,
+          cfg: +$("cfg").value,
+          sampler: $("sampler").value,
+          scheduler: $("scheduler").value,
+          prompt: $("prompt").value,
+          negative: $("negative").value,
+          negpip: $("negpipChk").checked,
+          negpipW: +$("negpipW").value,
+          modelKey: $("modelSel").value,
+          // LoRA는 현재 반영 상태를 그대로 씀(스냅샷 시점 lora.bin) — 별도 복사 불필요.
+        };
+        genQueue.push(job);
+        renderQueue();
+        pumpQueue();
+      }
+
+      let pumping = false;
+      async function pumpQueue() {
+        if (pumping) return;
+        pumping = true;
+        $("btnCancel").style.display = "";
+        $("btnCancelTop").style.display = "";
+        while (genQueue.length) {
+          curJob = genQueue.shift();
+          curCancel = false;
+          renderQueue();
+          try {
+            await runJob(curJob);
+          } catch (e) {
+            log("생성 실패: " + e.message, "err");
+            if (/external Instance|[Dd]evice.*lost|mapAsync/.test(e.message))
+              log("GPU 컨텍스트가 손실됨 — 페이지를 새로고침해 주세요", "err");
+            console.error(e);
+          }
+          curJob = null;
+          renderQueue();
+        }
+        pumping = false;
+        $("btnCancel").style.display = "none";
+        $("btnCancelTop").style.display = "none";
+      }
+
+      function cancelCurrent() {
+        if (curJob) {
+          curCancel = true;
+          log("현재 생성 중단 요청...", "dim");
+        }
+      }
+
+      // 큐 UI: 실행 중 + 대기 항목. 대기 항목은 × 로 제거 가능.
+      function renderQueue() {
+        const box = $("queueList");
+        box.innerHTML = "";
+        const rows = [];
+        if (curJob) rows.push({ job: curJob, running: true });
+        for (const j of genQueue) rows.push({ job: j, running: false });
+        for (const { job, running } of rows) {
+          const el = document.createElement("div");
+          el.className = "qitem" + (running ? " running" : "");
+          const meta = document.createElement("span");
+          meta.className = "qmeta";
+          meta.textContent = `${running ? "▶ " : ""}${job.pxW}×${job.pxH} · ${job.steps}스텝 · CFG ${job.cfg} · seed ${job.seed}`;
+          el.appendChild(meta);
+          if (!running) {
+            // 대기 항목: 클릭하면 제거, hover 시 안내 표시
+            el.classList.add("removable");
+            el.title = "클릭하면 큐에서 제거";
+            const hint = document.createElement("span");
+            hint.className = "qhint";
+            hint.textContent = "✕ 제거";
+            el.appendChild(hint);
+            el.onclick = () => {
+              const i = genQueue.indexOf(job);
+              if (i >= 0) genQueue.splice(i, 1);
+              renderQueue();
+            };
+          }
+          box.appendChild(el);
+        }
+      }
+
+      async function runJob(job) {
+        $("btnSave").disabled = true;
+        const t0 = performance.now();
+        {
+          const pxW = job.pxW,
+            pxH = job.pxH;
+          const W = pxW / 8,
+            H = pxH / 8,
+            LAT_N = LAT_C * H * W;
+
+          const steps = job.steps,
+            cfg = job.cfg;
+          let seed = job.seed;
+          const rand = mulberry32(seed);
+          const useCfg = cfg > 1.0;
+
+          log(`생성 시작 — seed ${seed} · ${pxW}x${pxH}`, "dim");
+          const negpipOK = !!(
+            sess.dit.inputNames && sess.dit.inputNames.includes("negpip_mask")
+          );
+          // 멀티 LoRA는 강도를 변환 단계(scale)에서 반영하므로 그래프 스칼라는 1.0 고정.
+          // 단일 LoRA: 강도를 그래프 lora_scale로 전달(재컴파일 없이 슬라이더 즉시 반영).
+          // 멀티 LoRA: 강도는 SVD 병합 단계에 흡수됐으므로 1.0 고정.
+          const activeLoras = lora.items.filter((i) => i.src);
+          const loraScale =
+            activeLoras.length === 1 ? Math.max(0, activeLoras[0].weight) : 1;
+          const loraFeed = sess.dit.inputNames.includes("lora_scale")
+            ? {
+                lora_scale: new ort.Tensor(
+                  "float32",
+                  Float32Array.of(loraScale),
+                  [1],
+                ),
+              }
+            : {};
+
+          // NegPip 체크박스: CFG=1일 때 부정 프롬프트를 음수 가중치 그룹으로 긍정에 병합.
+          // 부정 프롬프트 내부의 (tag:1.2)는 중첩 곱 규칙으로 자동으로 -1.2가 됨.
+          let posText = job.prompt;
+          const negText = job.negative.trim();
+          if (job.negpip && negText) {
+            if (!negpipOK) {
+              log("이 모델엔 NegPip 입력이 없음 — 체크박스 무시", "dim");
+            } else if (useCfg) {
+              log(
+                "CFG>1에서는 기존 부정 프롬프트 경로 사용 — NegPip 체크 무시",
+                "dim",
+              );
+            } else {
+              let w = job.negpipW;
+              if (!(w < 0)) {
+                log("NegPip 가중치는 음수여야 함 — -1.0 사용", "dim");
+                w = -1;
+              }
+              posText = posText + ", (" + negText + ":" + w + ")";
+              log(`NegPip 적용 — 부정 프롬프트 가중치 ${w}`, "dim");
+            }
+          }
+          const ctxPos = await encodePrompt(posText, negpipOK);
+          const ctxNeg = useCfg
+            ? await encodePrompt(job.negative, negpipOK)
+            : null;
+
+          const x = new Float32Array(LAT_N);
+          gaussianFill(x, rand); // σ_max = 1.0
+
+          const sigmas = (
+            job.scheduler === "simple" ? simpleSchedule : normalSchedule
+          )(steps);
+
+          const denoise = async (xf32, sigma) => {
+            const lat = makeF16Tensor(xf32, [1, LAT_C, 1, H, W]);
+            const t = new ort.Tensor("float32", new Float32Array([sigma]), [1]); // t = σ
+            const o1 = await sess.dit.run({
+              latent: lat,
+              timesteps: t,
+              context: ctxPos.ctx,
+              ...(ctxPos.mask ? { negpip_mask: ctxPos.mask } : {}),
+              ...loraFeed,
+            });
+            let v = toF32(o1[Object.keys(o1)[0]].data);
+            if (useCfg) {
+              const o2 = await sess.dit.run({
+                latent: lat,
+                timesteps: t,
+                context: ctxNeg.ctx,
+                ...(ctxNeg.mask ? { negpip_mask: ctxNeg.mask } : {}),
+                ...loraFeed,
+              });
+              const vu = toF32(o2[Object.keys(o2)[0]].data);
+              for (let k = 0; k < v.length; k++)
+                v[k] = vu[k] + cfg * (v[k] - vu[k]);
+            }
+            const den = new Float32Array(xf32.length);
+            for (let k = 0; k < den.length; k++)
+              den[k] = xf32[k] - sigma * v[k];
+            return den; // denoised = x - σ·v
+          };
+
+          let lastPreview = 0;
+          const onStep = (i, s, sn, den) => {
+            if (curCancel) return false; // 중단 신호 → 샘플러 루프 탈출
+            $("genBar").style.width = ((i + 1) / steps) * 100 + "%";
+            $("genStat").textContent =
+              `step ${i + 1}/${steps}  σ ${s.toFixed(4)} → ${sn.toFixed(4)}  ` +
+              `(${((performance.now() - t0) / 1000).toFixed(1)}s)`;
+            // latent 프리뷰: 체크박스 ON일 때만, ~250ms 간격으로 (마지막 스텝은 항상).
+            const now = performance.now();
+            if (
+              den &&
+              $("previewChk").checked &&
+              (now - lastPreview > 250 || sn === 0)
+            ) {
+              lastPreview = now;
+              try {
+                previewLatent(den, H, W);
+              } catch (_) {}
+            }
+            return true;
+          };
+
+          const sampler = job.sampler === "er_sde" ? sampleErSde : sampleEuler;
+          const xf = await sampler(denoise, x, sigmas, rand, onStep);
+
+          if (xf === null) {
+            // 중단됨 — VAE 디코드 스킵
+            log(`생성 중단됨 — seed ${seed}`, "dim");
+            $("genStat").textContent = "중단됨";
+            $("genBar").style.width = "0%";
+            return;
+          }
+
+          log("VAE 디코드...", "dim");
+          const vo = await sess.vae.run({
+            latent: makeF16Tensor(xf, [1, LAT_C, 1, H, W]),
+          });
+          const img = vo[Object.keys(vo)[0]].data; // fp32 (1,3,H,W) [-1,1]
+
+          const cv = $("canvas");
+          cv.width = pxW;
+          cv.height = pxH;
+          const cx = cv.getContext("2d");
+          const im = cx.createImageData(pxW, pxH);
+          const plane = pxW * pxH;
+          for (let p = 0; p < plane; p++) {
+            im.data[p * 4] = Math.min(255, Math.max(0, (img[p] + 1) * 127.5));
+            im.data[p * 4 + 1] = Math.min(
+              255,
+              Math.max(0, (img[plane + p] + 1) * 127.5),
+            );
+            im.data[p * 4 + 2] = Math.min(
+              255,
+              Math.max(0, (img[2 * plane + p] + 1) * 127.5),
+            );
+            im.data[p * 4 + 3] = 255;
+          }
+          cx.putImageData(im, 0, 0);
+          log(
+            `완료 — ${((performance.now() - t0) / 1000).toFixed(1)}s · seed ${seed}`,
+            "ok",
+          );
+          const metaTxt = `seed ${seed} · ${pxW}x${pxH} · ${steps}스텝 · CFG ${cfg}`;
+          $("genStat").textContent = metaTxt;
+          $("btnSave").disabled = false;
+          pushToGallery(cv, metaTxt); // 스택에 썸네일 추가 (최신이 앞)
+        }
+      }
+
+      // ───────── 초기화 ─────────
+      (async () => {
+        const fail = (msg) => {
+          $("gpuInfo").innerHTML =
+            `<span style="color:var(--err)">${msg}</span>`;
+          $("btnLoad").disabled = true;
+        };
+        if (!window.isSecureContext)
+          return fail(
+            "보안 컨텍스트가 아닙니다 (http + IP 접속). WebGPU는 HTTPS 또는 localhost에서만 동작합니다 — https 주소로 접속하세요.",
+          );
+        if (!navigator.gpu)
+          return fail(
+            "이 브라우저는 WebGPU를 지원하지 않습니다. 데스크톱 Chrome/Edge 최신 버전이 필요합니다.",
+          );
+        const adapter = await navigator.gpu.requestAdapter({
+          powerPreference: gpuPreference,
+        });
+        if (!adapter)
+          return fail(
+            "GPU 어댑터를 찾을 수 없습니다. GPU 드라이버를 확인하세요.",
+          );
+        const f16 = adapter.features.has("shader-f16");
+        if (!f16)
+          return fail(
+            "이 GPU/드라이버는 shader-f16을 지원하지 않아 모델 실행이 불가능합니다.",
+          );
+        const bufGB = adapter.limits.maxBufferSize / 2 ** 30;
+        const warn =
+          bufGB < 2
+            ? ' · <span style="color:var(--err)">maxBufferSize가 작아 DiT 로드가 실패할 수 있음</span>'
+            : "";
+        const engine = HAS_JSPI
+          ? '<span style="color:var(--ok)">native EP (jspi)</span>'
+          : '<span style="color:var(--warn)">JSEP ⚠ — DP4A·FlashAttention 가속 불가 (Chrome/Edge 권장)</span>';
+        $("gpuInfo").innerHTML =
+          `WebGPU OK · shader-f16 <span style="color:var(--ok)">지원</span>` +
+          ` · maxBufferSize ${bufGB.toFixed(1)}GB` +
+          ` · 엔진 ${engine}${warn}` +
+          `<br><span style="color:var(--dim)">권장: VRAM 8GB+ · 최초 로드 시 ~2.5GB 다운로드 (이후 캐시)</span>`;
+      })();
+
+      $("btnLoad").onclick = loadAll;
+      $("btnClearCache").onclick = clearCache;
+      $("modelSel").onchange = onModelChange;
+      applyModelSettings();
+
+      // ───────── 해상도 프리셋 (칩 그리드: 버킷 칩 → 비율 칩) ─────────
+      // 표 기준. 장변 1664까지(1280버킷 16:9). [가로, 세로, 라벨]. 자유 입력은 2048까지 허용(VRAM 의존).
+      const RES_BUCKETS = {
+        512: [
+          [512, 512, "1:1"],
+          [384, 576, "2:3"],
+          [576, 384, "3:2"],
+          [384, 704, "9:16"],
+          [704, 384, "16:9"],
+        ],
+        768: [
+          [768, 768, "1:1"],
+          [640, 960, "2:3"],
+          [960, 640, "3:2"],
+          [576, 1024, "9:16"],
+          [1024, 576, "16:9"],
+        ],
+        1024: [
+          [1024, 1024, "1:1"],
+          [832, 1216, "2:3"],
+          [1216, 832, "3:2"],
+          [768, 1344, "9:16"],
+          [1344, 768, "16:9"],
+        ],
+        1280: [
+          [1280, 1280, "1:1"],
+          [1024, 1536, "2:3"],
+          [1536, 1024, "3:2"],
+          [960, 1664, "9:16"],
+          [1664, 960, "16:9"],
+        ],
+      };
+      let curBucket = "1024";
+
+      // 비율 아이콘 placeholder — 비율 모양의 빈 박스 (나중에 실제 아이콘/이미지로 교체).
+      function ratioIcon(w, h) {
+        const span = document.createElement("span");
+        span.className = "ratio-ico";
+        const base = 13;
+        if (w >= h) {
+          span.style.width = base + "px";
+          span.style.height = Math.round((base * h) / w) + "px";
+        } else {
+          span.style.height = base + "px";
+          span.style.width = Math.round((base * w) / h) + "px";
+        }
+        return span;
+      }
+
+      function renderRatioChips(bucket) {
+        const box = $("resRatioChips");
+        box.innerHTML = "";
+        for (const [w, h, label] of RES_BUCKETS[bucket] || []) {
+          const b = document.createElement("button");
+          b.className = "chip";
+          b.dataset.wh = `${w}x${h}`;
+          b.appendChild(ratioIcon(w, h));
+          const t = document.createElement("span");
+          t.textContent = label;
+          b.appendChild(t);
+          b.title = `${w}×${h}`; // 실제 해상도는 툴팁으로
+          b.onclick = () => {
+            $("width").value = w;
+            $("height").value = h;
+            [...box.children].forEach((c) =>
+              c.classList.toggle("active", c === b),
+            );
+          };
+          box.appendChild(b);
+        }
+      }
+
+      function renderBucketChips() {
+        const box = $("resBucketChips");
+        box.innerHTML = "";
+        for (const bk of Object.keys(RES_BUCKETS)) {
+          const b = document.createElement("button");
+          b.className = "chip" + (bk === curBucket ? " active" : "");
+          b.textContent = bk;
+          b.onclick = () => {
+            curBucket = bk;
+            [...box.children].forEach((c) =>
+              c.classList.toggle("active", c.textContent === bk),
+            );
+            renderRatioChips(bk);
+            // 버킷 선택 시 정사각(첫 항목) 자동 적용
+            const [w, h] = RES_BUCKETS[bk][0];
+            $("width").value = w;
+            $("height").value = h;
+            markActiveRatio();
+          };
+          box.appendChild(b);
+        }
+      }
+
+      // 현재 width/height에 맞는 비율 칩을 active 표시 (없으면 모두 해제)
+      function markActiveRatio() {
+        const w = +$("width").value,
+          h = +$("height").value;
+        [...$("resRatioChips").children].forEach((c) => {
+          const [cw, ch] = c.dataset.wh.split("x").map(Number);
+          c.classList.toggle("active", cw === w && ch === h);
+        });
+      }
+      $("width").addEventListener("input", markActiveRatio);
+      $("height").addEventListener("input", markActiveRatio);
+
+      renderBucketChips();
+      renderRatioChips(curBucket);
+      markActiveRatio();
+
+      $("btnGen").onclick = enqueueGenerate;
+      $("btnCancel").onclick = cancelCurrent;
+      $("btnGenTop").onclick = enqueueGenerate;
+      $("btnCancelTop").onclick = cancelCurrent;
+      $("btnSaveAll").onclick = () => downloadAllZip($("btnSaveAll"));
+
+      // 아코디언: 헤더 클릭으로 패널 접기/펴기
+      document.querySelectorAll(".accordion .acc-head").forEach((head) => {
+        head.onclick = () =>
+          head.closest(".accordion").classList.toggle("collapsed");
       });
-      if (name.startsWith('dit:')) ditSessions[key] = s;
-      else sess[name] = s;
-    }
-    sharedLoaded = true;
-    sess.dit = ditSessions[key];
-    if (lora.items.some(i => i.src)) {
-      lora.dirty = false;
-      const ab = $('btnLoraApply'); if (ab) { ab.disabled = true; ab.textContent = 'LoRA 반영'; }
-      $('loraStat').textContent = sess.dit.loraManifest
-        ? lora.lastReport : '이 모델엔 LoRA 슬롯이 없음 (슬롯 빌드 필요)';
-    }
-    log(`로드 완료 (${((performance.now() - t0) / 1000).toFixed(1)}s)`, 'ok');
-    $('btnGen').disabled = false;
-    $('loadStat').textContent = `${MODELS[key].label} 준비됨`;
-  } catch (e) {
-    log('로드 실패: ' + e.message, 'err');
-    console.error(e);
-  }
-  $('btnLoad').disabled = false;
-}
+      $("btnSave").onclick = () => {
+        const a = document.createElement("a");
+        a.download = `anima_${Date.now()}.png`;
+        a.href = $("canvas").toDataURL("image/png");
+        a.click();
+      };
 
-// ───────── 추론 ─────────
-// ───────── 프롬프트 가중치 ─────────
-// ComfyUI 호환: (x) = ×1.1, (x:w) = ×w, 중첩은 곱, \( \) 는 리터럴 괄호
-function parsePromptWeights(text) {
-  const out = [];                  // {text, weight}
-  const starts = [];               // '(' 가 열린 시점의 out 길이
-  let buf = '';
-  const flush = () => { if (buf) { out.push({ text: buf, weight: 1 }); buf = ''; } };
-  for (let i = 0; i < text.length; i++) {
-    const c = text[i];
-    if (c === '\\' && (text[i + 1] === '(' || text[i + 1] === ')')) { buf += text[i + 1]; i++; continue; }
-    if (c === '(') { flush(); starts.push(out.length); continue; }
-    if (c === ')') {
-      let w = 1.1;
-      const m = buf.match(/^([\s\S]*?):([+-]?\d+(?:\.\d+)?)\s*$/);
-      if (m && starts.length) { buf = m[1]; w = parseFloat(m[2]); }
-      flush();
-      const s = starts.pop();
-      if (s !== undefined) for (let k = s; k < out.length; k++) out[k].weight *= w;
-      continue;
-    }
-    buf += c;
-  }
-  flush();
-  return out;
-}
-
-async function encodePrompt(text, negpipOK) {
-  const segs = parsePromptWeights(text);
-  const clean = segs.map(s => s.text).join('');                      // 가중치 문법 제거본
-
-  const q = tok.qwen(clean);
-  const ids = q.input_ids.data, mask = q.attention_mask.data;        // BigInt64Array
-  const teOut = await sess.te.run({
-    input_ids: new ort.Tensor('int64', ids, [1, ids.length]),
-    attention_mask: new ort.Tensor('int64', mask, [1, mask.length]),
-  });
-  const hidden = teOut[Object.keys(teOut)[0]];                       // fp16 (1,S,1024)
-
-  // T5: 세그먼트별 토크나이즈 → 토큰 단위 가중치 벡터 (EOS는 마지막에 1회)
-  const eosIds = Array.from(tok.t5('').input_ids.data);
-  const EOS_ID = eosIds.length ? eosIds[eosIds.length - 1] : null;
-  const t5arr = [], tw = [];
-  for (const sgm of segs) {
-    if (!sgm.text) continue;
-    const enc = Array.from(tok.t5(sgm.text).input_ids.data);
-    if (EOS_ID !== null && enc.length && enc[enc.length - 1] === EOS_ID) enc.pop();
-    for (const id of enc) { t5arr.push(id); tw.push(sgm.weight); }
-  }
-  for (const id of eosIds) { t5arr.push(id); tw.push(1); }
-  if (t5arr.length > CTX_LEN) { t5arr.length = CTX_LEN; tw.length = CTX_LEN; }
-  const t5ids = BigInt64Array.from(t5arr);
-
-  const adOut = await sess.adapter.run({
-    qwen_hidden_states: hidden,
-    t5_input_ids: new ort.Tensor('int64', t5ids, [1, t5ids.length]),
-  });
-  const ctx = adOut[Object.keys(adOut)[0]];                          // fp16 (1,S,1024)
-
-  // 가중치 적용 — ComfyUI Anima 동일 지점: out = out * t5xxl_weights (512 패딩 전)
-  let cdata = ctx.data;
-  let hasW = false, hasNeg = false;
-  for (const w of tw) { if (w !== 1) hasW = true; if (w < 0) hasNeg = true; }
-  if (hasNeg && !negpipOK)
-    log('이 모델엔 NegPip 입력이 없음 — 음수 가중치를 0으로 처리', 'dim');
-  if (hasW) {
-    const S = Math.min(tw.length, (cdata.length / CTX_DIM) | 0);
-    const f = HAS_F16 ? cdata : f16ToF32(cdata);                     // 사실 3: u16 비트패턴 분기
-    for (let t = 0; t < S; t++) {
-      // NegPip: 크기 |w|는 context에, 부호는 negpip_mask로 분리 (참조 구현과 동일)
-      let w = negpipOK ? Math.abs(tw[t]) : Math.max(0, tw[t]);
-      if (w === 1) continue;
-      const off = t * CTX_DIM;
-      for (let d = 0; d < CTX_DIM; d++) f[off + d] *= w;
-    }
-    cdata = HAS_F16 ? f : f32ToF16(f);
-  }
-
-  const padded = HAS_F16 ? new Float16Array(CTX_LEN * CTX_DIM)
-                         : new Uint16Array(CTX_LEN * CTX_DIM);       // zero-pad → 512
-  padded.set(cdata.subarray(0, Math.min(cdata.length, padded.length)));
-
-  // negpip 마스크: 토큰별 부호(±1), 패딩 구간은 1
-  let npMask = null;
-  if (negpipOK) {
-    const mf = new Float32Array(CTX_LEN).fill(1);
-    for (let t = 0; t < Math.min(tw.length, CTX_LEN); t++) if (tw[t] < 0) mf[t] = -1;
-    npMask = makeF16Tensor(mf, [1, CTX_LEN, 1]);
-  }
-  return { ctx: new ort.Tensor('float16', padded, [1, CTX_LEN, CTX_DIM]), mask: npMask };
-}
-
-// ───────── 생성 결과 갤러리 (세션 메모리 — 새로고침 시 소멸) ─────────
-// 각 항목: { url(dataURL), w, h, meta(저장 표시용 텍스트) }. localStorage 미사용(아티팩트/프라이버시).
-const gallery = [];
-
-function renderThumb(item) {
-  const btn = document.createElement('button');
-  btn.className = 'thumb';
-  btn.title = item.meta;
-  const img = document.createElement('img');
-  img.src = item.url;
-  img.alt = item.meta;
-  btn.appendChild(img);
-  btn.onclick = () => showFromGallery(item);
-  return btn;
-}
-
-// 썸네일 클릭 → 메인 캔버스에 다시 크게 표시. 이후 'PNG 저장'은 이 이미지를 저장.
-function showFromGallery(item) {
-  const cv = $('canvas');
-  const draw = () => {
-    cv.width = item.w; cv.height = item.h;
-    cv.getContext('2d').drawImage(im2, 0, 0);
-    $('btnSave').disabled = false;
-    $('genStat').textContent = item.meta;
-    // 활성 썸네일 표시
-    [...$('gallery').children].forEach((el, i) =>
-      el.classList.toggle('active', gallery[i] === item));
-  };
-  const im2 = new Image();
-  im2.onload = draw;
-  im2.src = item.url;
-}
-
-// 생성 직후 캔버스 내용을 갤러리에 추가 (스택: 최신이 앞).
-function pushToGallery(canvas, meta) {
-  const item = { url: canvas.toDataURL('image/png'),
-                 w: canvas.width, h: canvas.height, meta };
-  gallery.unshift(item);
-  const g = $('gallery');
-  g.insertBefore(renderThumb(item), g.firstChild);
-  // 방금 생성분을 활성 표시
-  [...g.children].forEach((el, i) => el.classList.toggle('active', i === 0));
-}
-
-async function generate() {
-  $('btnGen').disabled = true; $('btnSave').disabled = true;
-  const t0 = performance.now();
-  try {
-    const pxW = +$('width').value, pxH = +$('height').value;
-    if (pxW % 16 || pxH % 16) throw new Error('해상도는 16의 배수여야 함 (latent/patch 제약)');
-    const W = pxW / 8, H = pxH / 8, LAT_N = LAT_C * H * W;
-
-    const steps = +$('steps').value, cfg = +$('cfg').value;
-    let seed = +$('seed').value;
-    if (seed < 0) seed = (Math.random() * 0x7fffffff) | 0;
-    const rand = mulberry32(seed);
-    const useCfg = cfg > 1.0;
-
-    log(`생성 시작 — seed ${seed} · ${pxW}x${pxH}`, 'dim');
-    const negpipOK = !!(sess.dit.inputNames && sess.dit.inputNames.includes('negpip_mask'));
-    // 멀티 LoRA는 강도를 변환 단계(scale)에서 반영하므로 그래프 스칼라는 1.0 고정.
-    // 단일 LoRA: 강도를 그래프 lora_scale로 전달(재컴파일 없이 슬라이더 즉시 반영).
-    // 멀티 LoRA: 강도는 SVD 병합 단계에 흡수됐으므로 1.0 고정.
-    const activeLoras = lora.items.filter(i => i.src);
-    const loraScale = activeLoras.length === 1 ? Math.max(0, activeLoras[0].weight) : 1;
-    const loraFeed = sess.dit.inputNames.includes('lora_scale')
-      ? { lora_scale: new ort.Tensor('float32', Float32Array.of(loraScale), [1]) }
-      : {};
-
-    // NegPip 체크박스: CFG=1일 때 부정 프롬프트를 음수 가중치 그룹으로 긍정에 병합.
-    // 부정 프롬프트 내부의 (tag:1.2)는 중첩 곱 규칙으로 자동으로 -1.2가 됨.
-    let posText = $('prompt').value;
-    const negText = $('negative').value.trim();
-    if ($('negpipChk').checked && negText) {
-      if (!negpipOK) {
-        log('이 모델엔 NegPip 입력이 없음 — 체크박스 무시', 'dim');
-      } else if (useCfg) {
-        log('CFG>1에서는 기존 부정 프롬프트 경로 사용 — NegPip 체크 무시', 'dim');
-      } else {
-        let w = +$('negpipW').value;
-        if (!(w < 0)) { log('NegPip 가중치는 음수여야 함 — -1.0 사용', 'dim'); w = -1; }
-        posText = posText + ', (' + negText + ':' + w + ')';
-        log(`NegPip 적용 — 부정 프롬프트 가중치 ${w}`, 'dim');
+      // ── 멀티 LoRA UI ──
+      function markLoraDirty() {
+        lora.dirty = true;
+        const btn = $("btnLoraApply");
+        btn.disabled = false;
+        btn.textContent = "LoRA 반영 ●";
+        $("loraStat").textContent = "변경됨 — [LoRA 반영]을 눌러 적용";
       }
-    }
-    const ctxPos = await encodePrompt(posText, negpipOK);
-    const ctxNeg = useCfg ? await encodePrompt($('negative').value, negpipOK) : null;
 
-    const x = new Float32Array(LAT_N);
-    gaussianFill(x, rand);                                            // σ_max = 1.0
-
-    const sigmas = ($('scheduler').value === 'simple' ? simpleSchedule : normalSchedule)(steps);
-
-    const denoise = async (xf32, sigma) => {
-      const lat = makeF16Tensor(xf32, [1, LAT_C, 1, H, W]);
-      const t = new ort.Tensor('float32', new Float32Array([sigma]), [1]); // t = σ
-      const o1 = await sess.dit.run({ latent: lat, timesteps: t, context: ctxPos.ctx,
-        ...(ctxPos.mask ? { negpip_mask: ctxPos.mask } : {}), ...loraFeed });
-      let v = toF32(o1[Object.keys(o1)[0]].data);
-      if (useCfg) {
-        const o2 = await sess.dit.run({ latent: lat, timesteps: t, context: ctxNeg.ctx,
-          ...(ctxNeg.mask ? { negpip_mask: ctxNeg.mask } : {}), ...loraFeed });
-        const vu = toF32(o2[Object.keys(o2)[0]].data);
-        for (let k = 0; k < v.length; k++) v[k] = vu[k] + cfg * (v[k] - vu[k]);
+      function createLoraRow(item) {
+        const row = document.createElement("div");
+        row.dataset.loraId = item.id;
+        row.style.cssText =
+          "display:flex;gap:6px;align-items:center;margin-bottom:5px";
+        const file = document.createElement("input");
+        file.type = "file";
+        file.accept = ".safetensors";
+        file.style.cssText = "flex:1;min-width:0;font-size:12px";
+        file.onchange = async (e) => {
+          const f = e.target.files[0];
+          if (!f) return;
+          try {
+            log(
+              `LoRA 읽는 중: ${f.name} (${(f.size / 2 ** 20).toFixed(0)}MB)`,
+              "dim",
+            );
+            // 파싱은 Worker가 수행 — 메인은 ArrayBuffer만 보관 (메인 스레드 비차단)
+            const buffer = await f.arrayBuffer();
+            item.src = { buffer };
+            item.fileName = f.name;
+            markLoraDirty(); // 즉시 컴파일 안 함 — 대기
+          } catch (err) {
+            log("LoRA 로드 실패: " + err.message, "err");
+            item.src = null;
+          }
+        };
+        const wlabel = document.createElement("span");
+        wlabel.style.cssText =
+          "font-size:11px;color:var(--dim,#888);width:30px;text-align:right";
+        wlabel.textContent = item.weight.toFixed(2);
+        const w = document.createElement("input");
+        w.type = "range";
+        w.min = "0";
+        w.max = "2";
+        w.step = "0.05";
+        w.value = item.weight;
+        w.style.cssText = "width:90px";
+        w.oninput = () => {
+          item.weight = +w.value;
+          wlabel.textContent = item.weight.toFixed(2);
+        };
+        w.onchange = () => {
+          if (!item.src) return;
+          // 단일 LoRA면 강도가 그래프 lora_scale로 가므로 재컴파일 불필요 — 다음 생성에 즉시 반영.
+          // 멀티면 SVD 병합에 강도가 들어가므로 재반영 필요.
+          if (lora.items.filter((i) => i.src).length >= 2) markLoraDirty();
+        };
+        const del = document.createElement("button");
+        del.textContent = "×";
+        del.style.cssText =
+          "width:auto;padding:0 9px;font-size:16px;line-height:1;height:28px;" +
+          "display:inline-flex;align-items:center;justify-content:center;flex:0 0 auto";
+        del.onclick = () => {
+          const had = !!item.src;
+          lora.items = lora.items.filter((x) => x.id !== item.id);
+          row.remove(); // 이 행만 제거 — 나머지 행은 그대로
+          if (had) markLoraDirty();
+        };
+        row.append(file, w, wlabel, del);
+        return row;
       }
-      const den = new Float32Array(xf32.length);
-      for (let k = 0; k < den.length; k++) den[k] = xf32[k] - sigma * v[k];
-      return den;                                                     // denoised = x - σ·v
-    };
 
-    const onStep = (i, s, sn) => {
-      $('genBar').style.width = ((i + 1) / steps * 100) + '%';
-      $('genStat').textContent =
-        `step ${i + 1}/${steps}  σ ${s.toFixed(4)} → ${sn.toFixed(4)}  ` +
-        `(${((performance.now() - t0) / 1000).toFixed(1)}s)`;
-    };
+      async function applyLora() {
+        const btn = $("btnLoraApply");
+        btn.disabled = true;
+        btn.textContent = "반영 중...";
+        const genBtn = $("btnGen"),
+          wasGenEnabled = !genBtn.disabled;
+        genBtn.disabled = true; // 병합·컴파일 중 생성 차단 (오류 방지)
+        $("loadBar").style.width = "0%";
+        const n = lora.items.filter((i) => i.src).length;
+        $("loraStat").textContent = n
+          ? `${n}개 LoRA 병합·컴파일...`
+          : "LoRA 해제·컴파일...";
+        try {
+          await reloadDit(); // 한 번만 컴파일 (병합은 Worker)
+          lora.dirty = false;
+          if (!sess.dit) $("loraStat").textContent = "다음 모델 로드 때 적용됨";
+        } catch (e) {
+          log("LoRA 반영 실패: " + e.message, "err");
+          $("loraStat").textContent = "LoRA 반영 실패";
+        } finally {
+          btn.textContent = lora.dirty ? "LoRA 반영 ●" : "LoRA 반영";
+          btn.disabled = !lora.dirty;
+          genBtn.disabled = sess.dit ? false : !wasGenEnabled; // 세션 있으면 생성 복구
+          $("loadBar").style.width = "0%";
+        }
+      }
 
+      function addLoraRow() {
+        const item = { id: ++loraSeq, src: null, fileName: "", weight: 1.0 };
+        lora.items.push(item);
+        $("loraList").appendChild(createLoraRow(item)); // 새 행만 추가
+      }
 
-    const sampler = $('sampler').value === 'er_sde' ? sampleErSde : sampleEuler;
-    const xf = await sampler(denoise, x, sigmas, rand, onStep);
+      $("customDitFiles").addEventListener("change", (e) => {
+        customFiles.clear();
+        for (const f of e.target.files) customFiles.set(f.name, f);
+        const onnx = [...customFiles.keys()].find(
+          (n) => n.endsWith(".onnx") && !n.endsWith(".data"),
+        );
+        log(
+          `사용자 파일 ${e.target.files.length}개 선택됨` +
+            (onnx ? ` · DiT: ${onnx}` : " · .onnx 없음!"),
+          onnx ? "ok" : "err",
+        );
+      });
 
-    log('VAE 디코드...', 'dim');
-    const vo = await sess.vae.run({
-      latent: makeF16Tensor(xf, [1, LAT_C, 1, H, W]),
-    });
-    const img = vo[Object.keys(vo)[0]].data;                          // fp32 (1,3,H,W) [-1,1]
+      $("btnLoraAdd").addEventListener("click", addLoraRow);
+      $("btnLoraApply").addEventListener("click", applyLora);
+      addLoraRow(); // 기본 1줄
 
-    const cv = $('canvas');
-    cv.width = pxW; cv.height = pxH;
-    const cx = cv.getContext('2d');
-    const im = cx.createImageData(pxW, pxH);
-    const plane = pxW * pxH;
-    for (let p = 0; p < plane; p++) {
-      im.data[p * 4]     = Math.min(255, Math.max(0, (img[p] + 1) * 127.5));
-      im.data[p * 4 + 1] = Math.min(255, Math.max(0, (img[plane + p] + 1) * 127.5));
-      im.data[p * 4 + 2] = Math.min(255, Math.max(0, (img[2 * plane + p] + 1) * 127.5));
-      im.data[p * 4 + 3] = 255;
-    }
-    cx.putImageData(im, 0, 0);
-    log(`완료 — ${((performance.now() - t0) / 1000).toFixed(1)}s · seed ${seed}`, 'ok');
-    const metaTxt = `seed ${seed} · ${pxW}x${pxH} · ${steps}스텝 · CFG ${cfg}`;
-    $('genStat').textContent = metaTxt;
-    $('btnSave').disabled = false;
-    pushToGallery(cv, metaTxt);   // 스택에 썸네일 추가 (최신이 앞)
-  } catch (e) {
-    log('생성 실패: ' + e.message, 'err');
-    if (/external Instance|[Dd]evice.*lost|mapAsync/.test(e.message))
-      log('GPU 컨텍스트가 손실됨 — 페이지를 새로고침해 주세요 (반복 재컴파일 후 VRAM 누수로 발생 가능)', 'err');
-    console.error(e);
-  }
-  $('btnGen').disabled = false;
-}
-
-// ───────── 초기화 ─────────
-(async () => {
-  const fail = msg => {
-    $('gpuInfo').innerHTML = `<span style="color:var(--err)">${msg}</span>`;
-    $('btnLoad').disabled = true;
-  };
-  if (!window.isSecureContext)
-    return fail('보안 컨텍스트가 아닙니다 (http + IP 접속). WebGPU는 HTTPS 또는 localhost에서만 동작합니다 — https 주소로 접속하세요.');
-  if (!navigator.gpu)
-    return fail('이 브라우저는 WebGPU를 지원하지 않습니다. 데스크톱 Chrome/Edge 최신 버전이 필요합니다.');
-  const adapter = await navigator.gpu.requestAdapter({ powerPreference: gpuPreference });
-  if (!adapter) return fail('GPU 어댑터를 찾을 수 없습니다. GPU 드라이버를 확인하세요.');
-  const f16 = adapter.features.has('shader-f16');
-  if (!f16)
-    return fail('이 GPU/드라이버는 shader-f16을 지원하지 않아 모델 실행이 불가능합니다.');
-  const bufGB = adapter.limits.maxBufferSize / 2 ** 30;
-  const warn = bufGB < 2
-    ? ' · <span style="color:var(--err)">maxBufferSize가 작아 DiT 로드가 실패할 수 있음</span>' : '';
-  $('gpuInfo').innerHTML =
-    `WebGPU OK · shader-f16 <span style="color:var(--ok)">지원</span>` +
-    ` · maxBufferSize ${bufGB.toFixed(1)}GB` +
-    ` · 엔진 ${HAS_JSPI ? '<span style="color:var(--ok)">native EP (jspi)</span>' : 'JSEP'}${warn}` +
-    `<br><span style="color:var(--dim)">권장: VRAM 6GB+ 외장 GPU · 최초 로드 시 ~2.5GB 다운로드 (이후 캐시)</span>`;
-})();
-
-$('btnLoad').onclick = loadAll;
-$('btnClearCache').onclick = clearCache;
-$('modelSel').onchange = onModelChange;
-applyModelSettings();
-$('btnGen').onclick = generate;
-$('btnSave').onclick = () => {
-  const a = document.createElement('a');
-  a.download = `anima_${Date.now()}.png`;
-  a.href = $('canvas').toDataURL('image/png');
-  a.click();
-};
-
-// ── 멀티 LoRA UI ──
-function markLoraDirty() {
-  lora.dirty = true;
-  const btn = $('btnLoraApply');
-  btn.disabled = false;
-  btn.textContent = 'LoRA 반영 ●';
-  $('loraStat').textContent = '변경됨 — [LoRA 반영]을 눌러 적용';
-}
-
-function createLoraRow(item) {
-  const row = document.createElement('div');
-  row.dataset.loraId = item.id;
-  row.style.cssText = 'display:flex;gap:6px;align-items:center;margin-bottom:5px';
-  const file = document.createElement('input');
-  file.type = 'file'; file.accept = '.safetensors';
-  file.style.cssText = 'flex:1;min-width:0;font-size:12px';
-  file.onchange = async e => {
-    const f = e.target.files[0];
-    if (!f) return;
-    try {
-      log(`LoRA 읽는 중: ${f.name} (${(f.size / 2 ** 20).toFixed(0)}MB)`, 'dim');
-      // 파싱은 Worker가 수행 — 메인은 ArrayBuffer만 보관 (메인 스레드 비차단)
-      const buffer = await f.arrayBuffer();
-      item.src = { buffer }; item.fileName = f.name;
-      markLoraDirty();                          // 즉시 컴파일 안 함 — 대기
-    } catch (err) {
-      log('LoRA 로드 실패: ' + err.message, 'err');
-      item.src = null;
-    }
-  };
-  const wlabel = document.createElement('span');
-  wlabel.style.cssText = 'font-size:11px;color:var(--dim,#888);width:30px;text-align:right';
-  wlabel.textContent = item.weight.toFixed(2);
-  const w = document.createElement('input');
-  w.type = 'range'; w.min = '0'; w.max = '2'; w.step = '0.05'; w.value = item.weight;
-  w.style.cssText = 'width:90px';
-  w.oninput = () => { item.weight = +w.value; wlabel.textContent = item.weight.toFixed(2); };
-  w.onchange = () => {
-    if (!item.src) return;
-    // 단일 LoRA면 강도가 그래프 lora_scale로 가므로 재컴파일 불필요 — 다음 생성에 즉시 반영.
-    // 멀티면 SVD 병합에 강도가 들어가므로 재반영 필요.
-    if (lora.items.filter(i => i.src).length >= 2) markLoraDirty();
-  };
-  const del = document.createElement('button');
-  del.textContent = '×'; del.style.cssText = 'width:auto;padding:2px 9px;font-size:14px';
-  del.onclick = () => {
-    const had = !!item.src;
-    lora.items = lora.items.filter(x => x.id !== item.id);
-    row.remove();                               // 이 행만 제거 — 나머지 행은 그대로
-    if (had) markLoraDirty();
-  };
-  row.append(file, w, wlabel, del);
-  return row;
-}
-
-async function applyLora() {
-  const btn = $('btnLoraApply');
-  btn.disabled = true; btn.textContent = '반영 중...';
-  const genBtn = $('btnGen'), wasGenEnabled = !genBtn.disabled;
-  genBtn.disabled = true;                          // 병합·컴파일 중 생성 차단 (오류 방지)
-  $('loadBar').style.width = '0%';
-  const n = lora.items.filter(i => i.src).length;
-  $('loraStat').textContent = n ? `${n}개 LoRA 병합·컴파일...` : 'LoRA 해제·컴파일...';
-  try {
-    await reloadDit();                             // 한 번만 컴파일 (병합은 Worker)
-    lora.dirty = false;
-    if (!sess.dit) $('loraStat').textContent = '다음 모델 로드 때 적용됨';
-  } catch (e) {
-    log('LoRA 반영 실패: ' + e.message, 'err');
-    $('loraStat').textContent = 'LoRA 반영 실패';
-  } finally {
-    btn.textContent = lora.dirty ? 'LoRA 반영 ●' : 'LoRA 반영';
-    btn.disabled = !lora.dirty;
-    genBtn.disabled = sess.dit ? false : !wasGenEnabled;   // 세션 있으면 생성 복구
-    $('loadBar').style.width = '0%';
-  }
-}
-
-function addLoraRow() {
-  const item = { id: ++loraSeq, src: null, fileName: '', weight: 1.0 };
-  lora.items.push(item);
-  $('loraList').appendChild(createLoraRow(item));   // 새 행만 추가
-}
-
-$('customDitFiles').addEventListener('change', e => {
-  customFiles.clear();
-  for (const f of e.target.files) customFiles.set(f.name, f);
-  const onnx = [...customFiles.keys()].find(n => n.endsWith('.onnx') && !n.endsWith('.data'));
-  log(`사용자 파일 ${e.target.files.length}개 선택됨` + (onnx ? ` · DiT: ${onnx}` : ' · .onnx 없음!'),
-      onnx ? 'ok' : 'err');
-});
-$('gpuPref').addEventListener('change', e => {
-  gpuPreference = e.target.value;
-  log(`GPU 선호도: ${e.target.value} (다음 페이지 로드부터 적용)`, 'dim');
-});
-
-$('btnLoraAdd').addEventListener('click', addLoraRow);
-$('btnLoraApply').addEventListener('click', applyLora);
-addLoraRow();   // 기본 1줄
-
-$('negpipChk').addEventListener('change', updateModelUI);
-updateModelUI();
-</script>
-</body>
+      $("negpipChk").addEventListener("change", updateModelUI);
+      // 초기 로드: 기본 모델이 터보(CFG=1)면 NegPip 자동 활성화
+      if (MODELS[$("modelSel").value].cfg <= 1) $("negpipChk").checked = true;
+      updateModelUI();
+    </script>
+  </body>
 </html>

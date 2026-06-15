@@ -20,7 +20,6 @@
 - **VAE chunked attention**: VAE 디코더의 mid-block self-attention을 쿼리 토큰축으로 8분할해 score 단일 버퍼를 1/8로 제한(수치 동치). 고해상도(예 1280²·1536²)에서 VAE가 2 GB 단일 버퍼 한계로 OOM 나던 문제를 해소 — **1536²까지 브라우저에서 생성**.
 - **런타임 LoRA**: 아무 Anima `.safetensors` LoRA(kohya 또는 `diffusion_model.` 포맷)를 강도와 함께 장착. 여러 개는 ΔW + SVD로 정확히 병합(Web Worker에서 — UI 안 멈춤). 재export 불필요.
 - **프롬프트 가중치** `(태그:1.2)`와 **NegPip**(CFG=1/터보에서 부정 프롬프트), 둘 다 ComfyUI 충실 구현.
-- **생성 결과 썸네일 스택**: 생성할 때마다 결과 패널에 썸네일이 쌓이고(세션 메모리), 클릭하면 캔버스에 다시 크게 표시 — 해상도별로 독립 보관.
 
 ## 동작 구조
 
@@ -39,7 +38,7 @@
 
 **서빙** — 아무 정적 파일 서버. 프로덕션에선 HTTPS 필수 (WebGPU와 OPFS가 secure context 요구, `localhost`는 테스트용 예외).
 
-**클라이언트** — WebGPU 지원 브라우저(데스크톱 Chrome/Edge), `shader-f16` 지원 GPU, VRAM 6GB+ 권장. 최초 방문 시 ~2.5GB 다운로드 (이후 OPFS 캐시).
+**클라이언트** — WebGPU 지원 브라우저(데스크톱 Chrome/Edge), `shader-f16` 지원 GPU, VRAM 8GB+ 권장. 최초 방문 시 ~2.5GB 다운로드 (이후 OPFS 캐시).
 
 ## 1. 모델 변환
 
@@ -110,6 +109,47 @@ python export/add_lora_slots.py --src out/dit/anima_dit_dyn32_q8a4fns.onnx \
 
 비슬롯(`q8a4fns`)과 슬롯(`q8a4fnLs`) 그래프를 **둘 다** 서버에 두세요: 페이지는 LoRA가 없으면 더 빠른 비슬롯 그래프를 쓰고, LoRA를 장착할 때만 슬롯 그래프로 전환합니다(샤드 동일, 추가 다운로드 없음). Turbo export에도 전체 체인을 반복하세요.
 
+**배치 자동화** — 체크포인트마다 6단계 × 2변형을 손으로 돌리는 건 번거롭습니다. `export/build_dit.bat`(Windows, ComfyUI portable)가 `export_dit → quantize → fuse → negpip → shard → lora-slots` 전체 체인을 base·Turbo 둘 다 한 번에 실행합니다:
+
+```bat
+REM ComfyUI portable 루트에서:
+export\build_dit.bat ComfyUI\models\diffusion_models\my-finetune.safetensors myft
+```
+
+`myft_dit_dyn32_q8a4fns/fnLs.onnx`와 `myft_dit_turbo32_*`(샤드 + manifest 포함)를 생성합니다. Turbo 변형은 export 시점에 Turbo LoRA를 머지합니다(`TURBO_LORA` 경로는 스크립트 상단에서 설정). 체크포인트를 다시 빌드할 때마다 실행하고, 출력을 `index.html`의 `MODELS` 맵에 등록하면 됩니다.
+
+### 페이지에 모델 추가하기
+
+DiT 파일을 `out/dit/`에 둔 뒤, `index.html`의 **두 곳**에 모델을 등록합니다. 두 곳은 **같은 key**를 써야 하며, 다르면 모델이 로드되지 않습니다.
+
+**1. `MODELS` 맵** (`const MODELS` 검색) — base/Turbo 한 쌍 추가:
+
+```js
+mymodel: {
+  label: "My Model",
+  dit:     "out/dit/mymodel_dit_dyn32_q8a4fns.onnx",
+  ditLora: "out/dit/mymodel_dit_dyn32_q8a4fnLs.onnx",
+  steps: 30, cfg: 5.0, sampler: "er_sde", scheduler: "simple",
+},
+mymodel_turbo: {
+  label: "My Model+Turbo",
+  dit:     "out/dit/mymodel_dit_turbo32_q8a4fns.onnx",
+  ditLora: "out/dit/mymodel_dit_turbo32_q8a4fnLs.onnx",
+  steps: 8, cfg: 1.0, sampler: "euler", scheduler: "simple",
+},
+```
+
+key는 자유(`[A-Za-z0-9_]`), `dit`/`ditLora` 경로는 실제 파일명과 일치해야 합니다. base는 30스텝 / CFG 5 / er_sde, Turbo는 8스텝 / CFG 1 / euler가 표준입니다.
+
+**2. 모델 드롭다운** (`id="modelSel"` 검색) — key마다 `<option>` 하나씩 추가:
+
+```html
+<option value="mymodel">My Model (베이스 · 30스텝 · CFG 5)</option>
+<option value="mymodel_turbo">My Model+Turbo (8스텝 · CFG 1)</option>
+```
+
+`value`는 `MODELS` key와 정확히 일치해야 합니다.
+
 최소 구성(레거시):
 
 ```bash
@@ -174,8 +214,6 @@ out/
 - **NegPip** — CFG=1(터보)에서는 부정 프롬프트가 무시됩니다. NegPip 체크 시 부정 프롬프트가 음수 가중치 그룹으로 병합되고, 슬롯 모델의 `negpip_mask`가 해당 토큰의 cross-attn value 부호를 뒤집어 개념을 빼냅니다. `add_negpip.py`로 만든 DiT 필요.
 - **런타임 LoRA** — `.safetensors` LoRA를 여러 개, 각자 강도로 추가한 뒤 **LoRA 반영**을 누릅니다(지연 적용 — N개를 N번이 아니라 1번에 컴파일). 변환(safetensors 파싱 + 멀티 LoRA ΔW/SVD 병합)은 Web Worker에서 진행바와 함께 돌고, 끝날 때까지 생성은 비활성화됩니다. **단일** LoRA는 강도가 그래프 입력(`lora_scale`)이라 슬라이더가 재컴파일 없이 다음 생성에 즉시 반영되고, **여러 개**일 때는 강도가 SVD 병합에 들어가 변경 시 재병합합니다. 어느 쪽이든 그래프는 랭크 48 유지. 미지원 키(텍스트 인코더 LoRA, LoKr)와 슬롯 밖 모듈은 조용히 버리지 않고 리포트합니다. `add_lora_slots.py`로 만든 슬롯 모델 필요.
 - **사용자 설정 모델** — *사용자 설정* 드롭다운으로 DiT(`.onnx` + 샤드 + manifest)를 디스크에서 골라 메모리에 직접 로드(OPFS 미사용, 모바일 동작). TE/어댑터/VAE는 기본 경로 사용.
-- **결과 썸네일 스택** — 생성할 때마다 결과 패널에 썸네일이 누적되고(세션 메모리, 새로고침 시 소멸), 클릭하면 그 이미지가 캔버스에 다시 크게 표시됩니다. 각 항목은 자신의 해상도 스냅샷을 독립 보관하므로, 해상도가 섞여도 클릭 시 정확히 복원됩니다. **PNG 저장**은 현재 캔버스(=마지막 클릭/생성) 기준으로 동작합니다.
-- **GPU 우선순위** — 고성능/절전/기본을 WebGPU `powerPreference`에 매핑(스펙상 GPU 번호 직접 지정 불가). 페이지 (재)로드 시 적용.
 
 ## 구현 노트 (다른 환경으로 포팅할 때)
 
