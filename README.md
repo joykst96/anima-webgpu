@@ -27,7 +27,7 @@ This repo contains the full pipeline: PyTorch/ComfyUI → ONNX export scripts, w
 |---|---|---|---|
 | Text encoding | Qwen3-0.6B-Base | ONNX fp16 | last hidden states |
 | Context adapter | Anima LLMAdapter | ONNX fp16 | dual tokenization: Qwen3 ids → hidden states, T5 ids → adapter queries; output zero-padded to 512×1024 |
-| Denoiser | Anima DiT 2B (Cosmos-Predict2) | ONNX, int8 weights (`accuracy_level=4` for DP4A) / fp32 activations, fp16 I/O | dynamic H/W axes, RoPE in-graph; self/cross attention fused into `MultiHeadAttention` (FA2); optional NegPip + LoRA-slot inputs |
+| Denoiser | Anima DiT 2B (Cosmos-Predict2) | ONNX, int8 weights (`accuracy_level=4` for DP4A) / fp32 activations (recommended — see Pitfalls), fp16 I/O | dynamic H/W axes, RoPE in-graph; self/cross attention fused into `MultiHeadAttention` (FA2); optional NegPip + LoRA-slot inputs |
 | Decode | Qwen-Image (Wan 2.1) VAE decoder | ONNX fp32 | CausalConv3d folded to 2D for T=1 (Conv2d kernel path); Wan21 de-normalization baked in; mid-block attention split into 8 query-axis chunks to cap the score buffer |
 
 The sampler (Euler / ER-SDE-Solver) and σ schedule run in plain JavaScript; each step calls the DiT session once (CFG 1) or twice (CFG > 1).
@@ -45,7 +45,7 @@ The sampler (Euler / ER-SDE-Solver) and σ schedule run in plain JavaScript; eac
 Model files needed: `anima-base-v1.0.safetensors`, the official **Anima Turbo LoRA** (optional, for the fast variant), `qwen_image_vae.safetensors`. Qwen3-0.6B-Base is fetched from HF automatically.
 
 ```bash
-# DiT — base variant (fp32 activations are REQUIRED for WebGPU; see Pitfalls)
+# DiT — base variant (--fp32-act recommended: fp16 runs but is ~1-2s slower; see Pitfalls)
 python export/export_dit.py --comfyui /path/to/ComfyUI \
   --ckpt /path/to/anima-base-v1.0.safetensors \
   --out out/dit/anima_dit_dyn32.onnx --dynamic --fp32-act
@@ -228,7 +228,7 @@ Hard-won facts about Anima's inference contract, verified against ComfyUI source
 
 ## Pitfalls encountered (read before reimplementing)
 
-1. **fp16 activations NaN on WebGPU.** CPU/DML execution providers silently upcast fp16 ops, so models that "work locally" still NaN in real fp16 shaders. Export the DiT with `--fp32-act` (fp16 I/O, fp32 compute baked as casts) and the VAE in fp32 — the Wan VAE overflows fp16 → the classic black-image bug.
+1. **DiT activation dtype — `--fp32-act` is a *speed* choice, not a NaN fix (corrected 2026-06).** Earlier this was believed to be "fp16 NaNs on WebGPU, so fp32-act is mandatory." That was wrong: exporting **without** `--fp32-act` (i.e. fp16 activations) runs fine with no NaN. But the model's internal autocast (block forward fp32 / submodules fp16) plus the `if x.dtype==fp16: x=x.float()` branch then bake a flood of fp16↔fp32 round-trip Casts into the graph (measured: 6 → 763 Cast nodes), which makes inference ~1-2s *slower* (12s → 14s) despite identical int8 weights and DP4A path. So `--fp32-act` is the recommended default for speed. Removing those Casts safely would require graph surgery across the whole network (high risk, uncertain memory payoff) — not currently worth it. **Separately**, export the VAE in fp32: the Wan VAE genuinely overflows fp16 → the classic black-image bug. (Also note: `add_lora_slots.py` hardcodes fp32 LoRA branches, so it is incompatible with an fp16-act DiT as-is — see the warning in that file.)
 2. **ORT Web returns `Float16Array`.** On browsers with native `Float16Array`, fp16 tensor `.data` contains *floats*, not uint16 bit patterns. Bit-twiddling it corrupts everything (zeros + NaN). Detect and branch (see `toF32`/`makeF16Tensor` in `index.html`).
 3. **Naive int4 RTN ruins diffusion DiTs** even with sensitive layers (adaLN/t_embedder/final_layer) excluded. Use int8, or HQQ for int4.
 4. **The dynamo ONNX exporter anonymizes names** (`node_linear`, `val_46`) — name-based layer matching is impossible; `quantize_dit.py` identifies sensitive layers by graph topology (reachable from `timesteps` but not `latent`) and weight shapes instead.

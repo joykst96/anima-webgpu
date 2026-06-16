@@ -3,9 +3,12 @@ DiT ONNX → MatMulNBits weight-only 양자화 (브라우저 탑재용).
 
 fp16 DiT(4.18GB)는 브라우저 ArrayBuffer/wasm 힙 한계를 넘어 로드 불가.
 MatMul 가중치를 int4(기본) 또는 int8로 블록 양자화해 크기를 줄인다.
-- 연산은 fp16 유지 (weight-only: 셰이더에서 역양자화 후 곱셈)
+- weight-only: 가중치만 양자화하고 activation dtype은 원본 그래프 그대로 둔다.
+  (fp32-act 모델이면 활성 fp32, fp16-act 모델이면 fp16 — 이 단계는 안 건드림)
+  셰이더에서 역양자화 후 곱셈. accuracy_level=4면 활성을 int8로 동적 양자화해
+  DP4A 정수 커널을 탄다(활성 원본 dtype과 무관하게 발동).
 - ORT WebGPU EP에 MatMulNBits 전용 커널 존재 (Phi-3 웹 데모 등에서 검증된 경로)
-- norm/embedding/conv는 fp16 그대로 유지됨
+- norm/embedding/conv 등 비양자화 레이어는 원본 dtype 그대로 유지됨
 
 사용 예 (portable 루트에서):
   python export/quantize_dit.py ^

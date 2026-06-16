@@ -349,9 +349,17 @@ def main():
     producer, consumers = build_maps(graph)
     init_names = {i.name for i in graph.initializer}
     r = args.rank
+
+    # ⚠️ [fp16 비호환 주의] 이 스크립트는 LoRA A/B 텐서와 lora_scale, 그리고
+    #   브랜치 말미의 Add를 전부 fp32로 만든다(아래 F32). fp32-act DiT는 타깃
+    #   프로젝션 출력 y_out이 fp32라 Add(y_out, lora_xs)의 dtype이 맞는다.
+    #   그러나 fp16-act DiT는 y_out이 fp16이라 Add(fp16, fp32) 불일치가 생겨
+    #   로드/실행이 깨진다. → fp16 모델에 슬롯을 붙이려면 A/B/lora_scale/Add를
+    #   모두 fp16으로 바꾸거나 Add 직전에 명시 Cast를 넣어야 한다(미구현).
+    #   현재 파이프라인은 fp32-act 기본이므로 이 스크립트도 fp32 고정으로 둔다.
     F32 = TensorProto.FLOAT
 
-    # lora_scale 입력 (스칼라, fp32)
+    # lora_scale 입력 (스칼라, fp32 — 위 경고 참조)
     graph.input.append(helper.make_tensor_value_info("lora_scale", F32, [1]))
 
     manifest = {"rank": r, "dtype": "float32", "bin": lora_bin,

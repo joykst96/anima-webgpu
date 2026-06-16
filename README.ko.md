@@ -27,7 +27,7 @@
 |---|---|---|---|
 | 텍스트 인코딩 | Qwen3-0.6B-Base | ONNX fp16 | last hidden states |
 | 컨텍스트 어댑터 | Anima LLMAdapter | ONNX fp16 | **이중 토큰화**: Qwen3 토큰 → 인코더 hidden states, T5 토큰 → 어댑터 쿼리. 출력은 512×1024로 zero-pad |
-| 디노이저 | Anima DiT 2B (Cosmos-Predict2) | ONNX, int8 가중치(DP4A용 `accuracy_level=4`) / fp32 활성, fp16 입출력 | H/W 동적 축, RoPE 그래프 내부; self/cross attention은 `MultiHeadAttention`으로 융합(FA2); NegPip·LoRA 슬롯 입력 선택 |
+| 디노이저 | Anima DiT 2B (Cosmos-Predict2) | ONNX, int8 가중치(DP4A용 `accuracy_level=4`) / fp32 활성(권장 — '함정' 참고), fp16 입출력 | H/W 동적 축, RoPE 그래프 내부; self/cross attention은 `MultiHeadAttention`으로 융합(FA2); NegPip·LoRA 슬롯 입력 선택 |
 | 디코드 | Qwen-Image (Wan 2.1) VAE 디코더 | ONNX fp32 | T=1에서 CausalConv3d를 2D로 폴딩(Conv2d 커널 경로); Wan21 역정규화 베이킹; mid-block attention은 쿼리축 8-chunk로 score 버퍼 제한 |
 
 샘플러(Euler / ER-SDE-Solver)와 시그마 스케줄은 순수 JavaScript로 돌고, 스텝마다 DiT 세션을 1회(CFG 1) 또는 2회(CFG > 1) 호출합니다.
@@ -45,7 +45,7 @@
 필요 파일: `anima-base-v1.0.safetensors`, 공식 **Anima Turbo LoRA**(고속 변형용, 선택), `qwen_image_vae.safetensors`. Qwen3-0.6B-Base는 HF에서 자동 다운로드됩니다.
 
 ```bash
-# DiT — 베이스 (WebGPU에는 fp32 활성이 필수 — 아래 '함정' 참고)
+# DiT — 베이스 (--fp32-act 권장: fp16도 되지만 ~1~2초 느림 — '함정' 참고)
 python export/export_dit.py --comfyui /path/to/ComfyUI \
   --ckpt /path/to/anima-base-v1.0.safetensors \
   --out out/dit/anima_dit_dyn32.onnx --dynamic --fp32-act
@@ -228,7 +228,7 @@ ComfyUI 소스 대조로 검증한 Anima의 추론 계약:
 
 ## 밟은 지뢰들 (재구현 전 필독)
 
-1. **WebGPU에서 fp16 활성이 NaN.** CPU/DML 실행 공급자는 fp16 연산을 조용히 fp32로 승격하므로 "로컬에선 되는" 모델이 진짜 fp16 셰이더에서는 NaN이 납니다. DiT는 `--fp32-act`(fp16 입출력, fp32 연산을 캐스트로 베이킹), VAE는 fp32로 export하세요 — Wan VAE는 fp16에서 오버플로해 고전적인 검은 이미지 버그를 재현합니다.
+1. **DiT 활성 dtype — `--fp32-act`는 NaN 방지가 아니라 *속도* 선택 (2026-06 정정).** 이전엔 "WebGPU에서 fp16 활성이 NaN → fp32-act 필수"로 알고 있었으나 틀렸다. `--fp32-act` **없이**(fp16 활성) export해도 NaN 없이 정상 동작한다. 다만 그 경우 모델 내부 autocast(블록 forward fp32 / 서브모듈 fp16)와 `if x.dtype==fp16: x=x.float()` 분기가 그래프에 fp16↔fp32 왕복 Cast를 대량으로 박는다(실측: Cast 6개 → 763개). 그 결과 weight(int8)·DP4A 경로가 동일한데도 추론이 오히려 ~1~2초 *느려진다*(12s → 14s). 그래서 `--fp32-act`가 속도 면에서 권장 기본값이다. 그 Cast를 안전하게 제거하려면 그래프 전반을 수술해야 하는데(리스크 큼, 메모리 이득 불확실) 현재로선 가치가 없다. **별개로**, VAE는 fp32로 export하라 — Wan VAE는 fp16에서 실제로 오버플로해 고전적인 검은 이미지 버그가 난다. (참고: `add_lora_slots.py`는 LoRA 브랜치를 fp32로 하드코딩하므로 현 상태로는 fp16 활성 DiT와 비호환 — 해당 파일의 경고 주석 참고.)
 2. **ORT Web이 `Float16Array`를 반환.** 네이티브 `Float16Array`가 있는 브라우저에서는 fp16 텐서의 `.data`가 uint16 비트 패턴이 아니라 *실제 float*입니다. 비트 연산으로 디코드하면 전부 깨집니다(0 + NaN). 감지해서 분기하세요 (`index.html`의 `toF32`/`makeF16Tensor`).
 3. **naive int4 RTN은 diffusion DiT를 망가뜨립니다** — 민감 레이어(adaLN/t_embedder/final_layer)를 제외해도 마찬가지. int8을 쓰거나, int4가 필요하면 HQQ를 쓰세요.
 4. **dynamo ONNX exporter는 이름을 익명화합니다** (`node_linear`, `val_46`) — 이름 기반 레이어 매칭이 불가능. `quantize_dit.py`는 그래프 위상(`timesteps`에서 도달 가능하고 `latent`에서 도달 불가)과 가중치 shape으로 민감 레이어를 식별합니다.

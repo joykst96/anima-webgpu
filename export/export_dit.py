@@ -2,10 +2,15 @@
 Anima DiT (MiniTrainDIT 2B) → ONNX export.
 
 핵심 포인트:
-- 반드시 fp16으로 로드한다. MiniTrainDIT._forward에는
-  `if x.dtype == torch.float16: x = x.float()` 분기가 있어서,
-  fp16으로 trace하면 "residual stream은 fp32, attention/MLP는 fp16" 캐스팅
-  패턴이 그래프에 그대로 박힌다. (bf16은 WebGPU에 없으므로 이 패턴이 필수)
+- dtype 두 경로: (기본·권장) --fp32-act는 fp32로 로드해 연산을 fp32로 굳히고
+  입출력만 fp16으로 캐스트한다. (대안) --fp32-act 없이 fp16으로 로드하면
+  MiniTrainDIT._forward의 `if x.dtype==torch.float16: x=x.float()` 분기 +
+  내부 autocast(블록=fp32 / 서브모듈=fp16)가 살아나 "residual은 fp32,
+  attention/MLP는 fp16"인 혼합 캐스팅 패턴이 그래프에 박힌다. bf16은 WebGPU에
+  없으므로 둘 다 fp16/fp32 조합으로만 간다.
+  ※ [검증 2026-06] fp16 경로도 NaN 없이 동작하지만, 위 혼합 패턴 때문에
+    fp16<->fp32 왕복 Cast가 폭증(6->763)해 1~2초 느리다. 그래서 --fp32-act 권장.
+    자세한 근거는 DitWrapper docstring 참고.
 - WrapperExecutor(ComfyUI 런타임 배관)를 우회하기 위해 _forward를 직접 호출.
 - 해상도 고정 export: RoPE 임베딩이 trace 시 상수로 구워진다.
   여러 해상도가 필요하면 --size를 바꿔 여러 번 export.
@@ -42,7 +47,16 @@ CONTEXT_DIM = 1024       # LLMAdapter target_dim
 
 class DitWrapper(torch.nn.Module):
     """WrapperExecutor를 건너뛰고 _forward를 직접 노출.
-    fp32_act 모드: 입출력은 fp16, 내부 연산은 fp32 (캐스팅을 그래프에 굽는다)."""
+    fp32_act 모드: 입출력은 fp16, 내부 연산은 fp32 (캐스팅을 그래프에 굽는다).
+
+    [검증 2026-06] fp32_act는 "NaN 방지용 필수 제약"이 아니라 속도 최적화다.
+    --fp32-act 없이(fp16 act) export해도 NaN 없이 정상 동작한다(5070 Ti 확인).
+    단 그 경우 MiniTrainDIT 내부의 autocast(블록 forward=fp32, 서브모듈=fp16)와
+    `if x.dtype==fp16: x=x.float()` 분기가 살아나, residual<->연산 경계마다
+    fp16<->fp32 왕복 Cast가 폭증한다(실측: Cast 6개 -> 763개). 이 Cast 오버헤드로
+    추론이 오히려 1~2초 느려진다(12s -> 14s). fp32_act는 입력을 통째 fp32로 올려
+    이 경계 Cast를 거의 제거한다(그래서 빠르다). weight는 어차피 이후 int8 양자화라
+    fp16/fp32 act 간 다운로드/weight 메모리 차이는 없다. 결론: fp32_act가 기본 권장."""
 
     def __init__(self, dit, fp32_act=False):
         super().__init__()
@@ -75,10 +89,11 @@ def main():
     p.add_argument("--lora-strength", type=float, default=1.0,
                    dest="lora_strength")
     p.add_argument("--fp32-act", action="store_true", dest="fp32_act",
-                   help="활성(연산)을 fp32로 유지. WebGPU 진짜-fp16 환경에서 "
-                        "활성값 오버플로(NaN) 방지. 입출력은 fp16 유지라 "
-                        "웹페이지 수정 불필요. 가중치는 이후 quantize_dit로 "
-                        "int4 양자화하면 됨.")
+                   help="활성(연산)을 fp32로 유지. 입출력은 fp16이라 웹페이지 "
+                        "수정 불필요. 효용은 NaN 방지가 아니라 '속도'다 — 빼면 "
+                        "모델 내부 autocast/캐스트 분기로 fp16<->fp32 왕복 Cast가 "
+                        "폭증(6->763)해 1~2초 느려진다(검증 2026-06). 기본 권장. "
+                        "가중치는 이후 quantize_dit로 int8/int4 양자화하면 됨.")
     args = p.parse_args()
 
     setup_comfyui(args.comfyui)
