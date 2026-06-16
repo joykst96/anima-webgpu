@@ -117,39 +117,48 @@ REM from the ComfyUI portable root:
 export\build_dit.bat ComfyUI\models\diffusion_models\my-finetune.safetensors myft
 ```
 
-This emits `myft_dit_dyn32_q8a4fns/fnLs.onnx` and `myft_dit_turbo32_*` (with shards + manifests). The Turbo variant merges the Turbo LoRA at export time (`TURBO_LORA` path is set at the top of the script). Re-run it per checkpoint whenever you rebuild; register the output in the `MODELS` map in `index.html`.
+This emits `myft_dit_dyn32_q8a4fns/fnLs.onnx` and `myft_dit_turbo32_*` (with shards + manifests). The Turbo variant merges the Turbo LoRA at export time (`TURBO_LORA` path is set at the top of the script). Re-run it per checkpoint whenever you rebuild; register the output via `export/model-list.yml` + `gen_models.py` (see "Adding models to the page" below).
 
 ### Adding models to the page
 
-Once the DiT files are in `out/dit/`, register the model in **two places** in `index.html`. The two must use the **same key**, or the model fails to load.
+Model registration is driven by `export/model-list.yml` and injected into
+`index.html` by `export/gen_models.py` — you no longer hand-edit the `MODELS`
+map or the dropdown. The generator writes between markers (`MODELS:START/END`,
+`MODEL_OPTIONS:START/END`, `PATH_DEFAULTS:START/END`, and the two prompt
+`<textarea>`s); everything else, including the `custom` entry, is left
+untouched. It is idempotent — re-running produces no diff.
 
-**1. The `MODELS` map** (search `const MODELS`) — add a base/Turbo pair:
+**Workflow:**
 
-```js
-mymodel: {
-  label: "My Model",
-  dit:     "out/dit/mymodel_dit_dyn32_q8a4fns.onnx",
-  ditLora: "out/dit/mymodel_dit_dyn32_q8a4fnLs.onnx",
-  steps: 30, cfg: 5.0, sampler: "er_sde", scheduler: "simple",
-},
-mymodel_turbo: {
-  label: "My Model+Turbo",
-  dit:     "out/dit/mymodel_dit_turbo32_q8a4fns.onnx",
-  ditLora: "out/dit/mymodel_dit_turbo32_q8a4fnLs.onnx",
-  steps: 8, cfg: 1.0, sampler: "euler", scheduler: "simple",
-},
+```bash
+# 1. build the DiT (key = the build_dit.bat prefix)
+export/build_dit.bat <ckpt> myft
+
+# 2. add one entry to export/model-list.yml
+# 3. inject into the page (static output, no runtime fetch)
+python export/gen_models.py export/model-list.yml web/index.html
 ```
 
-Keys are free-form (`[A-Za-z0-9_]`); `dit`/`ditLora` paths must match the actual filenames. Base uses 30 steps / CFG 5 / er_sde; Turbo uses 8 steps / CFG 1 / euler.
+A model entry only needs the `key` (= the build prefix); paths are derived by
+rule (`out/dit/{key}_dit_dyn32|turbo32_q8a4f{ns,Ls}.onnx`):
 
-**2. The model dropdown** (search `id="modelSel"`) — add one `<option>` per key:
-
-```html
-<option value="mymodel">My Model (base · 30 steps · CFG 5)</option>
-<option value="mymodel_turbo">My Model+Turbo (8 steps · CFG 1)</option>
+```yaml
+models:
+  - key: myft
+    label: My Model
+    variants: [base, turbo]      # or just [turbo] / [base]
+    source: https://civitai.com/...   # optional → footer credit link
+    overrides:                   # optional, per-variant
+      turbo: { steps: 6 }
 ```
 
-The `value` must equal the `MODELS` key exactly.
+The generated `MODELS` key is `{key}_{variant}` (e.g. `myft_base`,
+`myft_turbo`), which is also the dropdown `value`. Global bits live at the top
+of the yml: `selected` (default dropdown choice), `paths` (TE/adapter/VAE),
+`defaults.base`/`defaults.turbo` (per-variant steps/cfg/sampler/scheduler), and
+`prompt_defaults` (the initial positive/negative textarea text). The `source`
+footer links only render if `index.html` has a `FOOTER_SOURCES:START/END`
+marker pair; without it they are silently skipped.
 
 Quantization alone (legacy / minimal):
 
@@ -205,7 +214,7 @@ out/
 └── vae/           qwen_image_vae_decoder_dyn32_2dc.onnx (+ .data)
 ```
 
-Edit the `PATHS` / `MODELS` constants at the top of `web/index.html` if your filenames differ. Do **not** leave un-quantized source models in the web root.
+Set `paths` (TE/adapter/VAE) and model entries in `export/model-list.yml`, then run `gen_models.py`, if your filenames differ. Do **not** leave un-quantized source models in the web root.
 
 A ready-to-run static server is in `deploy/` (`docker compose up -d`; nginx with `immutable` cache headers for weights, `no-cache` for the page). Behind Cloudflare, add a Cache Rule making `.bin/.onnx/.data/.json` cache-eligible — these extensions are not cached by default, and without the rule every request hits your origin. Keep shards ≤ ~500 MB for free-tier per-file cache limits. Because weights are served `immutable`, **never overwrite a model file in place** — upload under a new filename and update `index.html`.
 

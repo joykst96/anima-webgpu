@@ -117,39 +117,46 @@ REM ComfyUI portable 루트에서:
 export\build_dit.bat ComfyUI\models\diffusion_models\my-finetune.safetensors myft
 ```
 
-`myft_dit_dyn32_q8a4fns/fnLs.onnx`와 `myft_dit_turbo32_*`(샤드 + manifest 포함)를 생성합니다. Turbo 변형은 export 시점에 Turbo LoRA를 머지합니다(`TURBO_LORA` 경로는 스크립트 상단에서 설정). 체크포인트를 다시 빌드할 때마다 실행하고, 출력을 `index.html`의 `MODELS` 맵에 등록하면 됩니다.
+`myft_dit_dyn32_q8a4fns/fnLs.onnx`와 `myft_dit_turbo32_*`(샤드 + manifest 포함)를 생성합니다. Turbo 변형은 export 시점에 Turbo LoRA를 머지합니다(`TURBO_LORA` 경로는 스크립트 상단에서 설정). 체크포인트를 다시 빌드할 때마다 실행하고, 출력은 `export/model-list.yml` + `gen_models.py`로 등록합니다(아래 "페이지에 모델 추가하기" 참고).
 
 ### 페이지에 모델 추가하기
 
-DiT 파일을 `out/dit/`에 둔 뒤, `index.html`의 **두 곳**에 모델을 등록합니다. 두 곳은 **같은 key**를 써야 하며, 다르면 모델이 로드되지 않습니다.
+모델 등록은 `export/model-list.yml`로 관리되고 `export/gen_models.py`가
+`index.html`에 주입합니다 — `MODELS` 맵이나 드롭다운을 직접 수정하지 않습니다.
+생성기는 마커(`MODELS:START/END`, `MODEL_OPTIONS:START/END`,
+`PATH_DEFAULTS:START/END`, 프롬프트 `<textarea>` 2개) 사이만 교체하고, `custom`
+항목을 포함한 나머지는 건드리지 않습니다. 멱등이라 재실행해도 diff가 없습니다.
 
-**1. `MODELS` 맵** (`const MODELS` 검색) — base/Turbo 한 쌍 추가:
+**워크플로우:**
 
-```js
-mymodel: {
-  label: "My Model",
-  dit:     "out/dit/mymodel_dit_dyn32_q8a4fns.onnx",
-  ditLora: "out/dit/mymodel_dit_dyn32_q8a4fnLs.onnx",
-  steps: 30, cfg: 5.0, sampler: "er_sde", scheduler: "simple",
-},
-mymodel_turbo: {
-  label: "My Model+Turbo",
-  dit:     "out/dit/mymodel_dit_turbo32_q8a4fns.onnx",
-  ditLora: "out/dit/mymodel_dit_turbo32_q8a4fnLs.onnx",
-  steps: 8, cfg: 1.0, sampler: "euler", scheduler: "simple",
-},
+```bash
+# 1. DiT 빌드 (key = build_dit.bat prefix)
+export/build_dit.bat <ckpt> myft
+
+# 2. export/model-list.yml에 항목 한 줄 추가
+# 3. 페이지에 주입 (정적 출력, 런타임 fetch 없음)
+python export/gen_models.py export/model-list.yml web/index.html
 ```
 
-key는 자유(`[A-Za-z0-9_]`), `dit`/`ditLora` 경로는 실제 파일명과 일치해야 합니다. base는 30스텝 / CFG 5 / er_sde, Turbo는 8스텝 / CFG 1 / euler가 표준입니다.
+모델 항목은 `key`(= 빌드 prefix)만 있으면 되고, 경로는 규칙으로 자동 생성됩니다
+(`out/dit/{key}_dit_dyn32|turbo32_q8a4f{ns,Ls}.onnx`):
 
-**2. 모델 드롭다운** (`id="modelSel"` 검색) — key마다 `<option>` 하나씩 추가:
-
-```html
-<option value="mymodel">My Model (베이스 · 30스텝 · CFG 5)</option>
-<option value="mymodel_turbo">My Model+Turbo (8스텝 · CFG 1)</option>
+```yaml
+models:
+  - key: myft
+    label: My Model
+    variants: [base, turbo]      # 또는 [turbo] / [base]
+    source: https://civitai.com/...   # 옵션 → footer 출처 링크
+    overrides:                   # 옵션, variant별
+      turbo: { steps: 6 }
 ```
 
-`value`는 `MODELS` key와 정확히 일치해야 합니다.
+생성되는 `MODELS` key는 `{key}_{variant}`(예: `myft_base`, `myft_turbo`)이며
+드롭다운 `value`이기도 합니다. 전역 설정은 yml 상단에: `selected`(드롭다운 기본
+선택), `paths`(TE/adapter/VAE), `defaults.base`/`defaults.turbo`(variant별
+steps/cfg/sampler/scheduler), `prompt_defaults`(긍정/부정 textarea 초기값).
+`source` footer 링크는 `index.html`에 `FOOTER_SOURCES:START/END` 마커가 있을
+때만 렌더되고, 없으면 조용히 스킵됩니다.
 
 최소 구성(레거시):
 
@@ -205,7 +212,7 @@ out/
 └── vae/           qwen_image_vae_decoder_dyn32_2dc.onnx (+ .data)
 ```
 
-파일명이 다르면 `web/index.html` 상단의 `PATHS` / `MODELS` 상수를 수정하세요. **양자화 전 원본 모델을 웹 루트에 두지 마세요.**
+파일명이 다르면 `export/model-list.yml`의 `paths`(TE/adapter/VAE)와 모델 항목을 수정하고 `gen_models.py`를 실행하세요. **양자화 전 원본 모델을 웹 루트에 두지 마세요.**
 
 바로 쓸 수 있는 정적 서버가 `deploy/`에 있습니다 (`docker compose up -d`; nginx — 가중치는 `immutable` 캐시 헤더, 페이지는 `no-cache`). Cloudflare 뒤에 두는 경우 `.bin/.onnx/.data/.json`을 캐시 대상으로 지정하는 Cache Rule을 반드시 추가하세요 — 이 확장자들은 기본적으로 캐시되지 않아서, 규칙 없이는 모든 요청이 오리진까지 내려옵니다. 무료 플랜의 파일당 캐시 한도 때문에 샤드는 ~500MB 이하로 유지하세요. 가중치가 `immutable`로 서빙되므로 **모델 파일을 같은 이름으로 덮어쓰면 안 됩니다** — 새 파일명으로 올리고 `index.html`만 갱신하세요.
 
