@@ -97,6 +97,14 @@
         padding: 8px 10px;
         font: inherit;
       }
+      footer a {
+        color: #9aa4c0;
+        text-decoration: none;
+      }
+      footer a:hover {
+        color: #c0c8e0;
+        text-decoration: underline;
+      }
       textarea {
         resize: vertical;
         min-height: 64px;
@@ -742,36 +750,38 @@ worst quality, low quality, score_1, score_2, score_3, artist name, nsfw</textar
             모든 연산은 방문자 기기의 GPU에서 실행되며, 프롬프트와 생성 결과는
             서버로 전송되지 않습니다.
           </div>
-          <div
-            class="stats"
-            style="
-              margin-top: 14px;
-              padding-top: 12px;
-              border-top: 1px solid var(--border);
-              font-size: 11px;
-              line-height: 1.7;
-            "
-          >
-            This page distributes a <b>modified</b> version of the Anima model
-            (ONNX conversion, int8 weight quantization, and Turbo LoRA merge).
-            This is an unofficial project and is not endorsed, approved, or
-            validated by CircleStone Labs.<br />
-            “The CircleStone Model is licensed by CircleStone Labs LLC under the
-            <a
-              href="https://huggingface.co/circlestone-labs/Anima/blob/main/LICENSE.md"
-              style="color: var(--accent)"
-              >CircleStone Non-Commercial License</a
-            >. Copyright CircleStone Labs LLC. IN NO EVENT SHALL CIRCLESTONE
-            LABS LLC BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
-            WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-            OUT OF OR IN CONNECTION WITH USE OF THIS MODEL.”<br />
-            Rights to use the model and derivatives are granted directly by
-            CircleStone Labs LLC to you under the above license (non-commercial
-            use only). Built on NVIDIA Cosmos (NVIDIA Open Model License). Text
-            encoder: Qwen3-0.6B-Base (Apache 2.0).
-          </div>
         </div>
       </div>
+
+      <footer style="margin:28px 0 8px; padding-top:16px; border-top:1px solid var(--border); font-size:11px; line-height:1.7; color:var(--dim)">
+        <div style="margin-bottom:12px">
+          <span style="display:block; margin-bottom:6px; font-size:12px; color:var(--text)">파인튜닝 모델 출처 (Civitai)</span>
+          <span style="display:flex; flex-wrap:wrap; gap:6px 16px">
+            <!-- FOOTER_SOURCES:START (gen_models.py 자동생성 — 직접 수정 금지) -->
+
+            <!-- FOOTER_SOURCES:END -->
+          </span>
+        </div>
+        <div style="padding-top:12px; border-top:1px solid var(--border)">
+          This page distributes a <b>modified</b> version of the Anima model
+          (ONNX conversion, int8 weight quantization, and Turbo LoRA merge).
+          This is an unofficial project and is not endorsed, approved, or
+          validated by CircleStone Labs.<br />
+          “The CircleStone Model is licensed by CircleStone Labs LLC under the
+          <a
+            href="https://huggingface.co/circlestone-labs/Anima/blob/main/LICENSE.md"
+            style="color: var(--accent)"
+            >CircleStone Non-Commercial License</a
+          >. Copyright CircleStone Labs LLC. IN NO EVENT SHALL CIRCLESTONE
+          LABS LLC BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+          WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+          OUT OF OR IN CONNECTION WITH USE OF THIS MODEL.”<br />
+          Rights to use the model and derivatives are granted directly by
+          CircleStone Labs LLC to you under the above license (non-commercial
+          use only). Built on NVIDIA Cosmos (NVIDIA Open Model License). Text
+          encoder: Qwen3-0.6B-Base (Apache 2.0).
+        </div>
+      </footer>
     </div>
 
     <div id="lightbox" role="dialog" aria-modal="true">

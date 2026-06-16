@@ -72,7 +72,13 @@ def build_model_entries(cfg):
 
             model_key = f"{key}_{variant}"
             suffix = d.get("label_suffix", "")
-            label_core = ov.get("label", base_label)
+            # turbo는 모델명에 '+Turbo'를 붙여 base와 구분 (override label이 있으면 존중)
+            if "label" in ov:
+                label_core = ov["label"]
+            elif variant == "turbo":
+                label_core = base_label + "+Turbo"
+            else:
+                label_core = base_label
             label = (label_core + " " + suffix).strip()
 
             dit, dit_lora = dit_paths(key, variant)
@@ -138,8 +144,8 @@ def render_footer_html(cfg):
                 f'        <a href="{html.escape(src)}" target="_blank" '
                 f'rel="noopener">{html.escape(label)}</a>'
             )
-    if not links:
-        return None
+    # source가 하나도 없으면 빈 문자열을 반환해 마커 사이를 비운다
+    # (None을 반환하면 마커를 안 건드려 이전 링크가 남는 버그가 됨).
     return "\n".join(links)
 
 
