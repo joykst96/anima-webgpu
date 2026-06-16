@@ -212,6 +212,29 @@
         color: var(--text);
         background: #1a2030;
       }
+      /* SPEED 모드: 선택 불가 버킷 dim + 클릭 차단 */
+      .chips button.chip.chip-locked {
+        opacity: 0.3;
+        pointer-events: none;
+        filter: grayscale(0.6);
+      }
+      /* SPEED 모드: 비활성화된 입력/textarea 시각 표시 */
+      .speed-disabled {
+        opacity: 0.4;
+        pointer-events: none;
+      }
+      /* SPEED 활성 버킷 강조 테두리 (warn 톤 — 특수 모드임을 알림) */
+      .chips button.chip.speed-allowed {
+        border-color: var(--warn);
+        box-shadow: 0 0 0 1px var(--warn);
+      }
+      /* 비활성 입력 시각 표시 (예: CFG=1 + NegPip 미선택 시 부정 프롬프트) */
+      #negative:disabled,
+      #negpipChk:disabled,
+      #negpipW:disabled {
+        opacity: 0.4;
+        cursor: not-allowed;
+      }
       .chip .ratio-ico {
         display: inline-block;
         border: 1.5px solid currentColor;
@@ -594,7 +617,27 @@ masterpiece, best quality, score_7, safe</textarea
             <textarea id="negative">
 worst quality, low quality, score_1, score_2, score_3, artist name</textarea
             >
-            <label>해상도 프리셋</label>
+            <label style="display:flex; align-items:center; gap:8px; justify-content:space-between">
+              <span>해상도 프리셋</span>
+              <span style="display:flex; align-items:center; gap:5px; font-weight:normal; font-size:12px; color:var(--warn)" title="저해상도에서 시작해 denoise 도중 해상도를 키워 속도를 높입니다 (SPD/SPEED). 1024·1280 프리셋에서만 동작.">
+                <input id="speedChk" type="checkbox" style="width:auto" />
+                <span>SPEED (실험)</span>
+              </span>
+            </label>
+            <div id="speedDevPanel" style="display:none; margin:4px 0 6px; padding:6px 8px; border:1px solid var(--warn); border-radius:6px; font-size:12px; background:#1a1610">
+              <div style="color:var(--warn); margin-bottom:4px">SPEED 고급 설정</div>
+              <div class="row" style="gap:6px">
+                <div>
+                  <label style="font-size:11px" title="해상도 단계 (시작배율…1.0). 기본 0.5,1.0 = 절반 해상도로 시작">stages</label>
+                  <input id="speedStages" type="text" value="0.5, 1.0" style="width:100%" />
+                </div>
+                <div>
+                  <label style="font-size:11px" title="이 σ에서 고해상도로 전환. 낮을수록 빠르지만 디테일(손 등) 손실 위험. 0.7 권장, 시드마다 다름">전환 σ</label>
+                  <input id="speedTransSigmas" type="text" value="0.7" style="width:100%" />
+                </div>
+              </div>
+              <div style="font-size:10px; color:var(--muted, #888); margin-top:4px">σ 낮을수록 빠름 (0.5~0.8). 디테일 깨지면 σ를 올리거나 SPEED 끄기. 결과는 시드마다 다름.</div>
+            </div>
             <div id="resBucketChips" class="chips"></div>
             <div id="resRatioChips" class="chips" style="margin-top: 5px"></div>
             <div class="row" style="margin-top: 6px">
@@ -950,6 +993,197 @@ worst quality, low quality, score_1, score_2, score_3, artist name</textarea
         const sigs = [];
         for (let i = 0; i <= steps; i++) sigs.push(shiftSigma(1 - i / steps));
         return sigs;
+      }
+
+      // ═════════ SPEED / SPD (Spectral Progressive Diffusion) ═════════
+      // 저해상도에서 denoise 시작 → 특정 σ에서 DCT 스펙트럼 확장으로 해상도를
+      // 키우며 고주파를 노이즈로 채움. Anima는 σ를 t로 직접 사용.
+      //
+      // 출처(verbatim 포팅, 감사):
+      //   - ComfyUI-Spectrum-KSampler (spd.py) — 베이스
+      //     https://github.com/sorryhyun/ComfyUI-Spectrum-KSampler
+      //   - ComfyUI-SPEED — 교차 참고
+      //     https://github.com/ruwwww/ComfyUI-SPEED
+      //   - 논문: Xiao et al., arXiv:2605.18736
+      // 수식은 numpy 골든값으로 검증됨(오차 1e-15).
+      const _DCT_CACHE = new Map();
+      function _dctMatrix(n) {
+        const c = _DCT_CACHE.get(n);
+        if (c) return c;
+        const m = new Float64Array(n * n);
+        const s0 = 1 / Math.sqrt(n),
+          sk = Math.sqrt(2 / n);
+        for (let k = 0; k < n; k++) {
+          const sc = k === 0 ? s0 : sk,
+            b = k * n;
+          for (let j = 0; j < n; j++)
+            m[b + j] = Math.cos((Math.PI * k * (2 * j + 1)) / (2 * n)) * sc;
+        }
+        _DCT_CACHE.set(n, m);
+        return m;
+      }
+      // dct2 = Dh @ x @ Dw.T  (채널별, x는 길이 C*H*W flat)
+      function _dct2(x, C, H, W) {
+        const Dh = _dctMatrix(H),
+          Dw = _dctMatrix(W),
+          plane = H * W;
+        const out = new Float64Array(C * plane);
+        for (let c = 0; c < C; c++) {
+          const xb = c * plane;
+          const t1 = new Float64Array(plane); // Dh @ ch
+          for (let i = 0; i < H; i++)
+            for (let k = 0; k < H; k++) {
+              const a = Dh[i * H + k];
+              if (a === 0) continue;
+              for (let j = 0; j < W; j++) t1[i * W + j] += a * x[xb + k * W + j];
+            }
+          for (let i = 0; i < H; i++) // (t1) @ Dw.T
+            for (let r = 0; r < W; r++) {
+              let s = 0;
+              const rb = r * W;
+              for (let k = 0; k < W; k++) s += t1[i * W + k] * Dw[rb + k];
+              out[xb + i * W + r] = s;
+            }
+        }
+        return out;
+      }
+      // idct2 = Dh.T @ x @ Dw
+      function _idct2(x, C, H, W) {
+        const Dh = _dctMatrix(H),
+          Dw = _dctMatrix(W),
+          plane = H * W;
+        const out = new Float64Array(C * plane);
+        for (let c = 0; c < C; c++) {
+          const xb = c * plane;
+          const t1 = new Float64Array(plane); // Dh.T @ ch
+          for (let k = 0; k < H; k++)
+            for (let i = 0; i < H; i++) {
+              const a = Dh[k * H + i];
+              if (a === 0) continue;
+              for (let j = 0; j < W; j++) t1[i * W + j] += a * x[xb + k * W + j];
+            }
+          for (let i = 0; i < H; i++) // (t1) @ Dw
+            for (let j = 0; j < W; j++) {
+              let s = 0;
+              for (let k = 0; k < W; k++) s += t1[i * W + k] * Dw[k * W + j];
+              out[xb + i * W + j] = s;
+            }
+        }
+        return out;
+      }
+      const _snap = (v, m) => Math.max(m, Math.round(v / m) * m);
+
+      // (C,H,W) latent → 저주파 (C,h,w). 반환 {data,h,w}
+      function _dctLowpassInit(x, C, H, W, scale, patch) {
+        const xi = _dct2(x, C, H, W);
+        const h = Math.min(_snap(H * scale, patch), H);
+        const w = Math.min(_snap(W * scale, patch), W);
+        const crop = new Float64Array(C * h * w);
+        for (let c = 0; c < C; c++)
+          for (let y = 0; y < h; y++) {
+            const src = c * H * W + y * W,
+              dst = c * h * w + y * w;
+            for (let xx = 0; xx < w; xx++) crop[dst + xx] = xi[src + xx];
+          }
+        return { data: _idct2(crop, C, h, w), h, w };
+      }
+
+      // 저해상도 (C,hLo,wLo) → 고해상도. noise 내부 생성(rand). 반환 {data,h,w,sigmaAligned}
+      function _spectralExpand(xLo, C, hLo, wLo, sigmaVal, scaleLo, scaleHi,
+                               Hfull, Wfull, patch, rand) {
+        const xi = _dct2(xLo, C, hLo, wLo);
+        const hHi = Math.max(_snap(Hfull * scaleHi, patch), hLo);
+        const wHi = Math.max(_snap(Wfull * scaleHi, patch), wLo);
+        const r = scaleHi / scaleLo;
+        const sigmaAligned = (r * sigmaVal) / (1 + (r - 1) * sigmaVal);
+        const kappa = r / (1 + (r - 1) * sigmaVal);
+
+        const noise = new Float64Array(C * hHi * wHi);
+        const nf = new Float32Array(C * hHi * wHi);
+        gaussianFill(nf, rand);
+        for (let i = 0; i < noise.length; i++) noise[i] = nf[i];
+
+        const xiNew = new Float64Array(C * hHi * wHi);
+        for (let c = 0; c < C; c++) {
+          for (let y = 0; y < hLo; y++) {
+            const src = c * hLo * wLo + y * wLo,
+              dst = c * hHi * wHi + y * wHi;
+            for (let xx = 0; xx < wLo; xx++) xiNew[dst + xx] = xi[src + xx];
+          }
+          for (let y = 0; y < hHi; y++) {
+            const dstRow = c * hHi * wHi + y * wHi;
+            const xStart = y < hLo ? wLo : 0;
+            for (let xx = xStart; xx < wHi; xx++)
+              xiNew[dstRow + xx] += sigmaVal * noise[dstRow + xx];
+          }
+        }
+        const xNew = _idct2(xiNew, C, hHi, wHi);
+        for (let i = 0; i < xNew.length; i++) xNew[i] *= kappa;
+        return { data: xNew, h: hHi, w: wHi, sigmaAligned };
+      }
+
+      // SPEED 멀티해상도 euler. denoise(xf32, sigma, curH, curW) 호출.
+      // stages: 오름차순 scale 리스트(1.0 끝). transSig: 핸드오프 σ(len=stages-1).
+      // onStep(i, s, sn, den, curH, curW) — i는 전체 누적 인덱스.
+      async function sampleSpeed(denoise, x0, sigmas, rand, onStep, opts) {
+        const { stages, transSig, fullH, fullW, C, patch } = opts;
+        let curScale = stages[0];
+        let curH = _snap(fullH * curScale, patch),
+          curW = _snap(fullW * curScale, patch);
+
+        // 초기 저해상도로 다운 (스케일<1이면)
+        let x;
+        if (curScale < 1.0) {
+          const low = _dctLowpassInit(x0, C, fullH, fullW, curScale, patch);
+          x = new Float32Array(low.data.length);
+          for (let i = 0; i < x.length; i++) x[i] = low.data[i];
+          curH = low.h;
+          curW = low.w;
+        } else {
+          x = x0;
+        }
+
+        const sig = sigmas.slice(); // 가변 복사 (re-space)
+        let stageIdx = 0;
+        const n = sig.length - 1;
+
+        for (let i = 0; i < n; i++) {
+          // 해상도 핸드오프: σ가 임계 이하로 떨어지면 확장
+          while (
+            stageIdx < transSig.length &&
+            sig[i] <= transSig[stageIdx]
+          ) {
+            const scaleLo = stages[stageIdx],
+              scaleHi = stages[stageIdx + 1];
+            const old = sig[i];
+            // x를 Float64로 올려 확장
+            const xLo = new Float64Array(x.length);
+            for (let k = 0; k < x.length; k++) xLo[k] = x[k];
+            const ex = _spectralExpand(xLo, C, curH, curW, old, scaleLo,
+              scaleHi, fullH, fullW, patch, rand);
+            x = new Float32Array(ex.data.length);
+            for (let k = 0; k < x.length; k++) x[k] = ex.data[k];
+            curH = ex.h;
+            curW = ex.w;
+            curScale = scaleHi;
+            // 남은 σ re-space (Sec 4.3)
+            const nv = ex.sigmaAligned;
+            if (old > 0 && nv !== old)
+              for (let j = i + 1; j <= n; j++) sig[j] = nv * (sig[j] / old);
+            sig[i] = nv;
+            stageIdx++;
+          }
+
+          const s = sig[i],
+            sn = sig[i + 1];
+          const den = await denoise(x, s, curH, curW);
+          if (sn === 0) x.set(den);
+          else
+            for (let k = 0; k < x.length; k++)
+              x[k] += ((sn - s) * (x[k] - den[k])) / s;
+          if ((await onStep(i, s, sn, den, curH, curW)) === false) return null;
+        }
+        return x; // 풀 해상도 latent
       }
 
       // ───────── 샘플러 (run_pipeline.py 포팅) ─────────
@@ -1425,19 +1659,22 @@ worst quality, low quality, score_1, score_2, score_3, artist name</textarea
         $("scheduler").value = m.scheduler;
       }
 
+      let _prevCfg = 1; // CFG 변경 추적 (초기값은 아래 초기화에서 실제값으로 동기화)
       function updateModelUI() {
         const key = $("modelSel").value;
         $("customPanel").style.display = key === "custom" ? "" : "none";
-        const cfg = MODELS[key].cfg;
+        const cfg = +$("cfg").value; // 사용자가 직접 바꾼 실제 CFG 기준
         const chk = $("negpipChk"),
           nw = $("negpipW"),
           neg = $("negative");
-        // base(CFG>1): NegPip 무의미 → 비활성. base+turbo(CFG=1): NegPip 미체크면 부정칸 비활성.
+        // CFG>1: 일반 부정 프롬프트가 동작 → NegPip 무의미(해제+비활성). 부정칸은 활성 유지.
+        // CFG=1: NegPip 미체크면 부정 프롬프트가 무시됨 → 부정칸 비활성.
         if (cfg > 1) {
           chk.checked = false;
           chk.disabled = true;
           nw.disabled = true;
-          neg.disabled = false;
+          neg.disabled = false; // 터보여도 CFG>1이면 부정칸 활성
+          neg.placeholder = "";
           chk.parentElement.title =
             "CFG>1에서는 일반 부정 프롬프트가 동작하므로 NegPip 불필요";
         } else {
@@ -1453,9 +1690,10 @@ worst quality, low quality, score_1, score_2, score_3, artist name</textarea
 
       function onModelChange() {
         applyModelSettings();
-        // 터보(CFG=1) 전환 시 NegPip 자동 활성화 — 안 켜면 부정 프롬프트가 무시되므로.
-        // (모델 전환 순간에만. 이후 사용자가 직접 끄는 건 updateModelUI가 존중.)
-        if (MODELS[$("modelSel").value].cfg <= 1) $("negpipChk").checked = true;
+        _prevCfg = +$("cfg").value; // 모델 전환으로 바뀐 CFG 동기화
+        // 모델 전환 시 CFG=1이면 NegPip 자동 활성화 — 안 켜면 부정 프롬프트가 무시되므로.
+        // (전환 순간에만. 이후 사용자가 직접 끄는 건 updateModelUI가 존중.)
+        if (+$("cfg").value <= 1) $("negpipChk").checked = true;
         updateModelUI();
         const key = $("modelSel").value;
         if (ditSessions[key]) {
@@ -1917,6 +2155,34 @@ worst quality, low quality, score_1, score_2, score_3, artist name</textarea
         }
         let seed = +$("seed").value;
         if (seed < 0) seed = (Math.random() * 0x7fffffff) | 0;
+
+        // SPEED 스케줄 파싱 (개발패널 입력). 켜졌을 때만.
+        const speedOn = $("speedChk").checked;
+        let speedStages = null,
+          speedTransSig = null;
+        if (speedOn) {
+          const parseList = (s) =>
+            s
+              .split(",")
+              .map((v) => parseFloat(v.trim()))
+              .filter((v) => !isNaN(v));
+          speedStages = parseList($("speedStages").value);
+          speedTransSig = parseList($("speedTransSigmas").value);
+          // 검증: stages 오름차순+1.0끝, transSig 길이=stages-1, 모두 0<σ<범위
+          if (
+            speedStages.length < 2 ||
+            speedStages[speedStages.length - 1] !== 1.0 ||
+            speedStages.some((v, i) => i > 0 && v <= speedStages[i - 1]) ||
+            speedTransSig.length !== speedStages.length - 1
+          ) {
+            log(
+              "SPEED 스케줄 오류: stages는 오름차순+1.0끝, transition σ 길이는 stages-1이어야 함",
+              "err",
+            );
+            return;
+          }
+        }
+
         const job = {
           id: ++jobSeq,
           pxW,
@@ -1931,6 +2197,9 @@ worst quality, low quality, score_1, score_2, score_3, artist name</textarea
           negpip: $("negpipChk").checked,
           negpipW: +$("negpipW").value,
           modelKey: $("modelSel").value,
+          speed: speedOn,
+          speedStages,
+          speedTransSig,
           // LoRA는 현재 반영 상태를 그대로 씀(스냅샷 시점 lora.bin) — 별도 복사 불필요.
         };
         genQueue.push(job);
@@ -2073,8 +2342,8 @@ worst quality, low quality, score_1, score_2, score_3, artist name</textarea
             job.scheduler === "simple" ? simpleSchedule : normalSchedule
           )(steps);
 
-          const denoise = async (xf32, sigma) => {
-            const lat = makeF16Tensor(xf32, [1, LAT_C, 1, H, W]);
+          const denoise = async (xf32, sigma, curH = H, curW = W) => {
+            const lat = makeF16Tensor(xf32, [1, LAT_C, 1, curH, curW]);
             const t = new ort.Tensor("float32", new Float32Array([sigma]), [1]); // t = σ
             const o1 = await sess.dit.run({
               latent: lat,
@@ -2103,11 +2372,12 @@ worst quality, low quality, score_1, score_2, score_3, artist name</textarea
           };
 
           let lastPreview = 0;
-          const onStep = (i, s, sn, den) => {
+          const onStep = (i, s, sn, den, curH = H, curW = W) => {
             if (curCancel) return false; // 중단 신호 → 샘플러 루프 탈출
             $("genBar").style.width = ((i + 1) / steps) * 100 + "%";
             $("genStat").textContent =
               `step ${i + 1}/${steps}  σ ${s.toFixed(4)} → ${sn.toFixed(4)}  ` +
+              `${curW * 8}×${curH * 8}  ` +
               `(${((performance.now() - t0) / 1000).toFixed(1)}s)`;
             // latent 프리뷰: 체크박스 ON일 때만, ~250ms 간격으로 (마지막 스텝은 항상).
             const now = performance.now();
@@ -2118,14 +2388,28 @@ worst quality, low quality, score_1, score_2, score_3, artist name</textarea
             ) {
               lastPreview = now;
               try {
-                previewLatent(den, H, W);
+                previewLatent(den, curH, curW);
               } catch (_) {}
             }
             return true;
           };
 
-          const sampler = job.sampler === "er_sde" ? sampleErSde : sampleEuler;
-          const xf = await sampler(denoise, x, sigmas, rand, onStep);
+          let xf;
+          if (job.speed) {
+            // SPEED: 멀티해상도. 목표 H/W 기준, stages/transSig는 job에서.
+            xf = await sampleSpeed(denoise, x, sigmas, rand, onStep, {
+              stages: job.speedStages,
+              transSig: job.speedTransSig,
+              fullH: H,
+              fullW: W,
+              C: LAT_C,
+              patch: 2,
+            });
+          } else {
+            const sampler =
+              job.sampler === "er_sde" ? sampleErSde : sampleEuler;
+            xf = await sampler(denoise, x, sigmas, rand, onStep);
+          }
 
           if (xf === null) {
             // 중단됨 — VAE 디코드 스킵
@@ -2329,6 +2613,58 @@ worst quality, low quality, score_1, score_2, score_3, artist name</textarea
       renderRatioChips(curBucket);
       markActiveRatio();
 
+      // ── SPEED 모드 토글 ──────────────────────────────────────────────
+      // 켜면: 1024/1280 버킷만 허용(나머지 잠금), 1024·1:1 초기화,
+      //   가로/세로 수동입력·부정프롬프트·negpip 비활성(시각 dim), 개발패널 노출.
+      // 끄면: 전부 원복.
+      const SPEED_ALLOWED_BUCKETS = ["1024", "1280"];
+
+      function applySpeedMode(on) {
+        const bucketBox = $("resBucketChips");
+        $("speedDevPanel").style.display = on ? "" : "none";
+
+        // 버킷칩 잠금/허용 표시
+        [...bucketBox.children].forEach((c) => {
+          const allowed = SPEED_ALLOWED_BUCKETS.includes(c.textContent);
+          c.classList.toggle("chip-locked", on && !allowed);
+          c.classList.toggle("speed-allowed", on && allowed);
+        });
+
+        // 수동 입력만 비활성/원복 (부정프롬프트·negpip은 SPEED와 무관)
+        const lockTargets = [
+          $("width").closest("div"),
+          $("height").closest("div"),
+        ];
+        for (const el of lockTargets) {
+          if (!el) continue;
+          el.classList.toggle("speed-disabled", on);
+        }
+        $("width").disabled = on;
+        $("height").disabled = on;
+
+        if (on) {
+          // 1024 / 1:1로 초기화
+          if (curBucket !== "1024") {
+            curBucket = "1024";
+            [...bucketBox.children].forEach((c) =>
+              c.classList.toggle("active", c.textContent === "1024"),
+            );
+            renderRatioChips("1024");
+          }
+          const [w, h] = RES_BUCKETS["1024"][0]; // 1:1
+          $("width").value = w;
+          $("height").value = h;
+          markActiveRatio();
+        } else {
+          // 원복: CFG 기반 negative/negpip 상태를 다시 적용
+          updateModelUI();
+        }
+      }
+
+      $("speedChk").addEventListener("change", (e) =>
+        applySpeedMode(e.target.checked),
+      );
+
       $("btnGen").onclick = enqueueGenerate;
       $("btnCancel").onclick = cancelCurrent;
       $("btnGenTop").onclick = enqueueGenerate;
@@ -2470,8 +2806,16 @@ worst quality, low quality, score_1, score_2, score_3, artist name</textarea
       addLoraRow(); // 기본 1줄
 
       $("negpipChk").addEventListener("change", updateModelUI);
-      // 초기 로드: 기본 모델이 터보(CFG=1)면 NegPip 자동 활성화
-      if (MODELS[$("modelSel").value].cfg <= 1) $("negpipChk").checked = true;
+      // CFG 직접 변경: 1 이하로 내려오면 NegPip 자동 활성화(최초), 1 초과면 updateModelUI가 해제.
+      _prevCfg = +$("cfg").value;
+      $("cfg").addEventListener("input", () => {
+        const cur = +$("cfg").value;
+        if (cur <= 1 && _prevCfg > 1) $("negpipChk").checked = true; // 1초과→1: 자동 활성
+        _prevCfg = cur;
+        updateModelUI();
+      });
+      // 초기 로드: 기본 모델이 CFG=1이면 NegPip 자동 활성화
+      if (+$("cfg").value <= 1) $("negpipChk").checked = true;
       updateModelUI();
     </script>
   </body>

@@ -20,6 +20,7 @@
 - **VAE chunked attention**: VAE 디코더의 mid-block self-attention을 쿼리 토큰축으로 8분할해 score 단일 버퍼를 1/8로 제한(수치 동치). 고해상도(예 1280²·1536²)에서 VAE가 2 GB 단일 버퍼 한계로 OOM 나던 문제를 해소 — **1536²까지 브라우저에서 생성**.
 - **런타임 LoRA**: 아무 Anima `.safetensors` LoRA(kohya 또는 `diffusion_model.` 포맷)를 강도와 함께 장착. 여러 개는 ΔW + SVD로 정확히 병합(Web Worker에서 — UI 안 멈춤). 재export 불필요.
 - **프롬프트 가중치** `(태그:1.2)`와 **NegPip**(CFG=1/터보에서 부정 프롬프트), 둘 다 ComfyUI 충실 구현.
+- **SPEED(스펙트럼 점진 샘플링)**: 저해상도로 denoise를 시작해 스케줄 중간에 DCT 스펙트럼 확장으로 풀 해상도로 키우는 옵션 ([Xiao et al.](https://arxiv.org/abs/2605.18736) 기반). 터보에서 1024²/1280² 생성 시간을 ~40-45% 단축(시드에 따라 디테일이 약간 손실되는 트레이드오프). 옵트인 토글이며, 동적 해상도 DiT 그래프가 생성 중 해상도 전환을 재export 없이 처리.
 
 ## 동작 구조
 
@@ -214,6 +215,7 @@ out/
 - **NegPip** — CFG=1(터보)에서는 부정 프롬프트가 무시됩니다. NegPip 체크 시 부정 프롬프트가 음수 가중치 그룹으로 병합되고, 슬롯 모델의 `negpip_mask`가 해당 토큰의 cross-attn value 부호를 뒤집어 개념을 빼냅니다. `add_negpip.py`로 만든 DiT 필요.
 - **런타임 LoRA** — `.safetensors` LoRA를 여러 개, 각자 강도로 추가한 뒤 **LoRA 반영**을 누릅니다(지연 적용 — N개를 N번이 아니라 1번에 컴파일). 변환(safetensors 파싱 + 멀티 LoRA ΔW/SVD 병합)은 Web Worker에서 진행바와 함께 돌고, 끝날 때까지 생성은 비활성화됩니다. **단일** LoRA는 강도가 그래프 입력(`lora_scale`)이라 슬라이더가 재컴파일 없이 다음 생성에 즉시 반영되고, **여러 개**일 때는 강도가 SVD 병합에 들어가 변경 시 재병합합니다. 어느 쪽이든 그래프는 랭크 48 유지. 미지원 키(텍스트 인코더 LoRA, LoKr)와 슬롯 밖 모듈은 조용히 버리지 않고 리포트합니다. `add_lora_slots.py`로 만든 슬롯 모델 필요.
 - **사용자 설정 모델** — *사용자 설정* 드롭다운으로 DiT(`.onnx` + 샤드 + manifest)를 디스크에서 골라 메모리에 직접 로드(OPFS 미사용, 모바일 동작). TE/어댑터/VAE는 기본 경로 사용.
+- **SPEED** — 옵트인 스펙트럼 점진 샘플링(arXiv:2605.18736). 1024²·1280² 프리셋 버킷에서만 동작. latent가 저해상도에서 시작(기본 `stages = 0.5, 1.0` = 절반)하고, 노이즈 레벨이 전환 σ(기본 `0.7`)로 떨어지면 DCT 스펙트럼 확장으로 풀 해상도로 키웁니다: 저주파 블록은 보존, 새 고주파 대역은 σ 스케일 노이즈로 채우고, 결과를 κ = r/(1+(r-1)σ)로 재스케일하며 남은 스케줄을 정렬된 σ로 re-space. 초반 스텝이 1/4 면적 latent에서 도므로 터보 생성이 ~40-45% 단축(예: 1024² 12.9s → 6.8s, 1280² ~28s → ~17s). σ가 낮을수록 빠르지만 미세 디테일(손) 손실 위험 — 0.7이 무난하나 최적값은 시드마다 다름. 고급 패널에서 `stages`와 `전환 σ`를 조정 가능. DCT/IDCT·스펙트럼 확장 수식은 [`ComfyUI-Spectrum-KSampler`](https://github.com/sorryhyun/ComfyUI-Spectrum-KSampler)의 `spd.py`를 그대로 포팅([`ComfyUI-SPEED`](https://github.com/ruwwww/ComfyUI-SPEED)도 교차 참고), numpy 레퍼런스로 1e-15까지 검증.
 
 ## 구현 노트 (다른 환경으로 포팅할 때)
 
