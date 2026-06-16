@@ -1,0 +1,54 @@
+# Anima WebGPU 모델 목록 — gen_models.py가 이 파일을 읽어 index.html에 주입한다.
+#
+# 사용법:
+#   python gen_models.py model-list.yml web/index.html
+#
+# 모델 추가 워크플로우:
+#   1. build_dit.bat <ckpt> <key>   → out/dit/{key}_dit_*.onnx 산출
+#   2. 이 파일 models: 에 항목 한 줄 추가 (key = build_dit prefix)
+#   3. python gen_models.py model-list.yml web/index.html
+#
+# 파일 경로는 key + variant 규칙으로 자동 생성됨:
+#   base  비슬롯  out/dit/{key}_dit_dyn32_q8a4fns.onnx
+#   base  슬롯    out/dit/{key}_dit_dyn32_q8a4fnLs.onnx
+#   turbo 비슬롯  out/dit/{key}_dit_turbo32_q8a4fns.onnx
+#   turbo 슬롯    out/dit/{key}_dit_turbo32_q8a4fnLs.onnx
+# 규칙을 벗어나는 경우만 variant override에서 dit/ditLora를 직접 지정.
+
+# textarea 초기값 (페이지 로딩 시 1회 채워짐, 모델과 무관한 전역값)
+prompt_defaults:
+  positive: "masterpiece, best quality, score_7, safe"
+  negative: "worst quality, low quality, score_1, score_2, score_3, artist name, nsfw"
+
+# 공유 컴포넌트 경로 (TE / adapter / VAE)
+paths:
+  te: out/text_encoder/qwen3_06b_s.onnx
+  adapter: out/adapter/anima_llm_adapter.onnx
+  vae: out/vae/qwen_image_vae_decoder_dyn32_2dc.onnx
+
+# variant 기본 샘플링 파라미터 (모델별 overrides로 덮어쓸 수 있음)
+defaults:
+  base:
+    steps: 30
+    cfg: 5.0
+    sampler: er_sde
+    scheduler: simple
+    label_suffix: "(베이스 · 30스텝 · CFG 5)"
+  turbo:
+    steps: 8
+    cfg: 1.0
+    sampler: euler
+    scheduler: simple
+    label_suffix: "(8스텝 · CFG 1)"
+
+# 드롭다운 기본 선택 (생성된 MODELS key = {key}_{variant})
+selected: anima_turbo
+
+models:
+  - key: anima
+    label: Anima            # turbo는 label_suffix 붙어 "Anima (8스텝 · CFG 1)"
+    variants: [base, turbo]
+    # source: https://...   # 옵션: 있으면 footer 출처 링크 생성
+    overrides:
+      turbo:
+        label: "Anima+Turbo v0.2"   # 이 variant만 라벨 다르게 (suffix는 그대로 붙음)

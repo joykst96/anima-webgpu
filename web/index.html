@@ -467,10 +467,10 @@
               <div id="gpuInfo" class="stats">WebGPU 확인 중...</div>
               <label>모델</label>
               <select id="modelSel">
-                <option value="anima">Anima (베이스 · 30스텝 · CFG 5)</option>
-                <option value="turbo" selected>
-                  Anima + Turbo v0.2 (8스텝 · CFG 1)
-                </option>
+                <!-- MODEL_OPTIONS:START (gen_models.py 자동생성 — 직접 수정 금지) -->
+                <option value="anima_base">Anima (베이스 · 30스텝 · CFG 5)</option>
+                <option value="anima_turbo" selected>Anima+Turbo v0.2 (8스텝 · CFG 1)</option>
+                <!-- MODEL_OPTIONS:END -->
                 <option value="custom">사용자 설정 (직접 모델 지정)</option>
               </select>
               <div
@@ -615,7 +615,7 @@ masterpiece, best quality, score_7, safe</textarea
               </span>
             </label>
             <textarea id="negative">
-worst quality, low quality, score_1, score_2, score_3, artist name</textarea
+worst quality, low quality, score_1, score_2, score_3, artist name, nsfw</textarea
             >
             <label style="display:flex; align-items:center; gap:8px; justify-content:space-between">
               <span>해상도 프리셋</span>
@@ -823,14 +823,17 @@ worst quality, low quality, score_1, score_2, score_3, artist name</textarea
       }
 
       // ── 배포 구성: 경로/모델 설정은 여기서 수정 ──
+      // PATH_DEFAULTS:START (gen_models.py 자동생성 — 직접 수정 금지)
       const PATHS = {
         te: "out/text_encoder/qwen3_06b_s.onnx",
         adapter: "out/adapter/anima_llm_adapter.onnx",
         vae: "out/vae/qwen_image_vae_decoder_dyn32_2dc.onnx",
       };
+      // PATH_DEFAULTS:END
       const MODELS = {
-        anima: {
-          label: "Anima",
+        // MODELS:START (gen_models.py 자동생성 — 직접 수정 금지)
+        anima_base: {
+          label: "Anima (베이스 · 30스텝 · CFG 5)",
           dit: "out/dit/anima_dit_dyn32_q8a4fns.onnx",
           ditLora: "out/dit/anima_dit_dyn32_q8a4fnLs.onnx",
           steps: 30,
@@ -838,8 +841,8 @@ worst quality, low quality, score_1, score_2, score_3, artist name</textarea
           sampler: "er_sde",
           scheduler: "simple",
         },
-        turbo: {
-          label: "Anima+Turbo v0.2",
+        anima_turbo: {
+          label: "Anima+Turbo v0.2 (8스텝 · CFG 1)",
           dit: "out/dit/anima_dit_turbo32_q8a4fns.onnx",
           ditLora: "out/dit/anima_dit_turbo32_q8a4fnLs.onnx",
           steps: 8,
@@ -847,9 +850,7 @@ worst quality, low quality, score_1, score_2, score_3, artist name</textarea
           sampler: "euler",
           scheduler: "simple",
         },
-
-        // 모델 추가: 아래에 base/turbo 항목을 등록하고 <select id="modelSel">에도
-        // 같은 key로 <option>을 추가한다. 자세한 양식은 README "Adding models" 참고.
+        // MODELS:END
 
         custom: {
           label: "사용자 설정 (직접 모델 지정)",
