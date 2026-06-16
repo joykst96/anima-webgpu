@@ -1576,8 +1576,16 @@ worst quality, low quality, score_1, score_2, score_3, artist name, nsfw</textar
         log(`${name} 그래프 다운로드...`, "dim");
         const graph = await cachedFetch(url, (f) => onProgress(f * 0.05));
 
+        // 샤드 manifest는 DiT와 te(text_encoder) 산출물에 존재.
+        // adapter/vae는 단일 .data라 manifest 요청을 보내지 않아 404를 피한다.
+        const isSharded = name.startsWith("dit") || name === "te";
+        // LoRA 슬롯 manifest는 슬롯 모델(_q8a4fnLs)에만 존재. 비슬롯엔 요청 안 함.
+        const isSlot = url.includes("_q8a4fnLs");
+
         // 1) 샤드 manifest 우선 (shard_onnx_data.py 산출물 — ArrayBuffer 2GB 상한 우회)
-        const maniRes = await fetch(url + ".manifest.json").catch(() => null);
+        const maniRes = isSharded
+          ? await fetch(url + ".manifest.json").catch(() => null)
+          : null;
         if (maniRes && maniRes.ok) {
           const mani = await maniRes.json();
           const dir = url.slice(0, url.lastIndexOf("/") + 1);
@@ -1595,7 +1603,7 @@ worst quality, low quality, score_1, score_2, score_3, artist name, nsfw</textar
           }
           opts.externalData = ext;
         } else {
-          // 2) 단일 .data 폴백 (dynamo exporter 기본 산출물)
+          // 2) 단일 .data 폴백 (dynamo exporter 기본 산출물 — te/adapter/vae)
           const dataUrl = url + ".data";
           const probe = await fetch(dataUrl, { method: "HEAD" }).catch(
             () => null,
@@ -1611,9 +1619,11 @@ worst quality, low quality, score_1, score_2, score_3, artist name, nsfw</textar
             opts.externalData = [{ path: dataUrl.split("/").pop(), data }];
           }
         }
-        // LoRA 슬롯 manifest가 있으면 lora.bin을 변환본 또는 제로 버퍼로 주입
+        // LoRA 슬롯 manifest는 슬롯 모델에만 있으므로 그때만 요청 (비슬롯 404 회피)
         let lman = null;
-        const lres = await fetch(url + ".lora_manifest.json").catch(() => null);
+        const lres = isSlot
+          ? await fetch(url + ".lora_manifest.json").catch(() => null)
+          : null;
         if (lres && lres.ok) {
           lman = await lres.json();
           const total = lman.entries.reduce(
