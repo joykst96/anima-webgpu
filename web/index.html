@@ -775,6 +775,18 @@ worst quality, low quality, score_1, score_2, score_3, artist name, nsfw</textar
                   <option value="normal">normal</option>
                 </select>
               </div>
+              <div>
+                <label>배치 (장수)</label
+                ><input
+                  id="batch"
+                  type="number"
+                  value="1"
+                  min="1"
+                  max="100"
+                  step="1"
+                  title="한 번 클릭에 생성할 장수 (1~100). 시드가 -1이면 매 장 랜덤, 고정이면 같은 그림이 반복됩니다."
+                />
+              </div>
             </div>
             <div style="display: flex; gap: 8px; align-items: stretch">
               <button id="btnGen" disabled style="flex: 1">
@@ -2455,19 +2467,20 @@ worst quality, low quality, score_1, score_2, score_3, artist name, nsfw</textar
       let jobSeq = 0;
 
       // '생성' = 현재 설정을 스냅샷해 큐에 추가. 비어있으면 러너가 즉시 시작.
+      // 성공하면 true, 검증 실패로 큐에 넣지 못하면 false (배치 루프가 조기중단에 사용).
       function enqueueGenerate() {
         const pxW = +$("width").value,
           pxH = +$("height").value;
         if (pxW % 16 || pxH % 16) {
           log("해상도는 16의 배수여야 함", "err");
-          return;
+          return false;
         }
         if (Math.max(pxW, pxH) > 2048 || Math.min(pxW, pxH) < 384) {
           log(
             "해상도는 384~2048px 범위여야 함 (큰 해상도는 VRAM에 따라 실패)",
             "err",
           );
-          return;
+          return false;
         }
         let seed = +$("seed").value;
         if (seed < 0) seed = (Math.random() * 0x7fffffff) | 0;
@@ -2495,7 +2508,7 @@ worst quality, low quality, score_1, score_2, score_3, artist name, nsfw</textar
               "SPEED 스케줄 오류: stages는 오름차순+1.0끝, transition σ 길이는 stages-1이어야 함",
               "err",
             );
-            return;
+            return false;
           }
         }
 
@@ -2522,6 +2535,7 @@ worst quality, low quality, score_1, score_2, score_3, artist name, nsfw</textar
         renderQueue();
         refreshPickDirBtn(); // 첫 생성이 큐에 들어가면 폴더 지정 잠금
         pumpQueue();
+        return true;
       }
 
       let pumping = false;
@@ -2997,9 +3011,20 @@ worst quality, low quality, score_1, score_2, score_3, artist name, nsfw</textar
         applySpeedMode(e.target.checked),
       );
 
-      $("btnGen").onclick = enqueueGenerate;
+      // 생성 버튼 = 배치. 클릭 시점(사용자 의도 지점)에서 장수를 읽어 enqueueGenerate를
+      // 그만큼 반복 호출한다. enqueueGenerate는 '1장 확정' 단일 책임만 지므로, 시드(-1
+      // 랜덤) 등 '생성마다 달라지는' 로직이 매 호출마다 독립 적용된다.
+      const runBatch = () => {
+        const raw = parseInt($("batch").value, 10);
+        const n = Math.min(100, Math.max(1, isNaN(raw) ? 1 : raw));
+        // 검증 실패(해상도/SPEED)면 첫 호출에서 false → 즉시 중단(로그 N번 반복 방지)
+        for (let i = 0; i < n; i++) {
+          if (!enqueueGenerate()) break;
+        }
+      };
+      $("btnGen").onclick = runBatch;
       $("btnCancel").onclick = cancelCurrent;
-      $("btnGenTop").onclick = enqueueGenerate;
+      $("btnGenTop").onclick = runBatch;
       $("btnCancelTop").onclick = cancelCurrent;
       $("btnSaveAll").onclick = () => downloadAllZip($("btnSaveAll"));
 
