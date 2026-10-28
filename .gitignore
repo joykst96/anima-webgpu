@@ -10,3 +10,26 @@ __pycache__/
 *.pyc
 result*.png
 check*.png
+
+# 하네스 기준 이미지 (tools/harness.mjs saveReference — 골든 해시로 재생성 가능)
+tools/ref/
+
+# 운영 서버에 올리기 전 검증용 그래프 (devserver --local-out)
+out-local/
+
+# 빌드 산출물 곁가지 (.onnx.lora_manifest·fuse_meta는 *.manifest.json에 안 걸림)
+*.lora_manifest.json
+*.fuse_meta.json
+*.lora.bin
+
+# 체크포인트·태그 데이터 (자동완성 danbooru_ko.csv 등)
+diffusion_models/
+*.csv
+
+# 배포·작업 메모·로컬 도구 설정 — 공개 레포에 넣지 않음
+# (golden.json = 이 환경의 골든 해시. 빌드·ORT·GPU마다 달라 각자 h.saveGolden()으로 만든다)
+tools/golden.json
+export/model-list.deploy.yml
+WORKLOG.md
+AUDIT_PLAN.md
+.claude/

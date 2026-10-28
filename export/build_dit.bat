@@ -88,8 +88,8 @@ echo --- [1/6] export_dit (%BASE%) ---
 if errorlevel 1 exit /b 1
 
 echo.
-echo --- [2/6] int8 quant (accuracy_level=4) ---
-%PY% export\quantize_dit.py --src "%RAW%" --out "%Q%" --bits 8 --no-exclude --accuracy-level 4
+echo --- [2/6] int8 quant (accuracy_level=4, t_embed fp32) ---
+%PY% export\quantize_dit.py --src "%RAW%" --out "%Q%" --bits 8 --no-exclude --accuracy-level 4 --fp32-t-embed
 if errorlevel 1 exit /b 1
 
 echo.

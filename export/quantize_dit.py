@@ -153,7 +153,34 @@ def apply_accuracy_level(qmodel, level):
               f"미충족 {n_dp4a_no}개")
 
 
-SCRIPT_VERSION = "v5 (accuracy_level)"
+def keep_t_embed_fp32_act(qmodel):
+    """t_embedder의 MatMulNBits 2개만 accuracy_level=1로 되돌린다.
+    식별(구조): timesteps에서 닿고 latent에서는 안 닿는 MatMulNBits(= t_embedder + 모든 adaLN) 중
+    K·N이 모두 넓은(≥1024) 것 — adaLN은 전부 랭크 256 병목(K→256→N)이라 걸리지 않는다.
+    (t_embedder 출력은 adaLN 입력이 아니라 adaLN 출력에 더하는 adaln_lora 가지로 간다 — 하류 연결로는 못 고름)"""
+    g = qmodel.graph
+    def reach(start):  # 데이터로 이어진 텐서 (Shape 경유는 모양 정보뿐이라 제외)
+        seen = {start}
+        for n in g.node:
+            if n.op_type != "Shape" and any(i in seen for i in n.input):
+                seen.update(n.output)
+        return seen
+    from_t, from_x = reach("timesteps"), reach("latent")
+    t_only = [n for n in g.node if n.op_type == "MatMulNBits"
+              and n.output[0] in from_t and n.output[0] not in from_x]
+    def kn(n):
+        a = {x.name: x.i for x in n.attribute if x.name in ("K", "N")}
+        return a["K"], a["N"]
+    picked = [n for n in t_only if min(kn(n)) >= 1024]
+    assert len(picked) == 2, f"t_embedder MatMulNBits 식별 실패: {[n.name for n in picked]}"
+    for n in picked:
+        for a in n.attribute:
+            if a.name == "accuracy_level":
+                a.i = 1
+    print(f"[t_embed] accuracy_level=1 (활성 fp32): {[n.name for n in picked]}")
+
+
+SCRIPT_VERSION = "v6 (accuracy_level, t_embed fp32)"
 
 
 def main():
@@ -176,6 +203,10 @@ def main():
                         "브라우저(jspi 빌드) 가속의 핵심. 미지정 시 기존 동작. "
                         "주의: 활성화 양자화는 가중치 양자화와 별개의 정확도 "
                         "트레이드오프 — 브라우저 이미지 비교 필수.")
+    p.add_argument("--fp32-t-embed", action="store_true", dest="fp32_t_embed",
+                   help="t_embedder 선형층 2개만 accuracy_level=1(활성 fp32, 가중치 int8 그대로). "
+                        "DP4A 활성 int8 오차의 대부분이 여기서 나오며(M=1이라 시간 비용 없음) "
+                        "v1.0 원본 대비 DiT 오차 4.5~8% → 0.8~1.7%.")
     p.add_argument("--algo", default="rtn", choices=["rtn", "hqq"],
                    help="양자화 알고리즘. rtn=기본(빠름, 거침), "
                         "hqq=최적화 기반(느림, int4에서 훨씬 정확, torch 필요)")
@@ -204,6 +235,8 @@ def main():
 
     if args.accuracy_level is not None:
         apply_accuracy_level(qmodel, args.accuracy_level)
+    if args.fp32_t_embed:
+        keep_t_embed_fp32_act(qmodel)
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     data_name = os.path.basename(args.out) + ".data"

@@ -1,276 +1,258 @@
-# Anima WebGPU — Browser-Local Anime Image Generation
+# Anima WebGPU — anime image generation that runs in your browser
 
 English | [한국어](README.ko.md)
 
-Run [Anima](https://huggingface.co/circlestone-labs/Anima) (CircleStone Labs / Comfy Org, 2B DiT) entirely in the browser. No server-side inference, no installation — weights download once, then every generation runs on the visitor's own GPU via WebGPU.
+Runs [Anima](https://huggingface.co/circlestone-labs/Anima) (CircleStone Labs / Comfy Org, 2B DiT) entirely inside the browser.
+No server-side inference, nothing to install. After the weights are downloaded once, every generation runs on the visitor's own GPU through WebGPU, and prompts never leave the device.
 
-This repo contains the full pipeline: PyTorch/ComfyUI → ONNX export scripts, weight-only quantization, shard packaging for browsers/CDNs, a single-file web frontend, and deployment configs.
+This repo contains the whole chain: ComfyUI/PyTorch → ONNX export, quantization and graph post-processing, shard packaging, the web front end (plain ES modules, no build step), a static-server config, and the verification tools.
 
-**Highlights**
+## At a glance
 
-- 100% client-side inference (ONNX Runtime Web, WebGPU EP). Prompts never leave the device.
-- Dynamic resolution & aspect ratio from a single graph (RoPE traced symbolically — no per-resolution builds).
-- Faithful port of ComfyUI sampling: `er_sde` (CONST/flow path) and `simple` scheduler, numerically matched.
-- int8 weight-only quantization (MatMulNBits): fp16 compute, ~2.3 GB download, runs on any WebGPU GPU with `shader-f16` — no INT8 tensor-core requirement.
-- Weight sharding (≤ ~480 MB/file) to bypass the browser's single-ArrayBuffer limit and fit free-tier CDN cache limits.
-- OPFS caching: first visit downloads, later visits load from disk in seconds.
-- Two model variants in one page: base (er_sde · 30 steps · CFG 5) and Turbo-LoRA-merged (euler · 8 steps · CFG 1), plus a **Custom** option to load your own ONNX DiT directly from disk (mobile-friendly, no OPFS needed).
-- **Native WebGPU EP (JSPI build)** with DP4A int8 matmul (`accuracy_level=4`) — roughly 2× faster sampling than the JSEP build, with automatic fallback on older browsers.
-- **FlashAttention fusion (DiT)**: decomposed SDPA is fused into `com.microsoft.MultiHeadAttention` to trigger the JSPI EP's FA2 kernel. The attention score matrix is no longer materialized whole (O(S²)→O(S)), so resident VRAM drops by about half and above-1024 resolutions clear the DiT stage that previously OOM'd.
-- **VAE chunked attention**: the VAE decoder's mid-block self-attention is split along the query-token axis into 8 chunks, capping the score buffer at 1/8 (numerically identical). This fixes the OOM where the VAE hit the 2 GB single-buffer limit at high resolutions — **generation up to 1536² in the browser**.
-- **Runtime LoRA**: drop in any Anima `.safetensors` LoRA (kohya or `diffusion_model.` formats) with per-LoRA strength; multiple LoRAs are merged exactly via ΔW + SVD in a Web Worker (UI never blocks). No re-export.
-- **Prompt weighting** `(tag:1.2)` and **NegPip** (negative prompts under CFG=1 / Turbo), both faithful to ComfyUI.
-- **SPEED (spectral progressive sampling)**: optionally start denoising at half resolution and expand to full resolution mid-schedule via a DCT spectrum extension (after [Xiao et al.](https://arxiv.org/abs/2605.18736)). On Turbo this cuts generation time by ~40-45% at 1024²/1280² with a minor, seed-dependent detail trade-off. Opt-in toggle; the dynamic-resolution DiT graph handles the mid-run resolution switch with no re-export.
+RTX 5070 Ti (16 GB), Chrome 152, ONNX Runtime Web 1.26 JSPI build, warm median:
+
+| Task | Time |
+|---|---|
+| Turbo 1024² (8 steps, CFG 1) | **12.4 s** (DiT 1.43 s/step + VAE 0.75 s) |
+| Turbo 1024², advanced option "Fast" | 11.1–11.5 s |
+| Turbo 1024², SPEED | 6.7–6.9 s |
+| Turbo 1280² / 1536² | 24.4 s / about 45 s |
+| Base 1024² (er_sde 30 steps, CFG 5 = 60 DiT calls) | about 88 s |
+| Base + EasyCache / cfgpp_ud10_ab 20 steps | 60–66 s / 56–61 s |
+| With a LoRA | +1.5 s per image (7 s to apply) |
+
+- The first visit downloads about 3.6 GB (DiT 2.05 GB + text encoder, adapter, VAE). Later visits load from the OPFS cache.
+- A 256² warm-up right after loading builds the shaders, so even the first generation finishes in about 13 s.
+- For the same input, one DiT call differs from the ComfyUI (PyTorch fp32) reference by **0.8–1.7% for Base and 1.6–3.0% for Turbo** (relative L2, σ 1.0–0.1). Samplers, schedulers and prompt weighting compute the same thing as ComfyUI (see "Accuracy").
+
+## Features
+
+**Generation**
+- Model dropdown: Base (er_sde · 30 steps · CFG 5) and Turbo (Turbo LoRA merged, euler · 8 steps · CFG 1). A deployment can add fine-tunes.
+- Resolution: multiples of 16, aspect-ratio presets. One graph handles every resolution (dynamic H/W).
+- Samplers: `euler`, `er_sde`, `cfgpp_ud10_ab` (for Base, CFG 2 recommended — 20 steps is 31–34% faster than er_sde at 30). Schedulers: `simple`, `normal`.
+- Batch and queue: 1–100 images per click. A `-1` seed is redrawn for every image. Queued jobs can be cancelled one by one.
+- **SPEED** (opt-in): starts at low resolution and grows to full resolution mid-schedule via DCT spectrum expansion ([Xiao et al.](https://arxiv.org/abs/2605.18736)). About 45% faster for Turbo at 1024²/1280², with some risk of losing fine detail such as hands. 1024² and 1280² presets only.
+
+**Prompt**
+- Weighting follows ComfyUI's rules exactly: `(tag:1.2)` (an explicit number overrides the enclosing weight), `(tag)` = enclosing ×1.1, `\(` `\)` are literal parentheses. Tokenization also follows ComfyUI, one weighted span at a time.
+- **NegPip**: at CFG 1 (Turbo) the negative prompt is normally ignored. With NegPip checked, the negative prompt is merged into the positive one with negative weights, which subtracts the concept.
+- Tag autocomplete: Danbooru tags plus Korean aliases (200k rows), searched entirely in the browser (Web Worker, IndexedDB cache).
+
+**LoRA**
+- Attach several `.safetensors` LoRAs (kohya or `diffusion_model.` format), each with its own strength. They are injected into a rank-48 slot graph without re-exporting.
+- Multiple LoRAs are merged exactly via ΔW sum → SVD (in a Web Worker). With a single LoRA the strength slider applies on the next image without recompiling.
+- Keys that cannot be used (text-encoder LoRA, LoKr, …) are reported, not silently dropped.
+
+**Advanced options (gear icon)** — all off / standard by default; turning them off gives the same result as before.
+- Precision "Fast": the inside of each block in fp16 (norms, residuals and int8 inputs stay fp32). −10% per step; only fine details change.
+- Cross-attention padding compaction: replaces the 512-token padding with "one pad token + score bias ln(m)" (mathematically equivalent). −5.6% per step.
+- EasyCache: skips DiT calls on steps with little change and extrapolates from the previous result (port of the ComfyUI node). −25–29% for Base, 0–11% for Turbo.
+
+**Results**
+- Gallery, lightbox, ZIP download. Each entry shows its generation settings (seed, size, time, options in use).
+- Auto-save to a folder (Chromium): writes `{prefix}_00001.png` straight into the chosen folder. Only file names are read to continue the numbering; existing file contents are never read.
+- Custom model: pick a folder and the page lists the models it finds inside (subfolders included), whether browser-converter output or build output, and loads the chosen one straight into memory (no OPFS). Chromium remembers the folder for the next visit.
 
 ## How it works
 
 | Stage | Model | Format | Notes |
 |---|---|---|---|
-| Text encoding | Qwen3-0.6B-Base | ONNX fp16 | last hidden states |
-| Context adapter | Anima LLMAdapter | ONNX fp16 | dual tokenization: Qwen3 ids → hidden states, T5 ids → adapter queries; output zero-padded to 512×1024 |
-| Denoiser | Anima DiT 2B (Cosmos-Predict2) | ONNX, int8 weights (`accuracy_level=4` for DP4A) / fp32 activations (recommended — see Pitfalls), fp16 I/O | dynamic H/W axes, RoPE in-graph; self/cross attention fused into `MultiHeadAttention` (FA2); optional NegPip + LoRA-slot inputs |
-| Decode | Qwen-Image (Wan 2.1) VAE decoder | ONNX fp32 | CausalConv3d folded to 2D for T=1 (Conv2d kernel path); Wan21 de-normalization baked in; mid-block attention split into 8 query-axis chunks to cap the score buffer |
+| Text encoding | Qwen3-0.6B-Base | ONNX fp16, sharded | last hidden state |
+| Context adapter | Anima LLMAdapter | ONNX fp16 | dual tokenization (Qwen3 → hidden, T5 → queries); output zero-padded to 512×1024 and multiplied by the T5 token weights |
+| Denoiser | Anima DiT 2B (Cosmos-Predict2) | ONNX, int8 weights (MatMulNBits) + int8 activations (DP4A), fp16 I/O | dynamic H/W, RoPE in-graph, attention fused into `MultiHeadAttention` (FlashAttention), NegPip / LoRA-slot / padding-compaction inputs |
+| Decode | Qwen-Image (Wan 2.1) VAE decoder | ONNX fp32 | CausalConv3d folded to 2D, split into head (global attention) / tail (local convs) |
 
-The sampler (Euler / ER-SDE-Solver) and σ schedule run in plain JavaScript; each step calls the DiT session once (CFG 1) or twice (CFG > 1).
+- Samplers and schedulers run in JavaScript. Each step calls the DiT once (CFG 1) or twice (CFG > 1).
+- When `WebAssembly.Suspending` exists (Chrome 137+), ORT uses the **JSPI build** (native C++ WebGPU EP). The DP4A int8 matmul and FlashAttention kernels exist only there; otherwise it falls back to the JSEP build. Pinned to 1.26.0 (`?ort=x.y.z` loads another version for testing).
+- The VAE runs the head once and the tail in horizontal strips (16-latent halo) — bit-identical to a single call, with peak memory bounded by the strip size. Above 1024² the head's attention also runs per query chunk.
+- When the DiT is swapped (model change, precision change, applying LoRAs), the text encoder, adapter and VAE are unloaded and reloaded with it, because ORT WebGPU's buffer cache is only freed once every session on the GPU context is released (pitfall 14).
 
-## Requirements
+## Accuracy (vs ComfyUI)
 
-**Conversion machine** — a working ComfyUI install that can already run Anima, Python 3.10+, recent PyTorch (the new dynamo ONNX exporter is used), `onnx`, `onnxruntime`, `transformers`, `sentencepiece`. A 16 GB GPU is comfortable; fp32 export of the DiT peaks around 10 GB VRAM. ComfyUI **portable** users: replace `python` below with `python_embeded\python.exe` and run from the portable root.
+Checked directly against ComfyUI v0.43 + anima-base-v1.0 (PyTorch fp32).
 
-**Serving** — any static file server. HTTPS is mandatory in production (WebGPU and OPFS require a secure context; `localhost` is exempt for testing).
+| Item | Result |
+|---|---|
+| Schedulers `simple`/`normal`, samplers `euler`/`er_sde`/`cfgpp_ud10_ab` | ≤2.5e-7 vs a line-by-line port of the originals (float32 rounding) |
+| SPEED (DCT, spectrum expansion) | 4–6e-8 vs the original `spd_core` |
+| Prompt weighting and tokenization | same spans and weights as ComfyUI `token_weights`, same Qwen token sequence |
+| One DiT call (same input) | Base 0.8–1.7%, Turbo 1.6–3.0% |
+| Where that error comes from | int8 weights (block 32) are under 1%. Most of it is int8 activations (DP4A); the two timestep-embedding layers that contribute the most are kept in fp32 |
 
-**Client** — a WebGPU browser (desktop Chrome/Edge), GPU with `shader-f16` support, ~8 GB VRAM recommended. First visit downloads ~2.5 GB (then cached in OPFS).
+The same seed does **not** give the same image as ComfyUI, because the initial-noise RNG differs (mulberry32 vs `torch.randn`). Fed the same initial noise, the images match.
 
-## 1. Convert the models
+## Not included — supply your own
 
-Model files needed: `anima-base-v1.0.safetensors`, the official **Anima Turbo LoRA** (optional, for the fast variant), `qwen_image_vae.safetensors`. Qwen3-0.6B-Base is fetched from HF automatically.
+This repo ships code only. The following are left out on purpose; the page still runs without the optional ones.
 
-```bash
-# DiT — base variant (--fp32-act recommended: fp16 runs but is ~1-2s slower; see Pitfalls)
-python export/export_dit.py --comfyui /path/to/ComfyUI \
-  --ckpt /path/to/anima-base-v1.0.safetensors \
-  --out out/dit/anima_dit_dyn32.onnx --dynamic --fp32-act
+| What | Where it goes | How to fill it in |
+|---|---|---|
+| Model weights and graphs | `out/dit/`, `out/text_encoder/`, `out/adapter/`, `out/vae/` | Build them from the official releases with the steps under "Converting the models" (license terms apply). |
+| Tokenizers (optional) | `tokenizers/{qwen3,t5}/` | `export/prepare_tokenizers.py`. Without them the page loads the tokenizers from the Hugging Face Hub. |
+| Tag autocomplete data (optional) | `out/danbooru_ko.csv` | Not distributed; bring your own Danbooru tag list. Format: header `name,category,post_count,description`, then one tag per line; Korean aliases go after `키워드:` inside the quoted description, comma-separated. Without the file, autocomplete is just off. |
+| Your model list | `web/js/config.js` | The committed file lists only Anima. Generate it from your own list (`export/model-list.yml`, or a separate deployment list) with `gen_models.py`. |
+| Converter map | `web/convert/anima2b.map.json` | The shipped map matches the maintainer's template build, and the converter checks template hashes. Regenerate it from your own build with `export/make_convert_map.py` and serve those graphs as templates. |
+| Golden baseline | `tools/golden.json` | Pixel hashes depend on the build, ORT version, GPU and driver. Create your own on the first run (see "Development and verification tools"). |
 
-# DiT — Turbo variant (LoRA is merged at export time, no separate merge step)
-python export/export_dit.py --comfyui /path/to/ComfyUI \
-  --ckpt /path/to/anima-base-v1.0.safetensors \
-  --lora /path/to/anima_turbo.safetensors \
-  --out out/dit/anima_dit_turbo32.onnx --dynamic --fp32-act
+## Converting the models
 
-# Adapter (extracted from the same checkpoint) / text encoder / VAE
-python export/export_adapter.py --comfyui /path/to/ComfyUI \
-  --ckpt /path/to/anima-base-v1.0.safetensors --out out/adapter/anima_llm_adapter.onnx
-python export/export_text_encoder.py --out out/text_encoder/qwen3_06b.onnx
-python export/export_vae_decoder.py --comfyui /path/to/ComfyUI \
-  --vae /path/to/qwen_image_vae.safetensors \
-  --out out/vae/qwen_image_vae_decoder_dyn32_2d.onnx --dynamic --size 1024
-# CausalConv3d is folded to an equivalent 2D conv (T=1); --keep-3d disables this. --verify checks equivalence.
-```
+### Environment
 
-Notes: `--size 512` on the VAE only sets the trace size (the graph is dynamic); fp32 VAE traced at 1024 can OOM a 16 GB card. `export_dit.py --verify` additionally runs an ONNX-vs-PyTorch comparison at two resolutions.
+- A ComfyUI that runs Anima (portable recommended). Verified with v0.43.0 + Python 3.13 + PyTorch 2.14 (cu130).
+- Extra packages: `onnx`, `onnxruntime`, `onnxscript` (for portable: `python_embeded\python.exe -m pip install ...`).
+- Files (Hugging Face): `anima-base-v1.0.safetensors`, `qwen_3_06b_base.safetensors`, `qwen_image_vae.safetensors` from `circlestone-labs/Anima`, and `anima-turbo-lora-v0.2.safetensors` from `circlestone-labs/Anima-Official-LoRAs`.
+- A 16 GB GPU is enough (DiT fp32 export peaks around 10 GB). Quantization uses about 10 GB of RAM.
+- On Windows, set `PYTHONIOENCODING=utf-8` when redirecting logs to a file (torch.onnx progress output fails under cp949).
 
-**VAE attention chunk (high-resolution OOM fix)** — the Wan VAE decoder has a full-latent-resolution self-attention in its mid block, so the score matrix `(1,1,S,S)` reaches ~2.4 GB at 1280² (S=25600), past the browser's 2 GB single-buffer limit → OOM. `chunk_vae_attention.py` unrolls that SDPA into N query-token chunks (default 8) so each chunk builds only a partial score (softmax is row-wise, so this is **numerically identical**). K and V are shared. At 1536² (S=36864) each chunk's score is ~0.68 GB and clears.
+### DiT in one go
 
-```bash
-python export/chunk_vae_attention.py \
-  --src out/vae/qwen_image_vae_decoder_dyn32_2d.onnx \
-  --out out/vae/qwen_image_vae_decoder_dyn32_2dc.onnx --chunks 8
-```
-
-> Note: fusing the VAE attention into `MultiHeadAttention` is a dead end — head_dim 384 exceeds the WebGPU FA2 kernel's workgroup-storage limit (32 KB; it needs 48 KB) and the shader fails to compile. Splitting the single head into multiple heads changes the math, so the score chunk is the correct route — plain MatMul+Softmax, no head_dim constraint.
-
-## 2. Quantize, add features & shard the DiT
-
-The full DiT pipeline is: **quantize → FlashAttention fusion → NegPip → shard → LoRA slots**. Fusion runs right after quantization (before NegPip rewires v_proj); NegPip must precede sharding (it edits the graph); LoRA slots are added *after* sharding (graph-only, reuses the same shards). Because fusion absorbs the attention Softmax anchor, NegPip and LoRA slots identify attention from the `.fuse_meta.json` (q/k/v/o proj node names) that fusion emits (`--fuse-meta`), falling back to the old Softmax anchor when no meta is present.
-
-```bash
-# int8 weight-only + accuracy_level=4 (enables the DP4A integer kernel → ~2× sampling)
-python export/quantize_dit.py --src out/dit/anima_dit_dyn32.onnx \
-  --out out/dit/anima_dit_dyn32_q8a4.onnx --bits 8 --no-exclude --accuracy-level 4
-
-# FlashAttention fusion: decomposed SDPA → com.microsoft.MultiHeadAttention. Emits .fuse_meta.json.
-python export/fuse_attention.py --src out/dit/anima_dit_dyn32_q8a4.onnx \
-  --out out/dit/anima_dit_dyn32_q8a4f.onnx
-
-# NegPip: adds a negpip_mask input, rewires cross-attn v_proj (mask=1 ⇒ identical output).
-#   Uses fuse_meta if present beside the source, else falls back to the Softmax anchor.
-python export/add_negpip.py --src out/dit/anima_dit_dyn32_q8a4f.onnx \
-  --out out/dit/anima_dit_dyn32_q8a4fn.onnx
-
-# shard weights into CDN/browser-friendly files
-python export/shard_onnx_data.py --src out/dit/anima_dit_dyn32_q8a4fn.onnx \
-  --out out/dit/anima_dit_dyn32_q8a4fns.onnx --shard-mb 400
-
-# LoRA slots: low-rank side-branches (rank 48) for runtime LoRA. Output reuses the shards above.
-#   Sharding changes the filename, so pass the fuse_meta path explicitly.
-python export/add_lora_slots.py --src out/dit/anima_dit_dyn32_q8a4fns.onnx \
-  --out out/dit/anima_dit_dyn32_q8a4fnLs.onnx --rank 48 \
-  --fuse-meta out/dit/anima_dit_dyn32_q8a4f.onnx.fuse_meta.json
-```
-
-Keep **both** the non-slot (`q8a4fns`) and slot (`q8a4fnLs`) graphs on the server: the page serves the faster non-slot graph when no LoRA is active and only switches to the slot graph (same shards, no extra download) when a LoRA is applied. Repeat the whole chain for the Turbo export.
-
-**Batch automation** — running the six steps × two variants by hand for every checkpoint gets tedious. `export/build_dit.bat` (Windows, ComfyUI portable) runs the full `export_dit → quantize → fuse → negpip → shard → lora-slots` chain for both base and Turbo in one go:
+From the ComfyUI portable root:
 
 ```bat
-REM from the ComfyUI portable root:
-export\build_dit.bat ComfyUI\models\diffusion_models\my-finetune.safetensors myft
+export\build_dit.bat ComfyUI\models\diffusion_models\anima-base-v1.0.safetensors anima
 ```
 
-This emits `myft_dit_dyn32_q8a4fns/fnLs.onnx` and `myft_dit_turbo32_*` (with shards + manifests). The Turbo variant merges the Turbo LoRA at export time (`TURBO_LORA` path is set at the top of the script). Re-run it per checkpoint whenever you rebuild; register the output via `export/model-list.yml` + `gen_models.py` (see "Adding models to the page" below).
+For Base and for Turbo (merging `TURBO_LORA` from the top of the script) it runs six steps:
 
-### Adding models to the page
+1. `export_dit.py --dynamic --fp32-act` — dynamic-resolution ONNX (fp32 activations, fp16 I/O)
+2. `quantize_dit.py --bits 8 --no-exclude --accuracy-level 4 --fp32-t-embed` — int8 weights + DP4A, with only the two t_embedder layers on fp32 activations
+3. `fuse_attention.py` — decomposed SDPA → `MultiHeadAttention` (FlashAttention); writes `.fuse_meta.json`
+4. `add_negpip.py` — adds the `negpip_mask` input (output unchanged when mask = 1)
+5. `shard_onnx_data.py --shard-mb 400` — splits the weights into 400 MB shards
+6. `add_lora_slots.py --rank 48` — LoRA slot graph (shares the shards)
 
-Model registration is driven by `export/model-list.yml` and injected into
-`index.html` by `export/gen_models.py` — you no longer hand-edit the `MODELS`
-map or the dropdown. The generator writes between markers (`MODELS:START/END`,
-`MODEL_OPTIONS:START/END`, `PATH_DEFAULTS:START/END`, and the two prompt
-`<textarea>`s); everything else, including the `custom` entry, is left
-untouched. It is idempotent — re-running produces no diff.
+Output: `out/dit/{prefix}_dit_dyn32_q8a4fns.onnx` (plain) / `_q8a4fnLs.onnx` (LoRA slots), and `dit_turbo32` for Turbo.
 
-**Workflow:**
+### DiT post-processing for the page
+
+The page first looks for `<graph>_x.onnx` (padding-compaction inputs) and `<graph>_f16.onnx` ("Fast"), and falls back to the original graph if they are missing. For each plain and slot graph:
 
 ```bash
-# 1. build the DiT (key = the build_dit.bat prefix)
-export/build_dit.bat <ckpt> myft
-
-# 2. add one entry to export/model-list.yml
-# 3. inject into the page (static output, no runtime fetch)
-python export/gen_models.py export/model-list.yml web/index.html
+python -I tools/graph/xattn_compact.py <graph>.onnx <graph>_x.onnx
+python -I tools/graph/fp16_zones.py <graph>_x.onnx <graph>_f16.onnx --fast
 ```
 
-A model entry only needs the `key` (= the build prefix); paths are derived by
-rule (`out/dit/{key}_dit_dyn32|turbo32_q8a4f{ns,Ls}.onnx`):
+Only the graph changes; the original shards are referenced as they are. To apply this to every model already on a server at once, use `tools/graph/make_fast_graphs.py`.
 
-```yaml
-models:
-  - key: myft
-    label: My Model
-    variants: [base, turbo]      # or just [turbo] / [base]
-    source: https://civitai.com/...   # optional → footer credit link
-    overrides:                   # optional, per-variant
-      turbo: { steps: 6 }
-```
-
-The generated `MODELS` key is `{key}_{variant}` (e.g. `myft_base`,
-`myft_turbo`), which is also the dropdown `value`. Global bits live at the top
-of the yml: `selected` (default dropdown choice), `paths` (TE/adapter/VAE),
-`defaults.base`/`defaults.turbo` (per-variant steps/cfg/sampler/scheduler), and
-`prompt_defaults` (the initial positive/negative textarea text). The `source`
-footer links only render if `index.html` has a `FOOTER_SOURCES:START/END`
-marker pair; without it they are silently skipped.
-
-Quantization alone (legacy / minimal):
+### Text encoder, adapter, VAE
 
 ```bash
-python export/quantize_dit.py --src out/dit/anima_dit_dyn32.onnx \
-  --out out/dit/anima_dit_dyn32_q8.onnx --bits 8 --no-exclude
-python export/shard_onnx_data.py --src out/dit/anima_dit_dyn32_q8.onnx \
-  --out out/dit/anima_dit_dyn32_q8s.onnx --shard-mb 480
-``` Also shard anything else whose `.data` exceeds your CDN's cache limit (the fp16 text encoder is ~1.2 GB):
+python export/export_adapter.py --comfyui <ComfyUI> --ckpt <anima-base-v1.0.safetensors> --out out/adapter/anima_llm_adapter.onnx
+python export/export_text_encoder.py --out out/text_encoder/qwen3_06b.onnx
+python export/shard_onnx_data.py --src out/text_encoder/qwen3_06b.onnx --out out/text_encoder/qwen3_06b_s.onnx --shard-mb 400
 
-```bash
-python export/shard_onnx_data.py --src out/text_encoder/qwen3_06b.onnx \
-  --out out/text_encoder/qwen3_06b_s.onnx --shard-mb 400
+python export/export_vae_decoder.py --comfyui <ComfyUI> --vae <qwen_image_vae.safetensors> \
+  --out out/vae/qwen_image_vae_decoder_dyn32_2d.onnx --dynamic --size 512
+python export/chunk_vae_attention.py --src out/vae/qwen_image_vae_decoder_dyn32_2d.onnx \
+  --out out/vae/qwen_image_vae_decoder_dyn32_2dc.onnx --chunks 8
+python export/split_vae.py --src out/vae/qwen_image_vae_decoder_dyn32_2dc.onnx   # → _head / _tail / _head_a / _attn / _head_b
 ```
 
-Why these choices: **int4 RTN visibly destroys this DiT** (diffusion transformers are far more weight-quantization-sensitive than LLMs — the reason SVDQuant exists). int8 RTN is effectively lossless. `--algo hqq` provides a higher-quality int4 (~1.2 GB) if download size matters more than fidelity. Quantization is weight-only: shaders dequantize to fp16/fp32 at run time, so there is **no hardware INT8 requirement** and, since batch-1 inference is bandwidth-bound, it is also faster than fp16.
+Export the VAE in fp32. `--size` is only the trace size (the graph is dynamic); tracing the fp32 VAE at 1024 can OOM on 16 GB.
 
-## 3. Verify locally (recommended)
-
-```bash
-pip install onnxruntime pillow   # or onnxruntime-directml / onnxruntime-gpu
-python export/run_pipeline.py \
-  --dit out/dit/anima_dit_dyn32_q8s.onnx \
-  --adapter out/adapter/anima_llm_adapter.onnx \
-  --te out/text_encoder/qwen3_06b_s.onnx \
-  --vae out/vae/qwen_image_vae_decoder_dyn32.onnx \
-  --prompt "1girl, silver hair" --steps 30 --cfg 5.0 --size 768 --out check.png
-```
-
-This runs the exact pipeline the browser uses (same schedule/sampler math). If `check.png` looks right, any later browser-side problem is frontend code, not the models — that separation saved this project repeatedly.
-
-## 4. Tokenizers (self-hosted)
+### Tokenizers
 
 ```bash
 python export/prepare_tokenizers.py --out tokenizers
 ```
 
-Converts Qwen3 and the genuine `t5-v1_1` tokenizers to the fast `tokenizer.json` format transformers.js requires. The page tries `tokenizers/` locally first and falls back to HF Hub if absent.
+Saves the Qwen3 and T5 tokenizers as `tokenizer.json` for transformers.js. The page looks in `tokenizers/` first and falls back to the Hugging Face Hub.
 
-## 5. Deploy
+### Converting in the browser (no ComfyUI)
 
-Web-root layout:
+`web/convert/` is a standalone page that turns an Anima 2B (28-block) `.safetensors` checkpoint into a page-ready DiT (6 graphs + six 400 MB shards + manifests) inside the browser. It saves the result to a folder you pick, as `<name>_base/` (plus `<name>_turbo/` when you add the Turbo LoRA); the generation page then loads that folder through "Custom model". Browsers without the folder-save API get per-file download links instead.
+
+- Every Anima 2B checkpoint has the same graph structure, so the 12 graphs built by the pipeline above serve as **templates** and only the weight bytes are rebuilt (bf16 → fp32 → int8 block quantization exactly as the ORT quantizer does it; Turbo merges the LoRA through the same fp16 path as ComfyUI). For the same checkpoint the output is **byte-identical** to the pipeline's (checked on the base model and two fine-tunes).
+- Templates: the 12 base/Turbo graphs under `out/dit/` (`<stem>_q8a4fn{s,Ls}{,_x,_f16}.onnx`) and the two `<stem>_q8a4fnLs.onnx.lora_manifest.json`. The page looks in `../out/dit/`; `?templates=<URL>` overrides it. No shards, text encoder or VAE are needed.
+- The map `web/convert/anima2b.map.json` is generated by `export/make_convert_map.py` from a build folder and the source checkpoint (`--prefix` = the build's prefix, which also names the converter's output files; regenerate it whenever you rebuild the graphs, since it checks the templates by hash).
+- The adapter (`llm_adapter`) is not converted; the page uses one shared adapter for every model.
+- It can live on its own subdomain: `convert/` + `js/convert-core.js` + `workers/convert-*.js` + `css/app.css` + the templates. The generation page links to it through `convert_url` in the model list.
+
+### Registering models with the page
+
+The model list lives in `export/model-list.yml`; `gen_models.py` injects it into `web/js/config.js`, the only file that differs between deployments. Keep your real deployment list separately (for example a git-ignored `export/model-list.deploy.yml`) and generate from it when you deploy.
+
+```bash
+python export/gen_models.py export/model-list.yml web/js/config.js
+```
+
+```yaml
+models:
+  - key: myft                 # = build_dit.bat prefix → out/dit/myft_dit_{dyn32|turbo32}_q8a4f{ns,Ls}.onnx
+    label: My Model
+    variants: [base, turbo]
+    source: https://...       # optional: footer source link
+    overrides:                # optional, per variant: steps/cfg/sampler or graph paths (dit/ditLora)
+      turbo: { steps: 6 }
+```
+
+Top-level `defaults:` sets steps/CFG/sampler per variant (also used for custom models), `selected:` the initially selected model, and `convert_url:` the converter page address (empty = `convert/`).
+
+## Deployment
 
 ```
-index.html
+index.html  css/  js/  workers/      ← web/ as is (js/config.js is the deployment config)
 tokenizers/{qwen3,t5}/
 out/
-├── dit/           per variant: *_q8a4fns.onnx (non-slot) and *_q8a4fnLs.onnx (LoRA slots),
-│                 each with .bin shards + .onnx.manifest.json; slot graphs also have
-│                 .onnx.lora_manifest.json. Shards are shared between the two graphs.
+├── dit/           per graph: .onnx + _x + _f16, shards .N.bin + .manifest.json; slot graphs also .lora_manifest.json (the page builds .lora.bin itself)
 ├── adapter/       anima_llm_adapter.onnx (+ .data)
 ├── text_encoder/  qwen3_06b_s.onnx + shards + manifest
-└── vae/           qwen_image_vae_decoder_dyn32_2dc.onnx (+ .data)
+├── vae/           qwen_image_vae_decoder_dyn32_2dc.onnx + _head/_tail/_head_a/_attn/_head_b (+ .data)
+└── danbooru_ko.csv  tag-autocomplete data
 ```
 
-Set `paths` (TE/adapter/VAE) and model entries in `export/model-list.yml`, then run `gen_models.py`, if your filenames differ. Do **not** leave un-quantized source models in the web root.
+- `deploy/` has a ready nginx config (`docker compose up -d`). Weights and graphs are served `immutable` for a year; the page and `js/`, `css/`, `workers/` are `no-cache`.
+- Because of that, **overwriting a model file under the same name never reaches existing users.** Upload under a new name and change only `config.js`. The page cleans up caches the config no longer references in each user's browser.
+- HTTPS is required (WebGPU and OPFS need a secure context; `localhost` is the only exception).
+- Behind Cloudflare, add a Cache Rule that caches `.bin/.onnx/.data/.json` (not cached by default). Keep shards under 500 MB because of the free plan's per-file limit.
+- Never put the unquantized model in the web root.
 
-A ready-to-run static server is in `deploy/` (`docker compose up -d`; nginx with `immutable` cache headers for weights, `no-cache` for the page). Behind Cloudflare, add a Cache Rule making `.bin/.onnx/.data/.json` cache-eligible — these extensions are not cached by default, and without the rule every request hits your origin. Keep shards ≤ ~500 MB for free-tier per-file cache limits. Because weights are served `immutable`, **never overwrite a model file in place** — upload under a new filename and update `index.html`.
+## Development and verification tools
 
-## Browser features
+- `node tools/devserver.mjs --port 5173 --upstream <weights server> --local-out out-local` — serves `web/` and proxies `/out/` to the weights server (GET only; the `ANIMA_UPSTREAM` environment variable works instead of `--upstream`). If the same path exists under `--local-out`, that file is served instead (for testing graphs before deployment; supports HTTP Range).
+- `tools/harness.mjs` — golden harness. Compares pixel SHA-256 of 9 generation cases plus 8 autocomplete queries against `tools/golden.json`. Changes that alter numerics are judged by PSNR against reference images. The baseline is per environment and not in the repo: load the harness in the page console (`const h = await import("/__tools/harness.mjs")`), run `h.full()`, and once it finishes `await h.saveGolden()` writes `tools/golden.json` through the dev server; later runs use `await h.compareToGolden()`.
+- `tools/profile.mjs` — per-kernel GPU time via session profiling.
+- `tools/graph/` — graph analysis and post-processing scripts (`info.py`, `xattn_compact.py`, `fp16_zones.py`, and experiments such as `batch2.py`, `fuse_matmulnbits.py`, `split_context.py`, each with its results in the file header).
+- Browser-converter checks: `tools/convert-check.mjs` (runs the converter core in Node and compares bytes with a build), `tools/convert-folder.mjs` (writes the same result folder as the converter page to disk), `tools/convert-compare.py` (byte-compares that folder with a pipeline build made under another name).
 
-- **Prompt weighting** — `(tag:1.2)` scales a tag, `(tag)` = ×1.1, nesting multiplies, `\(` `\)` are literal parens (for Danbooru tags). Applied at the adapter output (token-wise), matching ComfyUI.
-- **NegPip** — under CFG=1 (Turbo), negative prompts are normally ignored. Check the NegPip box and the negative prompt is folded in as a negative-weight group; the slot model's `negpip_mask` flips the sign of those tokens' cross-attn values so the concept is subtracted. Requires a DiT built with `add_negpip.py`.
-- **Runtime LoRA** — add one or more `.safetensors` LoRAs with independent strengths, then press **Apply LoRA** (deferred so N LoRAs compile once, not N times). Conversion (safetensors parse + multi-LoRA ΔW/SVD merge) runs in a Web Worker with a progress bar; generation is disabled until it finishes. With a **single** LoRA the strength is a live graph input (`lora_scale`), so the slider takes effect on the next generation with no recompile; with **multiple** LoRAs the strength is baked into the SVD merge, so changing it re-runs the merge. Either way the graph stays rank-48. Unsupported keys (text-encoder LoRAs, LoKr) and out-of-slot modules are reported, not silently dropped. Requires a slot model from `add_lora_slots.py`.
-- **Custom model** — the *Custom* dropdown loads a DiT (`.onnx` + shards + manifests) you pick from disk, straight into memory (no OPFS, works on mobile). TE/adapter/VAE use the default paths.
-- **SPEED** — opt-in spectral progressive sampling (arXiv:2605.18736), available on the 1024² and 1280² preset buckets. The latent starts at a lower resolution (default `stages = 0.5, 1.0` = half) and, when the noise level drops to a transition σ (default `0.7`), a DCT spectrum extension grows it to full resolution: the low-frequency block is preserved, the new high-frequency band is filled with σ-scaled noise, and the result is rescaled by κ = r/(1+(r-1)σ) with the schedule re-spaced to the aligned σ. Because the early steps run on a quarter-area latent, Turbo generation drops ~40-45% (e.g. 1024² 12.9s → 6.8s, 1280² ~28s → ~17s). Lower σ is faster but risks fine-detail loss (hands); 0.7 is a reasonable balance, though the best value is seed-dependent — the advanced panel exposes `stages` and `transition σ` for tuning. The DCT/IDCT and spectrum-extension math is a verbatim port of [`ComfyUI-Spectrum-KSampler`](https://github.com/sorryhyun/ComfyUI-Spectrum-KSampler)'s `spd.py` (with [`ComfyUI-SPEED`](https://github.com/ruwwww/ComfyUI-SPEED) as a cross-reference), validated against a numpy reference to 1e-15.
-- **Batch** — a count field (1–100) next to the sampler/scheduler. One click enqueues that many generations; the click handler simply calls the single-image enqueue N times, so anything that varies per generation (a `-1` seed re-rolls each time; a fixed seed repeats the same image) applies independently to each. Queued jobs render as separate rows you can drop individually.
-- **Folder auto-save** (Chromium only) — pick an output folder and results stream straight to disk as `{prefix}_00001.png`, ComfyUI-style, no per-image download prompt. Uses the File System Access API, so files are written to your local disk with no server round-trip (the site principle is unchanged). The folder can only be chosen *before* the first generation of a session, which keeps the counter and the on-screen gallery in sync; the counter base is the max existing `{prefix}_N.png` + 1 (scanned by filename only, never reading contents), so re-runs and deletions never overwrite. The prefix is sanitized to `[A-Za-z0-9_-]`. In folder mode thumbnails hold an object URL to the just-written blob instead of a base64 data URL, the manual *Save* button becomes an auto-save indicator, and deleting a thumbnail removes the file from disk. Only images generated in the current session are shown either way — the existing folder contents are never loaded.
+## Inference contract (for porting)
 
-## Implementation notes (for porting elsewhere)
+- Flow model, `ModelSamplingDiscreteFlow`, **shift 3.0**, **multiplier 1.0** — the DiT's timestep input is σ itself (0–1). Feeding σ×1000 gives pure noise.
+- `denoised = x − σ·v` (CONST). CFG is equivalent in v space and denoised space.
+- `simple`: build a 1000-entry table `σ(t) = 3t/(1+2t)` for t = j/1000, sample evenly from the top, append 0. `normal`: split σ_max…σ_min linearly, then apply the shift again (exactly as ComfyUI does).
+- er_sde (CONST): λ = σ/(1−σ), α = 1−σ; σ₀ = 1 is moved to shift(1−10⁻⁴).
+- Dual tokenization on the text path (Qwen3 → hidden, T5 → adapter queries); adapter output × T5 token weights, then zero-padded to 512.
+- Initial latent is `randn` (σ₀ = 1); Wan21 latent (16 channels, spatial /8). Pixel sizes must be multiples of 16.
 
-Hard-won facts about Anima's inference contract, verified against ComfyUI source:
+## Pitfalls (read before reimplementing)
 
-- Flow model, `ModelSamplingDiscreteFlow`, **shift = 3.0**, and crucially **multiplier = 1.0**: the DiT's timestep input is **σ itself (0–1), not σ×1000**. Feeding ×1000 yields pure noise.
-- σ schedule (`simple`): build the 1000-entry table `σ(t)=3t/(1+2t)` for t = j/1000, sample it uniformly from the top, append 0.
-- Euler step: `x ← x + (σ_next − σ)·v`; `denoised = x − σ·v` (CONST). CFG applies identically in v-space and denoised-space.
-- ER-SDE (CONST path): λ = σ/(1−σ), α = 1−σ, offset σ₀ to σ(1−10⁻⁴) to avoid logit divergence; see `run_pipeline.py` / `index.html` for the full 3-stage solver.
-- Text path is **dual-tokenized**: the same prompt goes through the Qwen3 tokenizer (→ encoder hidden states) *and* the T5 tokenizer (→ adapter query ids, vocab 32128). Adapter output is zero-padded to 512 tokens.
-- Initial latent: `randn × σ₀` with σ₀ = 1.0; latent format Wan21 (16ch, /8 spatial), pixel sizes must be multiples of 16.
+1. **`--fp32-act` is a speed choice.** fp16 activations run without NaNs, but the model's internal autocast inserts 763 fp16↔fp32 Casts and makes it 1–2 s slower. Always export the VAE in fp32 (fp16 is known to overflow into black images, and on ORT 1.26 fp16 convs are actually slower).
+2. **ORT Web may return fp16 tensors as `Float16Array` (real values).** Assuming uint16 bit patterns breaks everything (see `toF32` in `js/ort.js`).
+3. **int4 RTN breaks this DiT,** even with sensitive layers excluded. int8 RTN (block 32) is effectively lossless at under 1%; blocks of 64 or 128 are worse.
+4. **DP4A (`accuracy_level=4`) also quantizes the activations to int8.** That is a separate error from weight quantization, and the two timestep-embedding layers (M = 1) produce most of it. Putting just those two at `accuracy_level=1` (`--fp32-t-embed`) cuts the error to a third to a fifth at no time cost. The CPU EP does not take this path, so judge quality in the browser.
+5. **The dynamo exporter anonymizes node names** (`node_linear_3`, `val_46`), so layers must be found by graph structure. Example: the t_embedder is "the linears reachable only from the timestep whose K and N are both ≥ 1024" (every adaLN goes through a rank-256 bottleneck).
+6. **ComfyUI custom ops must be replaced with plain PyTorch before export:** `comfy_kitchen`'s `rms_rope_split_half` (v0.43, q/k RMSNorm + RoPE), the older `apply_rope_split_half`, and `F.rms_norm` (`aten._fused_rms_norm` has no ONNX lowering). `export/common.py` handles these.
+7. **RoPE compares `max(H, W, T)` as Python ints, which freezes at trace time.** Landscape resolutions then break in a Reshape, so the embedding is replaced with an independent `arange` per axis (`common.py`).
+8. **A single browser ArrayBuffer tops out around 2 GB,** hence the sharding. ORT Web's `externalData` takes a list of files.
+9. **onnxruntime-web ships two WebGPU builds.** The default (JSEP) lacks the DP4A and FlashAttention kernels; the JSPI build has them.
+10. **The VAE's `CausalConv3d` (rank 5) runs on a slow naive kernel.** With T = 1 it equals a 2D conv over the last temporal tap, so it is folded to 4D to take the Conv2d path.
+11. **The VAE mid-block attention's score matrix causes high-resolution OOM** (2.4 GB at 1280²). head_dim 384 exceeds the FlashAttention kernel's workgroup limit, so the query axis is chunked instead (softmax is row-wise, so numerically equivalent) to shrink the score buffer.
+12. **ORT WebGPU does not reuse freed buffers within a single `run()`.** The VAE's peak grows to the sum of its intermediates, so it is split into head/tail and the tail runs in strips.
+13. **The GC does not see VRAM pressure.** ORT tensors are small JS objects wrapping big GPU buffers and are collected late. `dispose()` tensors as soon as they are read (guarded, since some builds lack it).
+14. **ORT WebGPU's buffer cache is not freed when one session is `release()`d.** The cache belongs to the GPU context and goes away only when every session on that context is released. Swapping just the DiT grows resident VRAM from 5 to 9.7 GB and pushes the peak to the 16 GB limit, doubling VAE time. The cache mode (`storageBufferCacheMode`) cannot be changed, because ORT JS adds session config entries *after* attaching the execution provider.
+15. **WebGPU `Split` uses a storage buffer per output.** With many outputs (e.g. 85) it exceeds the shader limit and fails; use `Slice` instead.
+16. **Do not assume a newer ORT is faster.** 1.30 made full generation 5–6% slower for this DiT (its fp16 kernels are better, though). Measure full generations in a fresh page.
+17. **Check that it is the same checkpoint.** Different checkpoints of the same family have identical graph structure and sizes. Comparing against the original PyTorch output is the only real check.
 
-## Pitfalls encountered (read before reimplementing)
+## License
 
-1. **DiT activation dtype — `--fp32-act` is a *speed* choice, not a NaN fix (corrected 2026-06).** Earlier this was believed to be "fp16 NaNs on WebGPU, so fp32-act is mandatory." That was wrong: exporting **without** `--fp32-act` (i.e. fp16 activations) runs fine with no NaN. But the model's internal autocast (block forward fp32 / submodules fp16) plus the `if x.dtype==fp16: x=x.float()` branch then bake a flood of fp16↔fp32 round-trip Casts into the graph (measured: 6 → 763 Cast nodes), which makes inference ~1-2s *slower* (12s → 14s) despite identical int8 weights and DP4A path. So `--fp32-act` is the recommended default for speed. Removing those Casts safely would require graph surgery across the whole network (high risk, uncertain memory payoff) — not currently worth it. **Separately**, export the VAE in fp32: the Wan VAE genuinely overflows fp16 → the classic black-image bug. (Also note: `add_lora_slots.py` hardcodes fp32 LoRA branches, so it is incompatible with an fp16-act DiT as-is — see the warning in that file.)
-2. **ORT Web returns `Float16Array`.** On browsers with native `Float16Array`, fp16 tensor `.data` contains *floats*, not uint16 bit patterns. Bit-twiddling it corrupts everything (zeros + NaN). Detect and branch (see `toF32`/`makeF16Tensor` in `index.html`).
-3. **Naive int4 RTN ruins diffusion DiTs** even with sensitive layers (adaLN/t_embedder/final_layer) excluded. Use int8, or HQQ for int4.
-4. **The dynamo ONNX exporter anonymizes names** (`node_linear`, `val_46`) — name-based layer matching is impossible; `quantize_dit.py` identifies sensitive layers by graph topology (reachable from `timesteps` but not `latent`) and weight shapes instead.
-5. **`aten._fused_rms_norm` has no ONNX lowering** in recent PyTorch; `F.rms_norm` is monkeypatched to a manual decomposition before export (`common.py`).
-6. **Browser single-ArrayBuffer limit (~2 GB)** blocks loading large `.data` files whole — hence sharding, which ORT Web's `externalData` list supports natively.
-7. ComfyUI custom ops (`comfy_kitchen.apply_rope_split_half`) must be replaced with pure-PyTorch equivalents pre-trace.
-8. **onnxruntime-web ships two WebGPU builds.** The default (`ort.webgpu.*`, JSEP) has **no** DP4A or FlashAttention kernels; the `ort.jspi.*` build is the native C++ WebGPU EP that does. This page loads the JSPI build (pinned `1.26.0`) when `WebAssembly.Suspending` exists (Chrome 137+), else falls back. `subgroup-matrix` paths are compiled out of the wasm build entirely — don't chase them.
-9. **DP4A needs `accuracy_level=4`** as a node attribute (set by `quantize_dit.py --accuracy-level 4`), plus `K%128==0 && N%16==0 && block_size%32==0`. It dynamically int8-quantizes activations — a *different* accuracy trade-off from weight quantization, so verify image quality in the browser (the CPU EP used by `run_pipeline.py` never takes this path).
-10. **VAE `CausalConv3d` is fp32-only and rank-5** — ORT runs it on a slow naive conv3d kernel. For single images (T=1) it's mathematically identical to a 2D conv on the last time-tap; `export_vae_decoder.py` materializes 4D weights so the Conv2d kernel runs instead (folds the per-step decode to near-instant). Not valid for video (T>1).
-11. **RoPE uses `max(H, W, T)`** internally, a Python `int` comparison that the dynamo exporter freezes at trace time — so the traced H/W ordering bakes in and **landscape (W>H) resolutions fail with a Reshape error** while square/portrait pass. A non-square trace does *not* fix it (dynamo still won't split the symbols); `patch_comfy_for_export` in `common.py` monkeypatches the RoPE embedding to use independent per-axis `arange` (numerically identical). `export_dit.py --verify` now checks landscape cases.
-12. **The VAE decoder's mid-block attention is the high-resolution OOM culprit.** Its score matrix `(1,1,S,S)` is a single buffer at full latent resolution (S=16384 at 1024², 25600 at 1280²), hitting ~2.4 GB at 1280² — past the 2 GB limit. `MultiHeadAttention` fusion fails to compile because head_dim 384 exceeds the WebGPU FA2 workgroup limit (32 KB), and splitting the single head changes the math. The fix is a query-token chunk (`chunk_vae_attention.py`) — numerically identical since softmax is row-wise, while cutting the score buffer to 1/N. The page only generates up to 1536² and uses N=8.
-13. **GC does not see VRAM pressure, so intermediate tensors must be `dispose()`d explicitly.** ORT Web tensors are small JS objects wrapping large GPU buffers; the JS heap looks nearly empty, so GC rarely fires and the backing GPU buffers linger — with the native WebGPU EP, finalizer-based release is further delayed. The result is a slow VRAM climb across repeated generations even at a fixed resolution. The fix is to call `.dispose()` the moment a tensor's data has been read out: per-step DiT inputs/outputs (`latent`, `timesteps`, prediction — plus the CFG uncond pass), the text-encoder and adapter inputs/outputs in `encodePrompt`, and the VAE input/output and context tensors in the run loop (on both the completed and cancelled paths). Reused tensors (context/mask/LoRA feed, live for the whole job) are freed once at job end, not per step. Guard the call (`typeof t.dispose === 'function'`) since some builds omit it; freeing after read-out means results and image quality are unaffected. This addresses the *inference-path* leak; the recompile leak in the note below is a separate, upstream issue.
-
-## Performance (reference)
-
-On an RTX 5070 Ti, 1024×1024, with the JSPI build + DP4A + 2D VAE: **Turbo ≈ 11 s** (8 steps, CFG 1), **base ≈ 70 s** (30 steps, CFG 5 → 60 DiT passes) — roughly 3× slower than local ComfyUI (down from ~10×). DP4A roughly halves sampling time; folding the VAE to 2D made decode effectively instant. Applying a LoRA adds ~9 s from the extra slot dispatches. The first generation at any new resolution is slower (shader specialization), then cached.
-
-**The measured value of DiT FlashAttention fusion was memory, not speed.** Within the current resolution range total time is roughly flat (±a few seconds), but no longer materializing the score matrix halves resident DiT VRAM and lets above-1024 resolutions clear the DiT stage that OOM'd when unfused. With **VAE chunked attention** on top, the last bottleneck — the VAE's single-buffer score OOM at high resolution — is gone too: on an RTX 5070 Ti, **1280² ≈ 29 s and 1536² ≈ 58 s**.
-
-> Note: the inference path now `dispose()`s its intermediate tensors (see Pitfall 13), so repeated generation at a fixed resolution no longer creeps VRAM upward. Separately, re-compiling the DiT repeatedly (e.g. toggling LoRAs many times) can still leak GPU memory in current ORT Web until a page refresh — a known upstream issue the page minimizes by deferring LoRA apply and keeping single-resident sessions.
-
-## Licenses
-
-- **Code in this repository**: MIT (see `LICENSE`).
-- **Anima model & all converted/quantized/merged derivatives**: [CircleStone Labs Non-Commercial License](https://huggingface.co/circlestone-labs/Anima/blob/main/LICENSE.md). Non-commercial use only; distribution of derivatives requires the attribution notice, a "modified" statement, and no implication of official endorsement — `web/index.html` ships the required notice. Generated images (Outputs) may be used commercially per the license. Also subject to the NVIDIA Open Model License as a Cosmos derivative ("Built on NVIDIA Cosmos").
+- **Code in this repo**: MIT (`LICENSE`).
+- **The Anima model and every converted, quantized or merged derivative**: [CircleStone Labs Non-Commercial License](https://huggingface.co/circlestone-labs/Anima/blob/main/LICENSE.md). Non-commercial use only; distributing derivatives requires the specified notice, a "modified" statement, and not implying official endorsement (`web/index.html` includes the required notice). Generated images may be used commercially under the license. As a Cosmos derivative, the NVIDIA Open Model License also applies ("Built on NVIDIA Cosmos").
 - **Qwen3-0.6B-Base**: Apache 2.0.
 
-This repository does **not** include model weights. Convert them yourself from the official releases, and keep all license obligations intact when distributing the results.
+This repo **does not include** model weights. Convert them yourself from the official releases and keep the license obligations when you distribute the results.
 
 ## Acknowledgements
 
-CircleStone Labs & Comfy Org (Anima), NVIDIA (Cosmos-Predict2), Alibaba (Qwen3, Qwen-Image VAE), the ComfyUI project (reference sampler/scheduler implementations), ONNX Runtime Web and transformers.js teams.
+CircleStone Labs & Comfy Org (Anima), NVIDIA (Cosmos-Predict2), Alibaba (Qwen3, Qwen-Image VAE), ComfyUI (sampler, scheduler and EasyCache reference implementations), sorryhyun/ComfyUI-Spectrum-KSampler (SPEED), and the ONNX Runtime Web and transformers.js teams.

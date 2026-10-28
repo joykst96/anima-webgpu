@@ -78,9 +78,11 @@ def simple_schedule(steps: int) -> np.ndarray:
 
 
 def normal_schedule(steps: int) -> np.ndarray:
-    """선형 t를 shift 변환. sigma[0]=1.0, sigma[-1]=0.0"""
-    t = np.linspace(1.0, 0.0, steps + 1)
-    return _shift_sigma(t)
+    """ComfyUI normal_scheduler 포팅 (ModelSamplingDiscreteFlow, multiplier 1 → timestep(σ)=σ).
+    σ_max(=1)~σ_min(=shift(1/1000))를 timestep으로 선형 분할한 뒤 shift를 한 번 더 적용하고 0.0 추가.
+    (종전 '선형 t를 shift' 구현은 simple과 같은 값이었다)"""
+    t = np.linspace(_shift_sigma(1.0), _shift_sigma(1.0 / 1000.0), steps)
+    return np.append(_shift_sigma(t), 0.0)
 
 
 # ──────────────────────── 샘플러 ────────────────────────

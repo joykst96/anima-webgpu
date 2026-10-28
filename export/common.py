@@ -59,6 +59,21 @@ def _rms_norm_manual(input, normalized_shape, weight=None, eps=None):
     return out.to(input.dtype)
 
 
+def _rms_rope_split_half_torch(q, k, freqs_cis, q_scale, k_scale=None, epsilon=1e-6, rot_dim=0):
+    """
+    comfy_kitchen.rms_rope_split_half(head별 RMSNorm + split-half RoPE 융합 커스텀 op)의 순수 PyTorch 등가.
+    ComfyUI 2026-05 이후 cosmos/predict2.py가 q/k norm + RoPE를 이 op 하나로 부른다(예전엔 norm 후
+    apply_rope_split_half). comfy_kitchen eager 백엔드 _rms_rope1(split_half=True, rot_dim=0)와 같은 계산.
+    """
+    if rot_dim and rot_dim != q.shape[-1]:
+        raise NotImplementedError("partial rotary(rot_dim) 미지원 — Anima는 rot_dim=0")
+    if k_scale is None:
+        k_scale = q_scale
+    qn = _rms_norm_manual(q, (q.shape[-1],), q_scale, epsilon)
+    kn = _rms_norm_manual(k, (k.shape[-1],), k_scale, epsilon)
+    return _apply_rope_split_half_torch(qn, kn, freqs_cis)
+
+
 def _rope_generate_embeddings_dynamic(self, B_T_H_W_C, fps=None,
                                       h_ntk_factor=None, w_ntk_factor=None,
                                       t_ntk_factor=None, device=None, dtype=None):
@@ -129,12 +144,14 @@ def patch_comfy_for_export():
 
     if getattr(qo, "ck", None) is not None:
         qo.ck.apply_rope_split_half = _apply_rope_split_half_torch
+        qo.ck.rms_rope_split_half = _rms_rope_split_half_torch
     else:
         # comfy_kitchen 미설치 환경: 더미 네임스페이스를 만들어 끼움
         class _CKShim:
             apply_rope_split_half = staticmethod(_apply_rope_split_half_torch)
+            rms_rope_split_half = staticmethod(_rms_rope_split_half_torch)
         qo.ck = _CKShim()
-    print("[patch] apply_rope_split_half → pure PyTorch 치환 완료")
+    print("[patch] apply_rope_split_half / rms_rope_split_half → pure PyTorch 치환 완료")
 
     # F.rms_norm 치환 (nn.RMSNorm.forward도 내부적으로 이걸 호출하므로 함께 커버됨)
     torch.nn.functional.rms_norm = _rms_norm_manual

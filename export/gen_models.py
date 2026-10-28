@@ -1,15 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""gen_models.py — model-list.yml → index.html 정적 주입기.
+"""gen_models.py — model-list.yml → web/js/config.js 정적 주입기.
 
-index.html에 박힌 마커 사이를 yml 내용으로 교체한다. 결과는 정적 HTML
+대상 파일의 마커 사이를 yml 내용으로 교체한다. 결과는 정적 파일
 (런타임 fetch 없음). 마커 밖 코드(custom 항목 등)는 건드리지 않는다.
 
 사용법:
-  python gen_models.py model-list.yml web/index.html
-  python gen_models.py model-list.yml web/index.html --check   # 변경 미적용, diff만
+  python gen_models.py model-list.yml web/js/config.js
+  python gen_models.py model-list.yml web/js/config.js --check   # 변경 미적용, 보고만
 
-교체 대상:
+config.js 모드 (대상이 .js) — 배포별 차이는 이 파일 하나로 모인다:
+  PATH_DEFAULTS:START..END     — PATHS 객체
+  MODELS:START..END            — MODELS 맵 항목 (custom은 마커 밖이라 보존)
+  SITE_DEFAULTS:START..END     — SELECTED_MODEL, PROMPT_DEFAULTS, MODEL_SOURCES, CONVERT_URL
+                                 (드롭다운·프롬프트 기본값·출처 링크·변환 페이지 링크는 페이지가 이 데이터로 그린다.
+                                  convert_url이 없으면 "" → 페이지 기본값 convert/)
+
+레거시 html 모드 (대상이 .html, 모듈 분리 이전의 단일 index.html) 교체 대상:
   MODELS:START..END            — MODELS 맵 항목 (custom은 마커 밖이라 보존)
   MODEL_OPTIONS:START..END     — <select> option (custom은 마커 밖이라 보존)
   PATH_DEFAULTS:START..END     — PATHS 객체
@@ -101,18 +108,21 @@ def build_model_entries(cfg):
     return entries, options
 
 
-def render_models_js(entries):
+HTML_INDENT = "      "  # index.html <script> 안 최상위 들여쓰기 (레거시 html 모드)
+
+
+def render_models_js(entries, base=HTML_INDENT):
     lines = []
     for mk, f in entries:
-        lines.append(f"        {mk}: {{")
-        lines.append(f"          label: {js_str(f['label'])},")
-        lines.append(f"          dit: {js_str(f['dit'])},")
-        lines.append(f"          ditLora: {js_str(f['ditLora'])},")
-        lines.append(f"          steps: {f['steps']},")
-        lines.append(f"          cfg: {float(f['cfg'])},")
-        lines.append(f"          sampler: {js_str(f['sampler'])},")
-        lines.append(f"          scheduler: {js_str(f['scheduler'])},")
-        lines.append("        },")
+        lines.append(f"{base}  {mk}: {{")
+        lines.append(f"{base}    label: {js_str(f['label'])},")
+        lines.append(f"{base}    dit: {js_str(f['dit'])},")
+        lines.append(f"{base}    ditLora: {js_str(f['ditLora'])},")
+        lines.append(f"{base}    steps: {f['steps']},")
+        lines.append(f"{base}    cfg: {float(f['cfg'])},")
+        lines.append(f"{base}    sampler: {js_str(f['sampler'])},")
+        lines.append(f"{base}    scheduler: {js_str(f['scheduler'])},")
+        lines.append(f"{base}  }},")
     return "\n".join(lines)
 
 
@@ -124,12 +134,39 @@ def render_options_html(options, selected):
     return "\n".join(lines)
 
 
-def render_paths_js(paths):
-    lines = ["      const PATHS = {"]
+def render_paths_js(paths, base=HTML_INDENT):
+    lines = [f"{base}const PATHS = {{"]
     for k in ("te", "adapter", "vae"):
         if k in paths:
-            lines.append(f"        {k}: {js_str(paths[k])},")
-    lines.append("      };")
+            lines.append(f"{base}  {k}: {js_str(paths[k])},")
+    lines.append(f"{base}}};")
+    return "\n".join(lines)
+
+
+def render_site_js(cfg, selected):
+    """config.js 모드: 드롭다운 기본 선택·프롬프트 기본값·출처 링크를 데이터로 출력.
+    (html 모드에선 이 값들이 option/textarea/footer HTML로 직접 들어갔다.)"""
+    pd = cfg.get("prompt_defaults", {})
+    lines = [f"const SELECTED_MODEL = {js_str(selected or '')};", "const PROMPT_DEFAULTS = {"]
+    for k in ("positive", "negative"):
+        if k in pd:
+            lines.append(f"  {k}: {js_str(pd[k])},")
+    lines += ["};", "const MODEL_SOURCES = ["]
+    for m in cfg["models"]:
+        if m.get("source"):
+            lines.append(f"  {{ label: {js_str(m.get('label', m['key']))}, url: {js_str(m['source'])} }},")
+    lines.append("];")
+    lines.append(f"const CONVERT_URL = {js_str(cfg.get('convert_url') or '')};")
+    # 변형별 생성 기본값 — 사용자 설정 모델(변환 결과 묶음)도 같은 값을 쓴다 (js/custom-ui.js)
+    lines.append("const VARIANT_DEFAULTS = {")
+    for v, d in cfg.get("defaults", {}).items():
+        vals = ", ".join(
+            f"{k}: {js_str(d[k]) if isinstance(d[k], str) else float(d[k]) if k == 'cfg' else d[k]}"
+            for k in ("steps", "cfg", "sampler", "scheduler")
+            if k in d
+        )
+        lines.append(f"  {v}: {{ {vals} }},")
+    lines.append("};")
     return "\n".join(lines)
 
 
@@ -215,6 +252,17 @@ def main():
 
     report = []
 
+    if args.html.endswith(".js"):
+        # config.js 모드 (모듈 분리 이후): 모든 배포 구성을 JS 데이터로. HTML은 건드리지 않는다.
+        text, ok = replace_marker(text, "PATH_DEFAULTS", render_paths_js(cfg.get("paths", {}), base=""))
+        report.append(("PATH_DEFAULTS", ok))
+        text, ok = replace_marker(text, "MODELS", render_models_js(entries, base=""))
+        report.append(("MODELS", ok))
+        text, ok = replace_marker(text, "SITE_DEFAULTS", render_site_js(cfg, selected))
+        report.append(("SITE_DEFAULTS", ok))
+        return finish(args, text, orig, report, entries, selected)
+
+    # ── 레거시 html 모드: 단일 index.html에 직접 주입 ──
     # MODELS
     text, ok = replace_marker(text, "MODELS", render_models_js(entries))
     report.append(("MODELS", ok))
@@ -237,7 +285,10 @@ def main():
     if footer is not None:
         text, ok = replace_marker(text, "FOOTER_SOURCES", footer)
         report.append(("FOOTER_SOURCES", ok))
+    return finish(args, text, orig, report, entries, selected)
 
+
+def finish(args, text, orig, report, entries, selected):
     print("주입 결과:")
     for name, ok in report:
         print(f"  {'OK ' if ok else 'SKIP(마커없음)'}  {name}")
@@ -250,7 +301,8 @@ def main():
         return
 
     if text != orig:
-        with open(args.html, "w", encoding="utf-8") as f:
+        # newline="\n": Windows 텍스트 모드의 CRLF 변환 방지 (운영본이 CRLF였던 원인)
+        with open(args.html, "w", encoding="utf-8", newline="\n") as f:
             f.write(text)
         print(f"\n{args.html} 갱신 완료.")
     else:
