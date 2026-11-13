@@ -1,7 +1,7 @@
 // 체크포인트 변환 Worker: safetensors → 지정한 폴더(FileSystemDirectoryHandle)에 변형별 하위 폴더로 페이지용 DiT 그래프·샤드·manifest.
 // 폴더는 사용자가 고른 실제 폴더(showDirectoryPicker) 또는 OPFS(다운로드용 임시) — 둘 다 createWritable로 같은 경로를 탄다.
 // 계산은 convert-compute.js 풀에 텐서 단위로 나누고, 이 Worker는 파일 쓰기와 템플릿 패치를 맡는다.
-// 메시지: {type:"start", dir, folder, ckpt, lora, strength, variants, mapUrl, templateDir}
+// 메시지: {type:"start", dir, folder, ckpt, lora, strength, variants, mapUrl, webnnMapUrl(선택 — WebNN용 파일도 만든다), templateDir}
 //   ckpt/lora: File 또는 {url, size, name} (convert-core sourceReader), folder: 하위 폴더 이름 앞부분
 //   → {type:"progress", frac, stage} … {type:"done", meta, folders} | {type:"error", message}
 import { convertDit, patchGraph, shardManifest, sourceReader } from "../js/convert-core.js";
@@ -70,22 +70,79 @@ async function writeFile(dir, name, bytes) {
   await w.close();
 }
 
-async function start(msg) {
-  const t0 = performance.now();
-  const { dir, folder, ckpt, lora, strength, variants, mapUrl, templateDir } = msg;
-  post({ type: "progress", frac: 0, stage: "매핑표·템플릿 그래프 받는 중" });
-  const map = await (await fetch(mapUrl)).json();
-
-  // 템플릿: 그래프(인라인 패치 대상)와 LoRA 슬롯 manifest. 매핑표가 만든 그래프와 같은 파일인지 sha1로 확인한다.
+// 매핑표 하나만큼 변환한다: 템플릿 확인 → 샤드 쓰기 → 그래프 패치 → 샤드 목록·슬롯 목록.
+//   운영(WebGPU) 그래프용 매핑표와 WebNN 그래프용 매핑표(anima2b.wnn.map.json)가 같은 절차를 탄다.
+//   매핑표에 manifests·copies가 있으면(WebNN) 그것을 쓰고, 없으면 운영 그래프의 규칙(두 슬롯의 manifest + lora_manifest).
+async function runMap(map, { subs, ckpt, lora, strength, variants, templateDir, files, progress }) {
   const templates = {},
-    loraManis = {};
+    copies = {};
   for (const [gk, g] of Object.entries(map.graphs)) {
     if (!variants.includes(gk.startsWith("turbo") ? "turbo" : "base")) continue;
     const b = await fetchBytes(templateDir + g.file);
     if ((await sha1Hex(b)) !== g.sha1) throw new Error(`템플릿 그래프가 매핑표와 다름: ${g.file}`);
     templates[gk] = b;
   }
-  for (const v of variants) loraManis[v] = await fetchBytes(`${templateDir}${map.stems[v]}_q8a4fnLs.onnx.lora_manifest.json`);
+  const copyNames = map.copies ?? ["{stem}_q8a4fnLs.onnx.lora_manifest.json"];
+  for (const v of variants)
+    copies[v] = await Promise.all(copyNames.map(async (c) => [c.replace("{stem}", map.stems[v]), await fetchBytes(templateDir + c.replace("{stem}", map.stems[v]))]));
+
+  const outs = {};
+  let pool = null;
+  try {
+    for (const v of variants) {
+      files[v] = [];
+      for (const s of map.shards) files[v].push(await openOut(subs[v], s.name.replace("{stem}", map.stems[v]), s.size));
+      const fv = files[v];
+      outs[v] = { write: (i, off, bytes) => fv[i].write(off, bytes) };
+    }
+    const n = Math.max(1, Math.min(8, (navigator.hardwareConcurrency || 4) - 1));
+    pool = makePool(n, { ckpt, lora, variants, strength, block: map.block });
+    progress(0, `변환 중 (Worker ${n}개)`);
+    let last = 0;
+    const res = await convertDit({
+      map,
+      read: sourceReader(ckpt),
+      lora: lora ? { read: sourceReader(lora), strength } : null,
+      outs,
+      compute: (job) => pool.run(job),
+      concurrency: n,
+      onProgress: (f) => {
+        const now = performance.now();
+        if (now - last > 250 || f === 1) {
+          last = now;
+          progress(f, "변환 중");
+        }
+      },
+    });
+    progress(1, "파일 마무리 중");
+    for (const fs of Object.values(files)) for (const f of fs) await f.close();
+    for (const k of Object.keys(files)) delete files[k];
+
+    for (const [gk, tpl] of Object.entries(templates)) {
+      const v = gk.startsWith("turbo") ? "turbo" : "base";
+      await writeFile(subs[v], map.graphs[gk].file, patchGraph(tpl, res.patches[gk]));
+    }
+    const enc = new TextEncoder();
+    const manis = map.manifests ?? ["_q8a4fns", "_q8a4fnLs"].map((slot) => ({ file: `{stem}${slot}.onnx.manifest.json`, shards: map.shards.map((_, i) => i) }));
+    for (const v of variants) {
+      const stem = map.stems[v];
+      for (const m of manis)
+        await writeFile(subs[v], m.file.replace("{stem}", stem), enc.encode(shardManifest(m.shards.map((i) => map.shards[i].name.replace("{stem}", stem)))));
+      for (const [name, bytes] of copies[v]) await writeFile(subs[v], name, bytes);
+    }
+    return res;
+  } finally {
+    pool?.close();
+  }
+}
+
+async function start(msg) {
+  const t0 = performance.now();
+  const { dir, folder, ckpt, lora, strength, variants, mapUrl, webnnMapUrl, templateDir } = msg;
+  post({ type: "progress", frac: 0, stage: "매핑표·템플릿 그래프 받는 중" });
+  // 매핑표: 운영(WebGPU) 그래프용은 항상, WebNN 그래프용은 요청했을 때만 (같은 폴더에 파일이 더해진다)
+  const maps = [await (await fetch(mapUrl)).json()];
+  if (webnnMapUrl) maps.push(await (await fetch(webnnMapUrl)).json());
 
   // 변형마다 하위 폴더 하나 = 생성 페이지 '사용자 설정'에서 한 번에 고를 파일 묶음. 이미 있으면 덮어쓰지 않는다.
   const folders = Object.fromEntries(variants.map((v) => [v, `${folder}_${v}`]));
@@ -101,67 +158,34 @@ async function start(msg) {
   const subs = {};
   for (const v of variants) subs[v] = await dir.getDirectoryHandle(folders[v], { create: true });
 
-  const files = {},
-    outs = {};
-  let pool = null;
+  const files = {}; // 열려 있는 출력 파일 (실패 시 abort)
   try {
-    for (const v of variants) {
-      files[v] = [];
-      for (const s of map.shards) files[v].push(await openOut(subs[v], s.name.replace("{stem}", map.stems[v]), s.size));
-      outs[v] = { write: (i, off, bytes) => files[v][i].write(off, bytes) };
+    let res = null;
+    for (let k = 0; k < maps.length; k++) {
+      const label = maps.length > 1 ? (k === 0 ? "[1/2 기본] " : "[2/2 WebNN] ") : "";
+      const r = await runMap(maps[k], {
+        subs, ckpt, lora, strength, variants, templateDir, files,
+        progress: (f, stage) => post({ type: "progress", frac: (k + f) / maps.length, stage: label + stage }),
+      });
+      res ??= r;
     }
-
-    const n = Math.max(1, Math.min(8, (navigator.hardwareConcurrency || 4) - 1));
-    pool = makePool(n, { ckpt, lora, variants, strength, block: map.block });
-    post({ type: "progress", frac: 0, stage: `변환 중 (Worker ${n}개)` });
-    let last = 0;
-    const res = await convertDit({
-      map,
-      read: sourceReader(ckpt),
-      lora: lora ? { read: sourceReader(lora), strength } : null,
-      outs,
-      compute: (job) => pool.run(job),
-      concurrency: n,
-      onProgress: (f) => {
-        const now = performance.now();
-        if (now - last > 250 || f === 1) {
-          last = now;
-          post({ type: "progress", frac: f, stage: "변환 중" });
-        }
-      },
-    });
-    post({ type: "progress", frac: 1, stage: "파일 마무리 중" });
-    for (const fs of Object.values(files)) for (const f of fs) await f.close();
-    for (const k of Object.keys(files)) delete files[k];
-
     const enc = new TextEncoder();
-    for (const [gk, tpl] of Object.entries(templates)) {
-      const v = gk.startsWith("turbo") ? "turbo" : "base";
-      await writeFile(subs[v], map.graphs[gk].file, patchGraph(tpl, res.patches[gk]));
-    }
     const meta = {
-      format: map.format,
-      mapVersion: map.version,
+      format: maps[0].format,
+      mapVersion: maps[0].version,
+      webnn: maps.length > 1 ? { format: maps[1].format, mapVersion: maps[1].version } : null,
       source: { name: ckpt.name, size: ckpt.size, lastModified: ckpt.lastModified ?? null, url: ckpt.url ?? null },
       lora: lora ? { name: lora.name, size: lora.size, strength, modules: res.loraModules } : null,
       created: new Date().toISOString(),
       seconds: +((performance.now() - t0) / 1000).toFixed(1),
     };
-    for (const v of variants) {
-      const stem = map.stems[v];
-      const mani = enc.encode(shardManifest(map.shards.map((s) => s.name.replace("{stem}", stem))));
-      for (const slot of ["_q8a4fns", "_q8a4fnLs"]) await writeFile(subs[v], `${stem}${slot}.onnx.manifest.json`, mani);
-      await writeFile(subs[v], `${stem}_q8a4fnLs.onnx.lora_manifest.json`, loraManis[v]);
-      await writeFile(subs[v], "convert-meta.json", enc.encode(JSON.stringify({ ...meta, variant: v }, null, 1)));
-    }
+    for (const v of variants) await writeFile(subs[v], "convert-meta.json", enc.encode(JSON.stringify({ ...meta, variant: v }, null, 1)));
     post({ type: "done", meta, folders });
   } catch (e) {
     for (const fs of Object.values(files)) for (const f of fs) await f.abort();
     for (const name of Object.values(folders))
       await dir.removeEntry(name, { recursive: true }).catch(() => {}); // 이 변환이 만든 폴더만 — 반쯤 쓴 결과는 남기지 않는다
     throw e;
-  } finally {
-    pool?.close();
   }
 }
 

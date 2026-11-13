@@ -237,6 +237,12 @@ function toF16Bytes(w) {
   return new Uint8Array(o.buffer);
 }
 
+function roundF16(w) {
+  const o = new Float32Array(w.length);
+  for (let i = 0; i < w.length; i++) o[i] = f16toF32(f16bits(w[i]));
+  return o;
+}
+
 // kind(매핑표) → 그래프에 들어가는 바이트
 export function tensorBytes(w, shape, kind) {
   switch (kind) {
@@ -248,6 +254,11 @@ export function tensorBytes(w, shape, kind) {
       return new Uint8Array(transpose(w, shape[0], shape[1]).buffer);
     case "f16T":
       return toF16Bytes(transpose(w, shape[0], shape[1]));
+    // WebNN 그래프: fp16으로 읽은 값을 fp32로 저장한 텐서 (fp16 반올림을 거친 fp32)
+    case "f32r16":
+      return new Uint8Array(roundF16(w).buffer);
+    case "f32r16T":
+      return new Uint8Array(roundF16(transpose(w, shape[0], shape[1])).buffer);
   }
   throw new Error(`알 수 없는 kind ${kind}`);
 }
@@ -329,7 +340,11 @@ export async function computeJob(job, { read, loraRead, variants, strength = 1.0
         [e.shard, e.offset, r.q],
         [e.sshard, e.soffset, new Uint8Array(r.s.buffer)],
       ];
-    } else writes[v] = [[e.shard, e.offset, tensorBytes(wv, e.shape, e.kind)]];
+    } else {
+      const bytes = tensorBytes(wv, e.shape, e.kind);
+      // also: 같은 바이트가 들어가는 다른 자리 (WebNN 매핑표 — 머리의 가중치는 샤드와 머리 .data 양쪽에 있다)
+      writes[v] = [[e.shard, e.offset, bytes], ...(e.also || []).map((d) => [d.shard, d.offset, bytes])];
+    }
   }
   return { writes, inline };
 }

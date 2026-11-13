@@ -2,7 +2,20 @@
 let svdDecompose = null;
 const svdReady = import('https://cdn.jsdelivr.net/npm/svd-js@1.1.1/build-es/svd.js').then(m => { svdDecompose = m.default; });
 
-function f16ToF32(u16){const out=new Float32Array(u16.length);for(let i=0;i<u16.length;i++){const h=u16[i],s=(h&0x8000)<<16,e=(h>>10)&0x1f,m=h&0x3ff;let bits;if(e===0)bits=m===0?s:(()=>{let mm=m,ee=-1;do{mm<<=1;ee++;}while(!(mm&0x400));return s|((127-15-ee)<<23)|((mm&0x3ff)<<13);})();else if(e===31)bits=s|0x7f800000|(m<<13);else bits=s|((e-15+127)<<23)|(m<<13);out[i]=new Float32Array(new Uint32Array([bits]).buffer)[0];}return out;}
+// fp16 → fp32. 결과 배열의 32비트 뷰에 비트를 직접 쓴다 — 원소마다 임시 배열을 만들던 종전 구현은 132MB LoRA(fp16 6,900만 개)에 23초가 걸렸다.
+// 값은 종전과 같다(65,536개 입력 전수 대조. NaN만 payload 비트가 다를 수 있다 — 종전은 값으로 한 번 읽어 신호 NaN이 조용한 NaN이 됐다).
+function f16ToF32(u16) {
+  const out = new Float32Array(u16.length), bits = new Uint32Array(out.buffer);
+  for (let i = 0; i < u16.length; i++) {
+    const h = u16[i], s = (h & 0x8000) << 16, e = (h >> 10) & 0x1f, m = h & 0x3ff;
+    if (e === 0) {
+      if (m === 0) bits[i] = s;
+      else { let mm = m, ee = -1; do { mm <<= 1; ee++; } while (!(mm & 0x400)); bits[i] = s | ((127 - 15 - ee) << 23) | ((mm & 0x3ff) << 13); }
+    } else if (e === 31) bits[i] = s | 0x7f800000 | (m << 13);
+    else bits[i] = s | ((e - 15 + 127) << 23) | (m << 13);
+  }
+  return out;
+}
 
 // safetensors: [u64 헤더길이][JSON 헤더][텐서 데이터]
 function parseSafetensors(arrayBuffer) {

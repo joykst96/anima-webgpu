@@ -1,8 +1,12 @@
-# VAE 분할 그래프(tail 등) fp16 변형 — 그래프만 바꾸고 가중치는 그대로(fp32 initializer에 Cast를 걸면 ORT가 세션 생성 때 접는다).
-#   python -I tools/graph/vae_fp16.py <src.onnx> <dst.onnx> <conv|all|nonorm> <데이터 입력 이름,...>
-#   예) ... qwen_image_vae_decoder_dyn32_2dc_tail.onnx tail_all.onnx all add_257
+# VAE 디코더 그래프를 fp16 계산으로 바꾼다 — 그래프만 바꾸고 가중치는 그대로(fp32 initializer에 Cast를 걸면 ORT가 세션 생성 때 접는다).
+#   python -I export/webnn/vae_fp16.py <src.onnx> <dst.onnx> <conv|all|nonorm> <데이터 입력 이름,...>
 #
-# ※ 미적용 실험 (2026-10-27) — "VAE는 fp32 필수(fp16 오버플로·검은 이미지)" 주장은 재현되지 않았다:
+# WebNN 빌드 단계 (build_webnn.bat이 부른다, 2026-11-13): 전체 동적 그래프를 all로 바꾼 <vae>_wnn16.onnx를 loader.js loadWebnnVae가 올린다.
+#   python -I export/webnn/vae_fp16.py out/vae/<vae>.onnx out/vae/<vae>_wnn16.onnx all latent
+#   DirectML(=Chrome WebNN)에서는 fp16이 빠르다: 1024² WebGPU fp32 742ms → WebNN fp16 111ms, fp32 대비 PSNR 67.7dB, 넘침 없음.
+#
+# WebGPU 경로에는 쓰지 않는다 — 분할 그래프(tail)로 해 본 실험 (2026-10-27, 예: ... _tail.onnx tail_all.onnx all add_257):
+#   "VAE는 fp32 필수(fp16 오버플로·검은 이미지)" 주장은 재현되지 않았다:
 #   tail 전부 fp16(all)도 1024² 실제 latent에서 NaN/Inf 없음, fp32 대비 PSNR 53dB(최대 24/255).
 #   그러나 ORT 1.26 WebGPU의 fp16 Conv2dMM·원소별 커널이 fp32보다 느려(Conv 380 → 795ms, Mul 3배) tail 0.68 → 1.10s(conv만 2.33s).
 #   ORT 1.30에서는 fp16 커널이 정상이라 all이 0.67 → 0.58s(−13%)지만, 1.30은 DiT가 6% 느려 전체로는 손해.
@@ -47,8 +51,12 @@ def cast(name, to):
         new_nodes.append(helper.make_node("Cast", [name], [out], to=to, name=out))
         cast_cache[key] = out; ncast[to] += 1; is16[out] = to == F16
     return cast_cache[key]
+# 원래 그래프의 텐서 dtype(shape inference) — shape 계산 경로(Slice·Concat 등 정수 텐서)를 float로 오인해 Cast를 걸지 않도록.
+# (head의 어텐션 Reshape는 shape 입력이 Shape→Slice→Concat이라, 추론 없이 op 이름만으로 가르면 fp16 Cast가 걸려 모델이 깨진다.)
+inferred = {v.name: v.type.tensor_type.elem_type for v in onnx.shape_inference.infer_shapes(m).graph.value_info}
 def is_float_tensor(name):
     if name in init: return init[name].data_type in (F32, F16)
+    if name in inferred and inferred[name] not in (F32, F16): return False
     return name in is16
 for idx, n in enumerate(nodes):
     want = mode16[idx]

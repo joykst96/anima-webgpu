@@ -6,6 +6,7 @@ import { disposeRun, disposeTensor, makeF16Tensor, ort, toF32 } from "./ort.js";
 import { gaussianFill, mulberry32, normalSchedule, sampleCfgppUd10Ab, sampleErSde, sampleEuler, simpleSchedule } from "./sampling.js";
 import { sampleSpeed } from "./speed.js";
 import { createEasyCache } from "./easycache.js";
+import { createSpectrum, predictedSteps } from "./spectrum.js";
 import { previewLatent } from "./preview.js";
 import { lora } from "./lora.js";
 import { ditSessions, loadState, sess } from "./loader.js";
@@ -83,6 +84,7 @@ function enqueueGenerate() {
     speedTransSig,
     xattnCompact: settings.xattnCompact,
     easyCache: settings.easyCache,
+    spectrum: settings.spectrum,
     // LoRA는 현재 반영 상태를 그대로 씀(스냅샷 시점 lora.bin) — 별도 복사 불필요.
   };
   genQueue.push(job);
@@ -162,7 +164,7 @@ function renderQueue() {
   }
 }
 
-// DiT의 cross-attention 입력. 그래프가 xattn_index/xattn_bias_row를 받을 때만 패딩 압축 가능 (tools/graph/xattn_compact.py).
+// DiT의 cross-attention 입력. 그래프가 xattn_index/xattn_bias_row를 받을 때만 패딩 압축 가능 (export/xattn_compact.py).
 // 압축: 어텐션에 실제 토큰 n개 + 패딩 대표 1개(점수 bias ln(512−n))만 넣는다 — 0 패딩 m개와 수학적으로 같다.
 // K/V 투영은 그래프가 종전처럼 512행으로 계산하고 어텐션 직전에 행만 고른다. 켜면 합산 순서 차이(~1e-6)를 DP4A가 증폭해 그림이 조금 달라진다.
 // 끄면 전체 인덱스 + bias 0 (종전과 같은 결과). context는 job 내내 같아 job마다 한 번 만든다.
@@ -187,6 +189,16 @@ async function runJob(job) {
   // job은 큐에 넣을 때의 모델로만 돈다. 그 사이 상주 DiT가 바뀌었으면(정상 흐름에선 잠금으로 불가) 건너뛴다.
   if (!sess.dit || sess.dit !== ditSessions[job.modelKey]) {
     log(`건너뜀 — 큐에 넣을 때의 모델(${job.modelKey})이 로드돼 있지 않음`, "err");
+    return;
+  }
+  // 정적 그래프(WebNN)는 한 해상도만 받는다. SPEED는 도중에 해상도가 바뀌어 쓸 수 없다.
+  const sl = sess.dit.staticLat;
+  if (sl && (job.speed || job.pxH / 8 !== sl.h || job.pxW / 8 !== sl.w)) {
+    log(
+      `건너뜀 — WebNN으로 로드한 모델은 ${sl.w * 8}×${sl.h * 8} 전용${job.speed ? "이고 SPEED를 쓸 수 없음" : ""}. ` +
+        "해상도를 맞추거나 고급 옵션에서 연산 정밀도를 바꾸세요",
+      "err",
+    );
     return;
   }
   $("btnSave").disabled = true;
@@ -262,9 +274,39 @@ async function runJob(job) {
       job.scheduler === "simple" ? simpleSchedule : normalSchedule
     )(steps);
 
+    // Spectrum(선택): 일부 스텝은 블록 계산을 건너뛰고, 저장한 특징으로 예측한 특징을 머리(sess.ditHead)에만 통과시킨다 (spectrum.js).
+    // 본체가 특징 출력을 가진 WebNN 세션(sess.dit.spectrum)이고, 스텝당 모델을 한 번 부르는 샘플러(euler·er_sde)일 때만.
+    let sp = null;
+    if (job.spectrum) {
+      if (!(sess.dit.spectrum && sess.ditHead)) log("Spectrum — 지금 로드된 모델에서는 쓸 수 없음(WebNN + Spectrum 그래프 필요). 끄고 진행", "dim");
+      else if (job.speed || !(job.sampler === "euler" || job.sampler === "er_sde")) log("Spectrum — euler·er_sde 샘플러에서만 동작. 끄고 진행", "dim");
+      else if (!predictedSteps(steps).length) log(`Spectrum — ${steps}스텝에서는 건너뛸 스텝이 없음. 끄고 진행`, "dim");
+      else sp = createSpectrum(steps);
+    }
+    let spStep = 0,
+      spDims = null;
+    // 특징을 두는 곳: 가중합 머리(sess.ditHeadK)가 있으면 GPU — 본체가 낸 fp16 텐서를 갈래별로 최근 K개 들고 있다가 그대로 머리에 넣는다
+    // (JS는 계수 K개만 계산). 없으면 CPU — 특징(fp32)을 읽어 와 spectrum.js가 누적·합산하고 머리에 올린다.
+    const hk = sp && sess.dit.spectrum.gpu ? sess.ditHeadK : null;
+    const spSlots = { cond: [], uncond: [] }; // GPU 경로: [{ own: 본체 출력 텐서(해제 책임), t: 머리 인스턴스용 }]
+    const spKeep = (branch, o) => {
+      const own = o.spectrum_feat16;
+      delete o.spectrum_feat16; // disposeRun(o)이 놓지 않게 — 슬롯에서 밀려나거나 생성이 끝날 때 놓는다
+      const list = spSlots[branch];
+      list.push({ own, t: hk.wrap(own) });
+      if (list.length > hk.slots) disposeTensor(list.shift().own);
+    };
+    const spCleanup = () => {
+      for (const list of Object.values(spSlots)) for (const e of list.splice(0)) disposeTensor(e.own);
+    };
+    const vName = sess.dit.outputNames[0];
+    // 본체에서 받을 출력: Spectrum을 안 쓰면 v_pred만(특징을 읽어 오지 않게), 쓰면 v_pred + 특징(GPU면 fp16 텐서, CPU면 fp32 값)
+    const ditFetch = !sess.dit.spectrum ? undefined : !sp ? [vName] : [vName, hk ? "spectrum_feat16" : "spectrum_feat"];
     // EasyCache(선택): 변화가 작은 스텝의 DiT 호출을 건너뛰고 직전 (출력 − 입력) 차이를 재사용 (easycache.js)
-    const ec = job.easyCache ? createEasyCache(LAT_C, sigmas[sigmas.length - 2]) : null;
+    if (job.easyCache && sp) log("Spectrum을 쓰는 동안 EasyCache는 쓰지 않음", "dim");
+    const ec = job.easyCache && !sp ? createEasyCache(LAT_C, sigmas[sigmas.length - 2]) : null;
     const denoise = async (xf32, sigma, curH = H, curW = W) => {
+      const spMode = sp ? sp.beginStep(spStep++) : null; // 스텝당 한 번: 이번 스텝을 실제로 계산할지 예측할지
       const cached = ec && ec.before(xf32, sigma, curH, curW);
       let v,
         vu = null,
@@ -273,24 +315,49 @@ async function runJob(job) {
         o1 = null,
         o2 = null;
       if (cached) [v, vu] = cached;
-      else {
+      else if (spMode === "cached") {
+        // 예측 스텝: 갈래(조건·무조건)마다 특징을 예측해 그 스텝의 σ로 머리만 돌린다
+        t = new ort.Tensor("float32", new Float32Array([sigma]), [1]);
+        const head = async (branch) => {
+          let o, ft;
+          if (hk) {
+            // 이력 K개의 가중치만 계산해 넘긴다. 빈 칸은 계수 0 + 아무 특징.
+            const list = spSlots[branch],
+              coef = new Float32Array(hk.slots);
+            coef.set(sp.weights(spStep - 1, hk.slots));
+            const feed = { coef: (ft = new ort.Tensor("float32", coef, [hk.slots])), timesteps: t };
+            for (let k = 0; k < hk.slots; k++) feed["feat" + k] = (list[k] ?? list[0]).t;
+            o = await hk.run(feed);
+          } else {
+            ft = new ort.Tensor("float32", sp.predict(branch, spStep - 1), spDims);
+            o = await sess.ditHead.run({ spectrum_feat: ft, timesteps: t });
+          }
+          const r = toF32(o[Object.keys(o)[0]].data);
+          disposeTensor(ft);
+          disposeRun(o);
+          return r;
+        };
+        v = await head("cond");
+        if (useCfg) vu = await head("uncond");
+      } else {
         lat = makeF16Tensor(xf32, [1, LAT_C, 1, curH, curW]);
         t = new ort.Tensor("float32", new Float32Array([sigma]), [1]); // t = σ
-        o1 = await sess.dit.run({
-          latent: lat,
-          timesteps: t,
-          ...xPos.feed,
-          ...loraFeed,
-        });
-        v = toF32(o1[Object.keys(o1)[0]].data);
-        if (useCfg) {
-          o2 = await sess.dit.run({
-            latent: lat,
-            timesteps: t,
-            ...xNeg.feed,
-            ...loraFeed,
-          });
-          vu = toF32(o2[Object.keys(o2)[0]].data);
+        const feedPos = { latent: lat, timesteps: t, ...xPos.feed, ...loraFeed };
+        o1 = await (ditFetch ? sess.dit.run(feedPos, ditFetch) : sess.dit.run(feedPos));
+        v = toF32(o1[vName].data);
+        // 무조건 갈래를 먼저 보내 두고, GPU가 그것을 계산하는 동안 조건 갈래의 특징을 저장한다(특징 누적은 CPU에서 수십 ms)
+        const feedNeg = useCfg ? { latent: lat, timesteps: t, ...xNeg.feed, ...loraFeed } : null;
+        const p2 = feedNeg ? (ditFetch ? sess.dit.run(feedNeg, ditFetch) : sess.dit.run(feedNeg)) : null;
+        if (hk) spKeep("cond", o1);
+        else if (sp) {
+          spDims ??= o1.spectrum_feat.dims;
+          sp.store("cond", o1.spectrum_feat.data);
+        }
+        if (p2) {
+          o2 = await p2;
+          vu = toF32(o2[vName].data);
+          if (hk) spKeep("uncond", o2);
+          else if (sp) sp.store("uncond", o2.spectrum_feat.data);
         }
         if (ec) ec.after(xf32, v, vu);
       }
@@ -354,7 +421,11 @@ async function runJob(job) {
     } else {
       const sampler =
         job.sampler === "er_sde" ? sampleErSde : job.sampler === "cfgpp_ud10_ab" ? sampleCfgppUd10Ab : sampleEuler;
-      xf = await sampler(denoise, x, sigmas, rand, onStep);
+      try {
+        xf = await sampler(denoise, x, sigmas, rand, onStep);
+      } finally {
+        spCleanup(); // GPU에 들고 있던 특징 텐서 반납 (중단·오류 포함)
+      }
     }
 
     if (xf === null) {
@@ -376,6 +447,11 @@ async function runJob(job) {
       log(
         `EasyCache — 스텝 ${ec.calls}회 중 ${ec.skipped.length}회 DiT 건너뜀` +
           (ec.skipped.length ? ` (${ec.skipped.join(", ")}번째)` : ""),
+        "dim",
+      );
+    if (sp)
+      log(
+        `Spectrum — ${steps}스텝 중 ${sp.stats.predicted.length}스텝 예측 (${sp.stats.predicted.join(", ")}번째)${hk ? "" : " · 특징 합산은 CPU"}`,
         "dim",
       );
     log("VAE 디코드...", "dim");
@@ -417,9 +493,10 @@ async function runJob(job) {
     );
     const metaTxt =
       `seed ${seed} · ${pxW}x${pxH} · ${steps}스텝 · CFG ${cfg}` +
-      (precision === "fast" ? ` · ${PRECISION_LABEL.fast}` : "") +
+      (precision !== "standard" ? ` · ${PRECISION_LABEL[precision]}` : "") +
       (xPos.compacted ? " · 패딩 압축" : "") +
-      (ec ? " · EasyCache" : "");
+      (ec ? " · EasyCache" : "") +
+      (sp ? " · Spectrum" : "");
     $("genStat").textContent = metaTxt;
     if (folderMode.active) {
       // 폴더 자동저장: 디스크에 쓰고 objectURL 썸네일. dataURL 미보관.

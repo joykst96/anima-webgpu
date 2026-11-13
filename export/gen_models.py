@@ -8,13 +8,17 @@
 사용법:
   python gen_models.py model-list.yml web/js/config.js
   python gen_models.py model-list.yml web/js/config.js --check   # 변경 미적용, 보고만
+  python gen_models.py my-list.yml web/js/config.js --out my-config.js
+      # web/js/config.js는 틀로만 읽고 결과를 다른 파일에 쓴다 (레포의 config.js를 건드리지 않고 배포용 구성을 만들 때)
 
 config.js 모드 (대상이 .js) — 배포별 차이는 이 파일 하나로 모인다:
   PATH_DEFAULTS:START..END     — PATHS 객체
   MODELS:START..END            — MODELS 맵 항목 (custom은 마커 밖이라 보존)
-  SITE_DEFAULTS:START..END     — SELECTED_MODEL, PROMPT_DEFAULTS, MODEL_SOURCES, CONVERT_URL
-                                 (드롭다운·프롬프트 기본값·출처 링크·변환 페이지 링크는 페이지가 이 데이터로 그린다.
-                                  convert_url이 없으면 "" → 페이지 기본값 convert/)
+  SITE_DEFAULTS:START..END     — SELECTED_MODEL, PROMPT_DEFAULTS, MODEL_SOURCES(+_TITLE), CONVERT_URL, TAG_HELPER_URL
+                                 (드롭다운·프롬프트 기본값·출처 링크·변환 페이지 링크·태그 도우미 링크는 페이지가 이 데이터로 그린다.
+                                  convert_url이 없으면 "" → 페이지 기본값 convert/,
+                                  tag_helper_url이 없으면 "" → 태그 도우미 배지 숨김,
+                                  sources_title이 없으면 "파인튜닝 모델 출처")
 
 레거시 html 모드 (대상이 .html, 모듈 분리 이전의 단일 index.html) 교체 대상:
   MODELS:START..END            — MODELS 맵 항목 (custom은 마커 밖이라 보존)
@@ -156,7 +160,9 @@ def render_site_js(cfg, selected):
         if m.get("source"):
             lines.append(f"  {{ label: {js_str(m.get('label', m['key']))}, url: {js_str(m['source'])} }},")
     lines.append("];")
+    lines.append(f"const MODEL_SOURCES_TITLE = {js_str(cfg.get('sources_title') or '파인튜닝 모델 출처')};")
     lines.append(f"const CONVERT_URL = {js_str(cfg.get('convert_url') or '')};")
+    lines.append(f"const TAG_HELPER_URL = {js_str(cfg.get('tag_helper_url') or '')};")
     # 변형별 생성 기본값 — 사용자 설정 모델(변환 결과 묶음)도 같은 값을 쓴다 (js/custom-ui.js)
     lines.append("const VARIANT_DEFAULTS = {")
     for v, d in cfg.get("defaults", {}).items():
@@ -234,6 +240,7 @@ def main():
     ap.add_argument("yml")
     ap.add_argument("html")
     ap.add_argument("--check", action="store_true", help="적용하지 않고 변경 여부만 보고")
+    ap.add_argument("--out", default=None, help="결과를 이 파일에 쓴다 (대상 파일은 틀로만 읽고 그대로 둔다)")
     args = ap.parse_args()
 
     with open(args.yml, encoding="utf-8") as f:
@@ -300,8 +307,12 @@ def finish(args, text, orig, report, entries, selected):
         print(f"\n--check: 변경 {'있음' if changed else '없음'} (파일 미수정)")
         return
 
-    if text != orig:
-        # newline="\n": Windows 텍스트 모드의 CRLF 변환 방지 (운영본이 CRLF였던 원인)
+    if args.out:
+        with open(args.out, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        print(f"\n{args.out} 에 씀 ({args.html}는 그대로).")
+    elif text != orig:
+        # newline="\n": Windows 텍스트 모드의 CRLF 변환 방지
         with open(args.html, "w", encoding="utf-8", newline="\n") as f:
             f.write(text)
         print(f"\n{args.html} 갱신 완료.")

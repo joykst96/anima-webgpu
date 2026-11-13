@@ -50,11 +50,13 @@ const PROMPT_DEFAULTS = {
 };
 const MODEL_SOURCES = [
 ];
+const MODEL_SOURCES_TITLE = "파인튜닝 모델 출처";
 const CONVERT_URL = "";
+const TAG_HELPER_URL = "";
 const VARIANT_DEFAULTS = {
   base: { steps: 30, cfg: 5.0, sampler: "er_sde", scheduler: "simple" },
   turbo: { steps: 8, cfg: 1.0, sampler: "euler", scheduler: "simple" },
 };
 // SITE_DEFAULTS:END
 
-export { CONVERT_URL, MODELS, MODEL_SOURCES, PATHS, PROMPT_DEFAULTS, SELECTED_MODEL, VARIANT_DEFAULTS };
+export { CONVERT_URL, MODELS, MODEL_SOURCES, MODEL_SOURCES_TITLE, PATHS, PROMPT_DEFAULTS, SELECTED_MODEL, TAG_HELPER_URL, VARIANT_DEFAULTS };

@@ -1,39 +1,21 @@
 <!doctype html>
-<html lang="ko">
+<html lang="ko" data-theme="dark">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <link rel="icon" href="data:," />
     <title>Anima WebGPU — 브라우저 로컬 이미지 생성</title>
+    <link rel="stylesheet" href="css/tokens.css" />
     <link rel="stylesheet" href="css/app.css" />
   </head>
   <body>
     <div class="wrap">
-      <div style="display: flex; align-items: center; gap: 12px">
-        <h1 style="margin: 0; flex: 1">Anima — 브라우저 로컬 생성</h1>
-        <button
-          id="btnGenTop"
-          disabled
-          style="
-            width: auto;
-            font-size: 13px;
-            padding: 7px 16px;
-            flex: 0 0 auto;
-          "
-        >
+      <div class="page-head">
+        <h1>Anima — 브라우저 로컬 생성</h1>
+        <button id="btnGenTop" class="btn-top" disabled>
           생성
         </button>
-        <button
-          id="btnCancelTop"
-          style="
-            width: auto;
-            font-size: 13px;
-            padding: 7px 14px;
-            flex: 0 0 auto;
-            background: #c0283c;
-            display: none;
-          "
-        >
+        <button id="btnCancelTop" class="btn-top btn-danger" style="display: none">
           ■ 중단
         </button>
       </div>
@@ -72,38 +54,23 @@
                   </svg>
                 </button>
               </div>
-              <div
-                id="customPanel"
-                style="
-                  display: none;
-                  margin: 8px 0;
-                  padding: 10px;
-                  border: 1px solid var(--line, #333);
-                  border-radius: 6px;
-                "
-              >
-                <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap">
-                  <button id="btnCustomDir" class="secondary" type="button" style="width: auto; margin: 0; padding: 8px 14px">
+              <div id="customPanel" class="sub-panel" style="display: none">
+                <div class="hstack hstack-wrap">
+                  <button id="btnCustomDir" class="secondary btn-inline" type="button">
                     모델 폴더 선택
                   </button>
                   <button
                     id="btnCustomReopen"
-                    class="secondary"
+                    class="secondary btn-inline"
                     type="button"
-                    style="display: none; width: auto; margin: 0; padding: 8px 14px"
+                    style="display: none"
                   ></button>
-                  <span id="customDirName" style="font-size: 12px; color: var(--dim, #888)"></span>
+                  <span id="customDirName" class="text-sm text-muted"></span>
                 </div>
-                <select id="customModelSel" style="display: none; margin-top: 8px" aria-label="폴더에서 찾은 모델"></select>
+                <select id="customModelSel" style="display: none" aria-label="폴더에서 찾은 모델"></select>
                 <input id="customDirInput" type="file" webkitdirectory hidden />
-                <div
-                  style="
-                    font-size: 11px;
-                    color: var(--dim, #888);
-                    margin: 6px 0 0;
-                  "
-                >
-                  <a id="convertLink" href="convert/" target="_blank" rel="noopener" style="color: var(--accent)"
+                <div class="text-xs text-muted sub-panel-note">
+                  <a id="convertLink" class="link" href="convert/" target="_blank" rel="noopener"
                     >체크포인트 변환 페이지</a
                   >에서 저장한 폴더(또는 그 상위 폴더)를 고르면 안의 모델을 찾아 목록으로 보여 줍니다.
                   LoRA·'빠르게' 모드도 서버 모델과 같게 동작하고, TE/어댑터/VAE는 기본 경로를 씁니다.
@@ -118,80 +85,32 @@
             </div>
           </div>
 
-          <div class="panel accordion" id="panelLora" style="margin-top: 16px">
+          <div class="panel accordion" id="panelLora">
             <h2 class="acc-head">2. LoRA <span class="acc-arrow">⌄</span></h2>
             <div class="acc-body">
-              <div
-                style="
-                  font-size: 11px;
-                  color: var(--dim, #888);
-                  margin: 0 0 6px;
-                "
-              >
-                .safetensors · 여러 개 가능
-              </div>
+              <div class="text-xs text-muted lora-note">.safetensors · 여러 개 가능</div>
               <div id="loraList"></div>
-              <div
-                style="
-                  display: flex;
-                  gap: 8px;
-                  align-items: center;
-                  margin-top: 4px;
-                "
-              >
-                <button
-                  id="btnLoraAdd"
-                  style="font-size: 12px; padding: 3px 10px; width: auto"
-                >
-                  + LoRA 추가
-                </button>
-                <button
-                  id="btnLoraApply"
-                  style="font-size: 12px; padding: 3px 10px; width: auto"
-                  disabled
-                >
-                  LoRA 반영
-                </button>
-                <div
-                  id="loraStat"
-                  style="font-size: 11px; color: var(--dim, #888); flex: 1"
-                ></div>
+              <div class="hstack lora-actions">
+                <button id="btnLoraAdd" class="btn-mini">+ LoRA 추가</button>
+                <button id="btnLoraApply" class="btn-mini" disabled>LoRA 반영</button>
+                <div id="loraStat" class="text-xs text-muted"></div>
               </div>
             </div>
           </div>
 
-          <div class="panel" style="margin-top: 16px">
-            <h2
-              style="
-                display: flex;
-                align-items: center;
-                justify-content: space-between;
-              "
-            >
+          <div class="panel">
+            <h2 class="panel-head">
               3. 생성
-              <span
-                style="
-                  display: flex;
-                  align-items: center;
-                  gap: 5px;
-                  font-weight: normal;
-                  font-size: 12px;
-                  color: var(--dim);
-                "
-              >
-                <input
-                  id="previewChk"
-                  type="checkbox"
-                  checked
-                  style="width: auto; margin: 0"
-                />프리뷰 보기
+              <span class="check-label">
+                <input id="previewChk" type="checkbox" checked />프리뷰 보기
               </span>
             </h2>
             <div class="label-row">
               <label>긍정 프롬프트</label>
               <a
+                id="tagHelper"
                 class="taghelper-badge"
-                href="https://taghelper.baepoyong.com/"
+                hidden
                 target="_blank"
                 rel="noopener"
                 title="한국어 묘사로 Danbooru 태그를 만들어주는 도우미"
@@ -202,31 +121,18 @@
               <textarea id="prompt"></textarea>
               <div class="ac-pop" id="acPopPrompt"></div>
             </div>
-            <label style="display: flex; align-items: center; gap: 8px"
+            <label class="label-flex"
               >부정 프롬프트
-              <span
-                style="
-                  margin-left: auto;
-                  display: flex;
-                  align-items: center;
-                  gap: 5px;
-                  font-weight: normal;
-                  font-size: 12px;
-                "
-              >
-                <input
-                  id="negpipChk"
-                  type="checkbox"
-                  style="width: auto; margin: 0"
-                />NegPip
+              <span class="check-label">
+                <input id="negpipChk" type="checkbox" />NegPip
                 <input
                   id="negpipW"
+                  class="input-sm"
                   type="number"
                   value="-1.0"
                   step="0.1"
                   max="-0.1"
                   min="-3"
-                  style="width: 64px"
                   title="부정 프롬프트에 줄 음수 가중치"
                 />
               </span>
@@ -235,49 +141,21 @@
               <textarea id="negative"></textarea>
               <div class="ac-pop" id="acPopNegative"></div>
             </div>
-            <label
-              style="
-                display: flex;
-                align-items: center;
-                gap: 8px;
-                justify-content: space-between;
-              "
-            >
+            <label class="label-flex">
               <span>해상도 프리셋</span>
               <span
-                style="
-                  display: flex;
-                  align-items: center;
-                  gap: 5px;
-                  font-weight: normal;
-                  font-size: 12px;
-                  color: var(--warn);
-                "
+                class="check-label text-warning"
                 title="저해상도에서 시작해 denoise 도중 해상도를 키워 속도를 높입니다 (SPD/SPEED). 1024·1280 프리셋에서만 동작."
               >
-                <input id="speedChk" type="checkbox" style="width: auto" />
+                <input id="speedChk" type="checkbox" />
                 <span>SPEED (실험)</span>
               </span>
             </label>
-            <div
-              id="speedDevPanel"
-              style="
-                display: none;
-                margin: 4px 0 6px;
-                padding: 6px 8px;
-                border: 1px solid var(--warn);
-                border-radius: 6px;
-                font-size: 12px;
-                background: #1a1610;
-              "
-            >
-              <div style="color: var(--warn); margin-bottom: 4px">
-                SPEED 고급 설정
-              </div>
-              <div class="row" style="gap: 6px">
+            <div id="speedDevPanel" class="warn-panel" style="display: none">
+              <div class="warn-panel-title">SPEED 고급 설정</div>
+              <div class="row">
                 <div>
                   <label
-                    style="font-size: 11px"
                     title="해상도 단계 (시작배율…1.0). 기본 0.5,1.0 = 절반 해상도로 시작"
                     >stages</label
                   >
@@ -285,12 +163,10 @@
                     id="speedStages"
                     type="text"
                     value="0.5, 1.0"
-                    style="width: 100%"
                   />
                 </div>
                 <div>
                   <label
-                    style="font-size: 11px"
                     title="이 σ에서 고해상도로 전환. 낮을수록 빠르지만 디테일(손 등) 손실 위험. 0.7 권장, 시드마다 다름"
                     >전환 σ</label
                   >
@@ -298,24 +174,17 @@
                     id="speedTransSigmas"
                     type="text"
                     value="0.7"
-                    style="width: 100%"
                   />
                 </div>
               </div>
-              <div
-                style="
-                  font-size: 10px;
-                  color: var(--muted, #888);
-                  margin-top: 4px;
-                "
-              >
+              <div class="warn-panel-note">
                 σ 낮을수록 빠름 (0.5~0.8). 디테일 깨지면 σ를 올리거나 SPEED
                 끄기. 결과는 시드마다 다름.
               </div>
             </div>
             <div id="resBucketChips" class="chips"></div>
-            <div id="resRatioChips" class="chips" style="margin-top: 5px"></div>
-            <div class="row" style="margin-top: 6px">
+            <div id="resRatioChips" class="chips"></div>
+            <div class="row">
               <div>
                 <label>가로 (px, 16배수)</label
                 ><input
@@ -382,20 +251,11 @@
                 />
               </div>
             </div>
-            <div style="display: flex; gap: 8px; align-items: stretch">
-              <button id="btnGen" disabled style="flex: 1">
+            <div class="btn-row">
+              <button id="btnGen" disabled>
                 생성 (큐에 추가)
               </button>
-              <button
-                id="btnCancel"
-                style="
-                  flex: 0 0 auto;
-                  width: auto;
-                  padding: 0 14px;
-                  background: #c0283c;
-                  display: none;
-                "
-              >
+              <button id="btnCancel" class="btn-danger" style="display: none">
                 ■ 중단
               </button>
             </div>
@@ -421,11 +281,7 @@
               <span class="sm-txt">세션 저장 (수동)</span>
             </span>
             <span id="savePrefixWrap">
-              <label
-                for="savePrefix"
-                style="margin: 0; color: var(--dim); font-size: 11px"
-                >접두사</label
-              >
+              <label for="savePrefix">접두사</label>
               <input
                 id="savePrefix"
                 type="text"
@@ -437,18 +293,11 @@
             </span>
           </div>
           <canvas id="canvas" width="1024" height="1024"></canvas>
-          <div
-            style="
-              display: flex;
-              gap: 8px;
-              align-items: stretch;
-              margin-top: 6px;
-            "
-          >
-            <button id="btnSave" class="secondary" disabled style="flex: 8">
+          <div class="btn-row">
+            <button id="btnSave" class="secondary" disabled>
               현재 이미지 저장
             </button>
-            <button id="btnSaveAll" class="secondary" disabled style="flex: 2">
+            <button id="btnSaveAll" class="secondary" disabled>
               전체 저장
             </button>
           </div>
@@ -460,37 +309,20 @@
         </div>
       </div>
 
-      <footer
-        style="
-          margin: 28px 0 8px;
-          padding-top: 16px;
-          border-top: 1px solid var(--border);
-          font-size: 11px;
-          line-height: 1.7;
-          color: var(--dim);
-        "
-      >
-        <div id="modelSourcesBlock" style="margin-bottom: 12px">
-          <span
-            style="
-              display: block;
-              margin-bottom: 6px;
-              font-size: 12px;
-              color: var(--text);
-            "
-            >파인튜닝 모델 출처 (Civitai)</span
-          >
-          <span id="modelSources" style="display: flex; flex-wrap: wrap; gap: 6px 16px"><!-- js/site.js가 config.js(MODEL_SOURCES)로 채운다 --></span>
+      <footer>
+        <div id="modelSourcesBlock">
+          <span id="modelSourcesTitle" class="footer-title">파인튜닝 모델 출처</span>
+          <span id="modelSources"><!-- js/site.js가 config.js(MODEL_SOURCES)로 채운다 --></span>
         </div>
-        <div style="padding-top: 12px; border-top: 1px solid var(--border)">
+        <div class="footer-legal">
           This page distributes a <b>modified</b> version of the Anima model
           (ONNX conversion, int8 weight quantization, and Turbo LoRA merge).
           This is an unofficial project and is not endorsed, approved, or
           validated by CircleStone Labs.<br />
           “The CircleStone Model is licensed by CircleStone Labs LLC under the
           <a
+            class="link"
             href="https://huggingface.co/circlestone-labs/Anima/blob/main/LICENSE.md"
-            style="color: var(--accent)"
             >CircleStone Non-Commercial License</a
           >. Copyright CircleStone Labs LLC. IN NO EVENT SHALL CIRCLESTONE LABS
           LLC BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
@@ -540,6 +372,17 @@
             >
           </span>
         </label>
+        <label class="adv-choice">
+          <input type="radio" name="precision" value="webnn" />
+          <span>
+            <b>WebNN (실험)</b>
+            <small id="advWebnnNote"
+              >브라우저의 WebNN으로 모델을 계산합니다. WebNN 그래프가 있는 모델에서 1024×1024로만 생성할 수 있고,
+              SPEED는 쓸 수 없으며 NegPip은 무시됩니다. LoRA는 표준과 같은 방식으로 붙습니다. 가중치(약 3.7GB)를 따로
+              내려받고, 쓸 수 없으면 표준으로 로드됩니다. 같은 시드라도 그림의 세부가 달라집니다.</small
+            >
+          </span>
+        </label>
       </fieldset>
       <div id="advStatus" class="stats"></div>
       <button id="btnAdvApply" type="button" hidden>지금 적용 (DiT 다시 로드)</button>
@@ -566,6 +409,17 @@
             <small
               >변화가 작은 스텝은 모델 계산을 건너뛰고 직전 결과로 추정합니다. 베이스(30스텝)는 약 30%, Turbo(8스텝)는
               0~10% 빨라지고, 그림의 세부가 조금 달라집니다. 다음 생성부터 바로 적용됩니다.</small
+            >
+          </span>
+        </label>
+        <label class="adv-choice">
+          <input type="checkbox" id="advSpectrum" />
+          <span>
+            <b>Spectrum (실험, WebNN 전용)</b>
+            <small id="advSpectrumNote"
+              >일부 스텝은 모델의 블록 계산을 건너뛰고, 앞 스텝들의 특징으로 예측해 출력층만 돌립니다. 베이스(30스텝)는 17스텝만
+              실제로 계산합니다. euler·er_sde 샘플러에서만 동작하고, 8스텝(Turbo)에서는 건너뛸 스텝이 없습니다. 켜면 EasyCache는
+              쓰지 않습니다. 다음 생성부터 바로 적용됩니다.</small
             >
           </span>
         </label>

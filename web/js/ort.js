@@ -16,6 +16,23 @@ const ort = await import(
 );
 ort.env.wasm.wasmPaths = ORT_BASE;
 ort.env.wasm.proxy = false; // WebGPU EP는 메인 스레드 상주 (검증된 구성)
+
+// ── WebNN 전용 ORT (고급 옵션 'WebNN'일 때만 로드) ──
+// 위 ort와 **다른 인스턴스**로 둔다. ORT Web 1.26은 브라우저가 WebNN 그래프 build()를 거부하면 세션 생성이
+// 영원히 대기하는데, 같은 인스턴스(jspi 번들도 WebNN EP가 있음)에서 그 일이 나면 이미 만든 WebGPU 세션의 run()까지
+// "WebGPU validation failed"로 깨진다. 인스턴스를 나누면 영향이 없다(2026-11-13 실측).
+// 다른 인스턴스가 만든 Tensor를 그대로 feed로 받는 것도 확인했다 — 호출부는 위 ort.Tensor를 계속 쓴다.
+const HAS_WEBNN = typeof navigator !== "undefined" && "ml" in navigator; // Chrome 157 기준 플래그 뒤
+// tag가 다르면 인스턴스도 따로다(같은 번들을 다른 URL로 import). DiT와 VAE를 나눠 올려, 한쪽 세션 생성이 멈춰도 다른 쪽이 살아 있게 한다.
+const ortWebnnPromises = {};
+function loadOrtWebnn(tag = "") {
+  return (ortWebnnPromises[tag] ??= (async () => {
+    const m = await import(ORT_BASE + "ort.all.bundle.min.mjs" + (tag ? "?i=" + tag : ""));
+    m.env.wasm.wasmPaths = ORT_BASE;
+    m.env.wasm.proxy = false;
+    return m;
+  })());
+}
 // ───────── fp16 ↔ fp32 ─────────
 // 최신 ORT Web은 브라우저가 네이티브 Float16Array를 지원하면 fp16 텐서 .data를
 // 비트패턴(Uint16Array)이 아닌 Float16Array(실제 float)로 반환한다. 양쪽 모두 대응.
@@ -105,4 +122,4 @@ function f32ToF16(f32) {
   return out;
 }
 
-export { HAS_F16, HAS_JSPI, disposeRun, disposeTensor, f16ToF32, f32ToF16, makeF16Tensor, ort, toF32 };
+export { HAS_F16, HAS_JSPI, HAS_WEBNN, disposeRun, disposeTensor, f16ToF32, f32ToF16, loadOrtWebnn, makeF16Tensor, ort, toF32 };

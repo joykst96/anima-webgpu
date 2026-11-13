@@ -1,7 +1,7 @@
-// 배포 구성(config.js)을 화면에 반영: 모델 드롭다운, 프롬프트 기본값, 출처 링크.
+// 배포 구성(config.js)을 화면에 반영: 모델 드롭다운, 프롬프트 기본값, 출처 링크, 태그 도우미 링크.
 // 예전엔 gen_models.py가 이 내용을 index.html에 직접 써 넣었다 — 이제 HTML은 배포와 무관하다.
 import { $ } from "./dom.js";
-import { CONVERT_URL, MODELS, MODEL_SOURCES, PROMPT_DEFAULTS, SELECTED_MODEL } from "./config.js";
+import { CONVERT_URL, MODELS, MODEL_SOURCES, MODEL_SOURCES_TITLE, PROMPT_DEFAULTS, SELECTED_MODEL, TAG_HELPER_URL } from "./config.js";
 
 // 다른 모듈이 modelSel.value를 읽기 전에 호출해야 한다 (main.js 맨 앞).
 export function renderSiteDefaults() {
@@ -21,6 +21,7 @@ export function renderSiteDefaults() {
 
   // 파인튜닝 모델 출처 링크 (출처가 하나도 없는 배포면 제목째 숨김)
   $("modelSourcesBlock").hidden = !MODEL_SOURCES.length;
+  $("modelSourcesTitle").textContent = MODEL_SOURCES_TITLE;
   const box = $("modelSources");
   for (const { label, url } of MODEL_SOURCES) {
     const a = document.createElement("a");
@@ -33,4 +34,10 @@ export function renderSiteDefaults() {
 
   // 변환 페이지 링크 ('사용자 설정' 안내문). 별도 서브도메인이면 배포 목록의 convert_url, 없으면 HTML 기본값(convert/)
   if (CONVERT_URL) $("convertLink").href = CONVERT_URL;
+
+  // 태그 도우미 배지 (긍정 프롬프트 라벨 옆). 배포 목록에 tag_helper_url이 있을 때만 보인다
+  if (TAG_HELPER_URL) {
+    $("tagHelper").href = TAG_HELPER_URL;
+    $("tagHelper").hidden = false;
+  }
 }

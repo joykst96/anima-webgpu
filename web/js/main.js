@@ -25,7 +25,7 @@ initLightbox();
 (async () => {
   const fail = (msg) => {
     $("gpuInfo").innerHTML =
-      `<span style="color:var(--err)">${msg}</span>`;
+      `<span class="text-danger">${msg}</span>`;
     $("btnLoad").disabled = true;
   };
   if (!window.isSecureContext)
@@ -51,16 +51,16 @@ initLightbox();
   const bufGB = adapter.limits.maxBufferSize / 2 ** 30;
   const warn =
     bufGB < 2
-      ? ' · <span style="color:var(--err)">maxBufferSize가 작아 DiT 로드가 실패할 수 있음</span>'
+      ? ' · <span class="text-danger">maxBufferSize가 작아 DiT 로드가 실패할 수 있음</span>'
       : "";
   const engine = HAS_JSPI
-    ? '<span style="color:var(--ok)">native EP (jspi)</span>'
-    : '<span style="color:var(--warn)">JSEP ⚠ — DP4A·FlashAttention 가속 불가 (Chrome/Edge 권장)</span>';
+    ? '<span class="text-success">native EP (jspi)</span>'
+    : '<span class="text-warning">JSEP ⚠ — DP4A·FlashAttention 가속 불가 (Chrome/Edge 권장)</span>';
   $("gpuInfo").innerHTML =
-    `WebGPU OK · shader-f16 <span style="color:var(--ok)">지원</span>` +
+    `WebGPU OK · shader-f16 <span class="text-success">지원</span>` +
     ` · maxBufferSize ${bufGB.toFixed(1)}GB` +
     ` · 엔진 ${engine}${warn}` +
-    `<br><span style="color:var(--dim)">권장: VRAM 8GB+ · 최초 로드 시 ~2.5GB 다운로드 (이후 캐시)</span>`;
+    `<br><span class="text-muted">권장: VRAM 8GB+ · 최초 로드 시 ~3.6GB 다운로드, 다른 모델은 ~2GB씩 추가 (이후 캐시)</span>`;
 })();
 
 $("btnLoad").onclick = loadAll;

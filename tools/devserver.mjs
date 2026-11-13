@@ -3,10 +3,12 @@
 //   localhost라 secure context 예외가 적용돼 WebGPU/OPFS가 동작한다.
 //   프록시는 GET/HEAD만 통과시킨다 — 운영 서버 상태를 바꾸는 요청은 보내지 않는다.
 //
-//   node tools/devserver.mjs [--port 5173] --upstream <가중치 서버 http://host:port> [--local-out out-local]
+//   node tools/devserver.mjs [--port 5173] --upstream <가중치 서버 http://host:port> [--local-out out-local] [--config <config.js>]
 //   --upstream: 없으면 환경변수 ANIMA_UPSTREAM. 둘 다 없으면 프록시 경로는 502 (로컬 파일·--local-out만 서빙).
 //   --local-out: /out/<경로>가 이 디렉터리에 있으면 프록시 대신 로컬 파일을 준다
 //                (운영 서버에 올리기 전 새 그래프를 검증할 때. 없으면 평소처럼 프록시).
+//   --config: /js/config.js 요청에 web/js/config.js 대신 이 파일을 준다 (레포의 기본 구성을 건드리지 않고
+//             자기 배포 구성으로 페이지를 띄울 때. gen_models.py --out으로 만든 파일).
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
@@ -24,13 +26,23 @@ const TOOLS = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(TOOLS, "../web");
 const PROXY_PREFIXES = ["/out/", "/tokenizers/"];
 const LOCAL_OUT = opt("--local-out", null) && path.resolve(opt("--local-out"));
+const CONFIG = opt("--config", null) && path.resolve(opt("--config"));
+if (CONFIG && !fs.existsSync(CONFIG)) {
+  console.error(`--config 파일이 없음: ${CONFIG}`);
+  process.exit(1);
+}
 
-// --local-out에 같은 경로의 파일이 있으면 그 경로를 돌려준다
+// --local-out에 같은 경로의 파일이 있으면 그 경로를 돌려준다.
+// 토크나이저는 레포 루트의 tokenizers/(prepare_tokenizers.py 산출물, git 제외)에 있으면 그것을 준다 — 가중치 서버 없이도 페이지가 뜨게.
+const LOCAL_TOK = path.resolve(TOOLS, "../tokenizers");
 function localOverride(req) {
-  if (!LOCAL_OUT || !req.url.startsWith("/out/")) return null;
-  const rel = decodeURIComponent(new URL(req.url, "http://x").pathname).slice("/out/".length);
-  const file = path.resolve(LOCAL_OUT, rel);
-  return file.startsWith(LOCAL_OUT + path.sep) && fs.existsSync(file) && fs.statSync(file).isFile() ? file : null;
+  const urlPath = decodeURIComponent(new URL(req.url, "http://x").pathname);
+  for (const [prefix, dir] of [["/out/", LOCAL_OUT], ["/tokenizers/", LOCAL_TOK]]) {
+    if (!dir || !urlPath.startsWith(prefix)) continue;
+    const file = path.resolve(dir, urlPath.slice(prefix.length));
+    if (file.startsWith(dir + path.sep) && fs.existsSync(file) && fs.statSync(file).isFile()) return file;
+  }
+  return null;
 }
 
 const MIME = {
@@ -114,11 +126,12 @@ function serveStatic(req, res) {
   const isTool = urlPath.startsWith("/__tools/");
   const base = isTool ? TOOLS : ROOT;
   const rel = isTool ? urlPath.slice("/__tools/".length) : urlPath.slice(1) + (urlPath.endsWith("/") ? "index.html" : ""); // nginx index와 같게
-  const file = path.resolve(base, rel);
+  let file = path.resolve(base, rel);
   if (!file.startsWith(base + path.sep)) {
     res.writeHead(403).end();
     return;
   }
+  if (CONFIG && urlPath === "/js/config.js") file = CONFIG; // --config: 배포 구성 바꿔 끼우기
   fs.stat(file, (err, st) => {
     if (err || !st.isFile()) {
       res.writeHead(404).end("not found");

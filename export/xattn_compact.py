@@ -13,7 +13,7 @@
 # 끄면(전체 인덱스 + bias 0) Gather는 그대로 복사, +0은 정확 → 종전과 같은 결과(골든 해시 일치로 검증).
 # fp16 구역 변환(fp16_zones.py)은 이 뒤에 적용한다.
 #
-#   python -I tools/graph/xattn_compact.py <src.onnx> <dst.onnx>
+#   python -I export/xattn_compact.py <src.onnx> <dst.onnx>
 import sys
 import numpy as np
 import onnx

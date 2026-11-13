@@ -8,7 +8,7 @@
 #   - MatMulNBits는 그대로(DP4A, accuracy_level 4) — 입력만 fp16, scales는 Cast(로드 시 상수 접힘)
 # 경계에는 Cast만 넣는다(fp32→fp16 입력, fp16→fp32 출력).
 #
-#   python -I tools/graph/fp16_zones.py <src.onnx> <dst.onnx> --fast
+#   python -I export/fp16_zones.py <src.onnx> <dst.onnx> --fast
 #   --fast = --keep-matmul --keep-mod --keep-norm (페이지 '빠르게' 모드, 실측: 현재 대비 오차 2.9/1.8/1.6%, DiT −11%)
 #   개별 옵션은 실험용 — 전부 fp16(옵션 없음)은 DP4A에 fp16 입력이 들어가 오차 18%.
 import sys, collections

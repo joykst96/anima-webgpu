@@ -1,37 +1,47 @@
 <!doctype html>
-<html lang="ko">
+<html lang="ko" data-theme="dark">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <link rel="icon" href="data:," />
     <title>Anima 체크포인트 변환</title>
+    <link rel="stylesheet" href="../css/tokens.css" />
     <link rel="stylesheet" href="../css/app.css" />
     <style>
       .wrap {
-        max-width: 640px;
+        max-width: var(--layout-max-width-narrow);
       }
       .row-chk {
         display: flex;
         align-items: center;
-        gap: 6px;
-        margin-top: 8px;
+        gap: var(--space-1_5);
+        margin-top: var(--space-2);
       }
       .row-chk input {
         width: auto;
         margin: 0;
       }
       .note {
-        font-size: 12px;
-        color: var(--dim);
-        margin: 4px 0 0;
+        font-size: var(--font-size-sm);
+        color: var(--color-fg-muted);
+        margin: var(--space-1) 0 0;
+      }
+      .note-md {
+        font-size: var(--font-size-md);
+      }
+      label[for="convName"] {
+        margin-top: var(--space-2);
+      }
+      #btnConvert {
+        margin-top: var(--space-2_5);
       }
       #outList a {
-        color: var(--accent);
+        color: var(--color-accent);
         display: block;
       }
       #outList .grp {
-        margin-top: 8px;
-        color: var(--text);
+        margin-top: var(--space-2);
+        color: var(--color-fg);
       }
     </style>
   </head>
@@ -47,9 +57,13 @@
         <input id="convCkpt" type="file" accept=".safetensors" />
         <label class="row-chk"><input id="convTurbo" type="checkbox" />Turbo 변형도 만들기 (Turbo LoRA 파일 선택)</label>
         <input id="convLora" type="file" accept=".safetensors" disabled />
-        <label for="convName" style="margin-top: 8px">결과 폴더 이름</label>
+        <label class="row-chk"><input id="convWebnn" type="checkbox" />WebNN용 파일도 만들기 (변형당 3.7GB 추가)</label>
+        <div class="note">
+          생성 페이지 고급 옵션의 연산 정밀도 'WebNN (실험)'에서 쓰는 fp16 그래프·가중치와 Spectrum용 그래프를 같은 폴더에 더합니다.
+        </div>
+        <label for="convName">결과 폴더 이름</label>
         <input id="convName" type="text" placeholder="비우면 체크포인트 파일 이름" />
-        <button id="btnConvert" disabled style="margin-top: 10px">변환</button>
+        <button id="btnConvert" disabled>변환</button>
         <div class="note" id="saveMode"></div>
         <div class="bar"><i id="convBar"></i></div>
         <div id="convStat" class="stats"></div>
@@ -57,10 +71,11 @@
       </div>
       <div class="panel">
         <h2>생성 페이지에서 쓰기</h2>
-        <div class="note" style="font-size: 13px">
+        <div class="note note-md">
           모델 → <b>사용자 설정 (직접 모델 지정)</b> → DiT 모델 파일에서 결과 폴더(<code>…_base</code> 또는
           <code>…_turbo</code>) 안의 파일을 <b>전부</b> 선택한 뒤 모델 로드. LoRA·'빠르게' 모드도 서버 모델과 똑같이 동작합니다.
-          크기는 변형당 2.3GB(Turbo 포함 4.6GB).
+          크기는 변형당 2.3GB(Turbo 포함 4.6GB). WebNN용 파일을 함께 만들었으면 변형당 6.0GB이고, 고급 옵션에서
+          'WebNN (실험)'을 고르면 그 파일로 로드합니다(LoRA·Spectrum 포함).
         </div>
       </div>
     </div>

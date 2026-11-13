@@ -32,6 +32,9 @@
 
 사용 (한 줄):
   python export/add_lora_slots.py --src out/dit/anima_dit_turbo32_q8a4ns.onnx --out out/dit/anima_dit_turbo32_q8a4nLs.onnx --rank 48
+
+WebNN용 fp16 그래프(export/webnn/)에도 그대로 쓴다: 융합 전 그래프라 --fuse-meta 없이 Softmax 앵커로 식별하고,
+타깃이 fp16 MatMul이면 브랜치를 fp16으로 만든다(lora.bin·manifest 레이아웃은 운영 그래프와 같다).
 """
 import argparse
 import json
@@ -350,14 +353,14 @@ def main():
     init_names = {i.name for i in graph.initializer}
     r = args.rank
 
-    # ⚠️ [fp16 비호환 주의] 이 스크립트는 LoRA A/B 텐서와 lora_scale, 그리고
-    #   브랜치 말미의 Add를 전부 fp32로 만든다(아래 F32). fp32-act DiT는 타깃
-    #   프로젝션 출력 y_out이 fp32라 Add(y_out, lora_xs)의 dtype이 맞는다.
-    #   그러나 fp16-act DiT는 y_out이 fp16이라 Add(fp16, fp32) 불일치가 생겨
-    #   로드/실행이 깨진다. → fp16 모델에 슬롯을 붙이려면 A/B/lora_scale/Add를
-    #   모두 fp16으로 바꾸거나 Add 직전에 명시 Cast를 넣어야 한다(미구현).
-    #   현재 파이프라인은 fp32-act 기본이므로 이 스크립트도 fp32 고정으로 둔다.
+    # dtype: lora.bin(A/B)과 lora_scale 입력은 항상 fp32다 — 페이지의 변환 워커와 manifest 레이아웃이 그래프 종류와 무관하게 같다.
+    #   타깃 프로젝션이 fp32 출력이면(운영 그래프: MatMulNBits, --fp32-act) 브랜치도 fp32 그대로.
+    #   타깃이 fp16 가중치의 MatMul이면(WebNN용 fp16 그래프) 브랜치를 fp16으로 계산한다:
+    #   A/B에 Cast(fp16)를 걸고(세션 생성 때 상수로 접힌다) lora_scale도 Cast 하나를 거쳐 곱한다.
     F32 = TensorProto.FLOAT
+    F16 = TensorProto.FLOAT16
+    init_dtype = {i.name: i.data_type for i in graph.initializer}
+    n16 = 0
 
     # lora_scale 입력 (스칼라, fp32 — 위 경고 참조)
     graph.input.append(helper.make_tensor_value_info("lora_scale", F32, [1]))
@@ -400,11 +403,17 @@ def main():
 
             x_in = node.input[0]
             y_out = node.output[0]
-            n_a = helper.make_node("MatMul", [x_in, tA], [f"lora_{key}_xa"],
+            casts, a_in, b_in, s_in = [], tA, tB, "lora_scale"
+            if node.op_type == "MatMul" and init_dtype.get(node.input[1]) == F16:
+                a_in, b_in, s_in = tA + "_f16", tB + "_f16", "lora_scale_f16"
+                casts = [helper.make_node("Cast", [tA], [a_in], to=F16, name=f"lora_{key}_ca"),
+                         helper.make_node("Cast", [tB], [b_in], to=F16, name=f"lora_{key}_cb")]
+                n16 += 1
+            n_a = helper.make_node("MatMul", [x_in, a_in], [f"lora_{key}_xa"],
                                    name=f"lora_{key}_ma")
-            n_b = helper.make_node("MatMul", [f"lora_{key}_xa", tB],
+            n_b = helper.make_node("MatMul", [f"lora_{key}_xa", b_in],
                                    [f"lora_{key}_xb"], name=f"lora_{key}_mb")
-            n_s = helper.make_node("Mul", [f"lora_{key}_xb", "lora_scale"],
+            n_s = helper.make_node("Mul", [f"lora_{key}_xb", s_in],
                                    [f"lora_{key}_xs"], name=f"lora_{key}_ms")
             y_new = f"{y_out}_lora"
             n_add = helper.make_node("Add", [y_out, f"lora_{key}_xs"], [y_new],
@@ -417,7 +426,7 @@ def main():
             for go in graph.output:
                 if go.name == y_out:
                     go.name = y_new
-            new_nodes_at.append((node, [n_a, n_b, n_s, n_add]))
+            new_nodes_at.append((node, casts + [n_a, n_b, n_s, n_add]))
             if args.dump:
                 print(f"  b{b:02d} {mod:34s} <- {node.name} ({K}x{N})")
 
@@ -428,8 +437,13 @@ def main():
         for j, nn in enumerate(nns):
             graph.node.insert(at + j, nn)
 
+    if n16:
+        # fp16 브랜치가 쓰는 스칼라. 그래프 맨 앞에 둔다(입력에만 의존).
+        graph.node.insert(0, helper.make_node("Cast", ["lora_scale"], ["lora_scale_f16"], to=F16,
+                                              name="lora_scale_cast_f16"))
+        manifest["slot_dtype_f16"] = n16      # 정보용 — 페이지는 읽지 않는다
     total = offset
-    print(f"[insert] 슬롯 {len(manifest['entries'])}개 · lora.bin {total/2**20:.1f} MiB (fp32)")
+    print(f"[insert] 슬롯 {len(manifest['entries'])}개 (fp16 브랜치 {n16}개) · lora.bin {total/2**20:.1f} MiB (fp32)")
 
     onnx.save_model(model, args.out)
 

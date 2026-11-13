@@ -1,4 +1,4 @@
-# config.js의 모든 DiT 그래프(8모델 × base/turbo × 일반/LoRA 슬롯 = 32개)에 그래프 후처리를 적용해 배포용 파일을 만든다.
+# 배포 구성(config.js)의 모든 DiT 그래프(모델 × base/turbo × 일반/LoRA 슬롯)에 그래프 후처리를 적용해 배포용 파일을 만든다.
 # 운영 서버에서 원본 그래프 .onnx만 HTTP GET으로 받는다(가중치 샤드는 받지 않음 — 결과물이 원본 샤드를 그대로 참조).
 #   <그래프>_x.onnx    : 표준 + cross-attention 패딩 압축 입력(xattn_compact.py). 운영 nginx가 .onnx를 1년 immutable로
 #                        캐시시키므로 같은 이름 교체는 기존 사용자에게 반영되지 않는다 → 반드시 새 이름.
@@ -6,11 +6,12 @@
 #   <그래프>_f16.onnx  : 위 + 블록 내부 fp16(fp16_zones.py --fast) — 페이지 '빠르게' 모드
 # 결과는 out-local/에 같은 경로로 저장 → devserver --local-out으로 검증, 운영 out/dit/에 그대로 업로드.
 #
-#   python -I tools/graph/make_fast_graphs.py --upstream <가중치 서버 http://host:port> [--only anima_turbo]
-#   (--upstream이 없으면 환경변수 ANIMA_UPSTREAM)
+#   python -I export/make_fast_graphs.py --upstream <가중치 서버 http://host:port> [--only anima_turbo] [--config <config.js>]
+#   (--upstream이 없으면 환경변수 ANIMA_UPSTREAM. --config가 없으면 레포의 web/js/config.js —
+#    자기 배포 구성을 따로 두었으면(gen_models.py --out) 그 파일을 준다)
 import os, re, subprocess, sys, urllib.request
 
-ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 HERE = os.path.dirname(os.path.abspath(__file__))
 args = sys.argv[1:]
 upstream = args[args.index("--upstream") + 1] if "--upstream" in args else os.environ.get("ANIMA_UPSTREAM")
@@ -18,7 +19,8 @@ if not upstream:
     sys.exit("--upstream <가중치 서버> 또는 환경변수 ANIMA_UPSTREAM 필요")
 only = args[args.index("--only") + 1] if "--only" in args else None
 
-config = open(os.path.join(ROOT, "web", "js", "config.js"), encoding="utf-8").read()
+config_path = args[args.index("--config") + 1] if "--config" in args else os.path.join(ROOT, "web", "js", "config.js")
+config = open(config_path, encoding="utf-8").read()
 paths = []
 for m in re.finditer(r"^\s{2}(\w+): \{(.*?)^\s{2}\},", config, re.S | re.M):
     if only and m.group(1) != only:

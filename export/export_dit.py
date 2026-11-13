@@ -94,6 +94,9 @@ def main():
                         "모델 내부 autocast/캐스트 분기로 fp16<->fp32 왕복 Cast가 "
                         "폭증(6->763)해 1~2초 느려진다(검증 2026-06). 기본 권장. "
                         "가중치는 이후 quantize_dit로 int8/int4 양자화하면 됨.")
+    p.add_argument("--blocks", type=int, default=0,
+                   help="실험용: 앞에서 N개 블록만 남기고 export (0 = 전부). "
+                        "출력은 원본과 다르다 — op 배정·블록당 시간만 보는 축소 리허설용.")
     args = p.parse_args()
 
     setup_comfyui(args.comfyui)
@@ -125,6 +128,10 @@ def main():
         dit = patcher.model.diffusion_model
         dit.eval().to(args.device)
         print("[lora] 머지 완료 (가중치 실체화됨)")
+
+    if args.blocks:
+        dit.blocks = dit.blocks[:args.blocks]
+        print(f"[blocks] 앞 {args.blocks}개 블록만 남김 (실험용 축소 그래프)")
 
     n_params = sum(t.numel() for t in dit.parameters())
     print(f"[load] 파라미터 수: {n_params / 1e9:.2f}B")

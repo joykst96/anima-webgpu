@@ -5,11 +5,16 @@
 // 반납되므로 정점이 띠 크기에 묶인다. tail은 국소 연산만 있어(수용영역 반경 14.7 latent 실측) halo 16으로
 // 잘라 붙이면 단일 호출과 비트 동일하다(1280²·1536² 실측). 분할 그래프는 export/split_vae.py 산출물.
 import { LAT_C } from "./constants.js";
+import { log } from "./dom.js";
 import { sess } from "./loader.js";
 import { HAS_F16, disposeRun, disposeTensor, makeF16Tensor, ort } from "./ort.js";
 
 const VAE_HALO = 16; // latent 단위, 수용영역 반경 117.5px(14.7 latent)보다 크게
-const VAE_STRIP_AREA = 128 * 128; // 띠 하나의 입력 latent 면적 상한 = 1024² 한 번과 같은 정점 메모리
+const VAE_STRIP_AREA = 128 * 128; // 띠 하나의 입력 latent 면적 상한 (띠 2개 이상일 때)
+// 띠 없이 한 번에 돌리는 면적 상한. 이보다 크면 최소 2개로 나눈다 — 1024²급(832×1216 등 포함)이 한 번에 돌면 일시 VRAM이 +7~8GB라
+// 정점이 14.8GB까지 올라가고, 여유가 적은 카드에서는 페이징으로 VAE가 수 초씩 느려진다. 2개로 나누면 +3.4GB(정점 11.1GB), 그림은 비트 동일,
+// VAE 시간은 halo를 겹쳐 계산하는 만큼 늘어난다(2026-11-13 실측). 768² 이하와 1280² 이상은 종전과 같다.
+const VAE_SINGLE_AREA = 80 * 128;
 // head의 mid-block 어텐션(latent 해상도 전역)을 쿼리 청크별 run으로 나누는 기준. 한 run 안에선 8청크의 score·prob가
 // 전부 살아 있어 1536²에서 청크당 680MB×2 × 8이 쌓인다. 1024² 이하는 한 run이 더 빠르다.
 const VAE_ATTN_SPLIT_TOKENS = 128 * 128;
@@ -48,9 +53,9 @@ async function runHead(vaeIn, H, W) {
   return { mid: bo[Object.keys(bo)[0]], release: () => disposeRun(bo) };
 }
 
-// 입력 면적이 상한 이하가 되는 가장 적은 띠 수와 각 띠의 [코어 시작, 끝, 입력 시작, 끝]
+// 입력 면적이 상한 이하가 되는 가장 적은 띠 수(면적이 VAE_SINGLE_AREA를 넘으면 2개부터)와 각 띠의 [코어 시작, 끝, 입력 시작, 끝]
 function planStrips(H, W) {
-  for (let n = 1; ; n++) {
+  for (let n = H * W <= VAE_SINGLE_AREA ? 1 : 2; ; n++) {
     const S = Math.ceil(H / n),
       strips = [];
     for (let y0 = 0; y0 < H; y0 += S) {
@@ -64,6 +69,25 @@ function planStrips(H, W) {
 // xf: fp32 latent (LAT_C·H·W). 반환 img는 fp32 (1,3,8H,8W) [-1,1]. 판독 후 release()로 텐서를 반환한다.
 async function decodeLatent(xf, H, W) {
   const vaeIn = makeF16Tensor(xf, [1, LAT_C, 1, H, W]);
+  // WebNN VAE(loader.js loadWebnnVae): 그 크기 전용 fp16 그래프를 한 번에 돌린다. 실행이 실패하면 내리고 아래 WebGPU 경로로 디코드한다.
+  const wn = sess.vaeWebnn;
+  if (wn && wn.lat.h === H && wn.lat.w === W) {
+    try {
+      const vo = await wn.run({ latent: vaeIn });
+      return {
+        img: vo[wn.outputNames[0]].data,
+        release() {
+          disposeTensor(vaeIn);
+          disposeRun(vo);
+        },
+      };
+    } catch (e) {
+      console.error(e);
+      log(`VAE(WebNN) 실행 실패 — ${e.message}. 기존 경로(WebGPU)로 디코드`, "err");
+      sess.vaeWebnn = null;
+      wn.release().catch(() => {});
+    }
+  }
   if (!(sess.vaeHead && sess.vaeTail)) {
     const vo = await sess.vae.run({ latent: vaeIn });
     return {

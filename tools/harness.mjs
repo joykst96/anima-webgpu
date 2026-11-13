@@ -19,28 +19,35 @@ const ORT_URL = "/js/ort.js";
 
 // ── ORT 호출 시간 계측 (페이지와 같은 모듈 인스턴스를 import해 prototype을 감싼다) ──
 export async function installTiming() {
-  const { ort } = await import(ORT_URL);
+  const { ort, loadOrtWebnn } = await import(ORT_URL);
   window.__bench ??= { runs: [], creates: [] };
-  const P = ort.InferenceSession.prototype;
-  if (P.__patched) return;
-  const origRun = P.run;
-  P.run = async function (...a) {
-    const n = this.inputNames || [];
-    const kind = n.includes("timesteps") ? "dit" : n.includes("qwen_hidden_states") ? "adapter"
-      : n.includes("input_ids") ? "te" : n.includes("latent") ? "vae" : "?";
-    const t0 = performance.now();
-    const r = await origRun.apply(this, a);
-    window.__bench.runs.push({ kind, ms: performance.now() - t0, at: t0 });
-    return r;
+  const patch = (o) => {
+    const P = o.InferenceSession.prototype;
+    if (P.__patched) return;
+    const origRun = P.run;
+    P.run = async function (...a) {
+      const n = this.inputNames || [];
+      const kind = n.includes("spectrum_feat") || n.includes("coef") ? "head" : n.includes("timesteps") ? "dit" : n.includes("qwen_hidden_states") ? "adapter"
+        : n.includes("input_ids") ? "te" : n.includes("latent") ? "vae" : "?";
+      const t0 = performance.now();
+      const r = await origRun.apply(this, a);
+      window.__bench.runs.push({ kind, ms: performance.now() - t0, at: t0 });
+      return r;
+    };
+    const origCreate = o.InferenceSession.create;
+    o.InferenceSession.create = async function (...a) {
+      const t0 = performance.now();
+      const s = await origCreate.apply(this, a);
+      window.__bench.creates.push({ inputs: s.inputNames.join(","), ms: performance.now() - t0 });
+      return s;
+    };
+    P.__patched = true;
   };
-  const origCreate = ort.InferenceSession.create;
-  ort.InferenceSession.create = async function (...a) {
-    const t0 = performance.now();
-    const s = await origCreate.apply(this, a);
-    window.__bench.creates.push({ inputs: s.inputNames.join(","), ms: performance.now() - t0 });
-    return s;
-  };
-  P.__patched = true;
+  patch(ort);
+  // 고급 옵션이 WebNN이면 DiT는 별도 ORT 인스턴스에서 돈다(ort.js loadOrtWebnn) → 그쪽도 계측. 표준·빠르게에서는 로드하지 않는다.
+  let precision = null;
+  try { precision = JSON.parse(localStorage.getItem("anima.settings.v1") || "{}").precision; } catch {}
+  if (precision === "webnn" && loadOrtWebnn) { patch(await loadOrtWebnn()); patch(await loadOrtWebnn("vae")); patch(await loadOrtWebnn("head")); } // VAE·Spectrum 머리는 또 다른 인스턴스
 }
 
 // ── 결정적 합성 LoRA (.safetensors) ──
@@ -153,6 +160,13 @@ async function newestHash() {
   return r;
 }
 
+// 실제 LoRA 파일: dev 서버가 주는 주소에서 받는다 (예: --local-out 폴더의 /out/loras/x.safetensors). 케이스에 loras: [{ url, weight }]
+async function fetchLoraFile(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`LoRA ${url}: ${r.status}`);
+  return new File([await r.arrayBuffer()], url.split("/").pop());
+}
+
 async function setLoras(list) {
   // 기존 행 전부 제거 후 필요한 만큼 추가
   for (const row of [...$("loraList").children]) row.querySelector("button").click();
@@ -197,10 +211,10 @@ export const CASES = [
 export async function runCase(c0) {
   const c = { ...BASE, ...c0 };
   let loraStat = null;
-  const wantLora = JSON.stringify(c.loras.map((l) => [l.synth, l.weight]));
+  const wantLora = JSON.stringify(c.loras.map((l) => [l.synth ?? l.url, l.weight]));
   if (window.__goldenLoraKey !== wantLora) {
     const list = [];
-    for (const l of c.loras) list.push({ file: await makeSyntheticLora(l.synth), weight: l.weight });
+    for (const l of c.loras) list.push({ file: l.url ? await fetchLoraFile(l.url) : await makeSyntheticLora(l.synth), weight: l.weight });
     loraStat = await setLoras(list);
     window.__goldenLoraKey = wantLora;
   }
@@ -230,6 +244,7 @@ export async function runCase(c0) {
   const r = {
     name: c.name, wh: img.wh, sha: img.sha, ms: Math.round(ms),
     dit: Math.round(sum("dit")), ditCalls: runs.filter((r) => r.kind === "dit").length, vae: Math.round(sum("vae")),
+    head: Math.round(sum("head")), headCalls: runs.filter((r) => r.kind === "head").length, // Spectrum 머리(예측 스텝)
     te: Math.round(sum("te")), adapter: Math.round(sum("adapter")),
     ditSteps: runs.filter((r) => r.kind === "dit").map((r) => Math.round(r.ms)), loraStat,
     wall: [wall0, Date.now()], // VRAM 로그(nvidia-smi) 대조용

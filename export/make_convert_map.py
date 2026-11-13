@@ -18,6 +18,11 @@ Anima 2B(28블록) 계열은 그래프 구조가 같고, 그래프의 가중치�
     --ckpt ComfyUI\\models\\diffusion_models\\anima-base-v1.0.safetensors ^
     --build ..\\work\\animav10 --prefix animav10 --out <repo>\\web\\convert\\anima2b.map.json --check
   --prefix: 템플릿 빌드의 build_dit.bat 접두사(그래프 이름 <prefix>_dit_{dyn32,turbo32}_*). 변환 결과 파일 이름도 이것을 따른다.
+
+WebNN용 그래프(export/webnn/build_webnn.bat 산출물)의 매핑표는 --webnn으로 따로 만든다:
+  … --build <WebNN 그래프 폴더> --prefix animav10 --out <repo>\\web\\convert\\anima2b.wnn.map.json --webnn --check
+  가중치가 fp16이라 kind는 f16/f16T뿐이고, 그래프는 변형당 6개(일반·슬롯, 각각의 _sp, Spectrum 머리 2종),
+  외부 데이터는 샤드 10개 + 머리의 .data다. 슬롯 그래프의 lora.bin은 페이지가 만들므로 다루지 않는다.
 """
 import argparse
 import base64
@@ -32,6 +37,11 @@ import numpy as np
 
 STEMS = {}  # main()에서 --prefix로 채운다: {"base": "<prefix>_dit_dyn32", "turbo": "<prefix>_dit_turbo32"}
 GRAPHS = ["_q8a4fns", "_q8a4fns_x", "_q8a4fns_f16", "_q8a4fnLs", "_q8a4fnLs_x", "_q8a4fnLs_f16"]
+LAYOUT = ["_q8a4fns"]          # 외부 데이터 배치를 읽을 그래프 (샤드 목록은 첫 그래프의 manifest)
+# --webnn (export/webnn/build_webnn.bat 산출물)
+WNN = "_wnn1024"
+GRAPHS_WNN = [f"_q8a4fns{WNN}", f"_q8a4fnLs{WNN}", f"_q8a4fns{WNN}_sp", f"_q8a4fnLs{WNN}_sp", f"_q8a4fns{WNN}_head", f"_q8a4fns{WNN}_headk"]
+LAYOUT_WNN = [f"_q8a4fns{WNN}", f"_q8a4fns{WNN}_head"]
 BLOCK = 32
 # ONNX TensorProto.DataType
 FLOAT, UINT8, FLOAT16 = 1, 2, 10
@@ -171,28 +181,40 @@ def main():
     p.add_argument("--prefix", default="animav10", help="템플릿 빌드 접두사 (build_dit.bat의 prefix)")
     p.add_argument("--out", required=True, help="매핑표 JSON")
     p.add_argument("--check", action="store_true", help="매핑표만으로 베이스 샤드·그래프를 재조립해 바이트 대조")
+    p.add_argument("--webnn", action="store_true", help="WebNN용 그래프(build_webnn.bat 산출물)의 매핑표를 만든다")
     args = p.parse_args()
+    graphs_list, layout_list = (GRAPHS_WNN, LAYOUT_WNN) if args.webnn else (GRAPHS, LAYOUT)
     STEMS.update(base=f"{args.prefix}_dit_dyn32", turbo=f"{args.prefix}_dit_turbo32")
 
     t0 = time.time()
     sd = read_safetensors(args.ckpt, skip=lambda k: ".llm_adapter." in k)
     print(f"[ckpt] DiT 텐서 {len(sd)}개 ({time.time() - t0:.1f}s)")
 
-    # 후보 바이트 해시: (key, kind) — kind: f32 | f32T | f16 | f16T | q8B | q8S
+    # 후보 바이트 해시: (key, kind) — kind: f32 | f32T | f16 | f16T | q8B | q8S  (--webnn: f16 | f16T | f32r16 | f32r16T)
     cand = {}
 
     def add(key, kind, data):
         cand.setdefault(h(data), []).append((key, kind))
 
     for k, w in sd.items():
-        add(k, "f32", w.tobytes())
         add(k, "f16", w.astype(np.float16).tobytes())
+        if args.webnn:
+            # WebNN 그래프는 체크포인트를 fp16으로 읽은 것이라 fp32로 저장된 텐서도 값은 fp16 반올림을 거쳤다(f32r16).
+            # bf16은 대부분 fp16으로 정확히 옮겨지지만 아주 작은 값(fp16 정규 범위 밖)은 달라지고, F32 체크포인트는 전부 달라진다.
+            r16 = w.astype(np.float16).astype(np.float32)
+            add(k, "f32r16", r16.tobytes())
+        else:
+            add(k, "f32", w.tobytes())
         if w.ndim == 2:
-            add(k, "f32T", np.ascontiguousarray(w.T).tobytes())
             add(k, "f16T", np.ascontiguousarray(w.T).astype(np.float16).tobytes())
-            q, s = quant8(w)
-            add(k, "q8B", q.tobytes())
-            add(k, "q8S", s.tobytes())
+            if args.webnn:
+                add(k, "f32r16T", np.ascontiguousarray(r16.T).tobytes())
+            else:
+                add(k, "f32T", np.ascontiguousarray(w.T).tobytes())
+            if not args.webnn:                 # WebNN 그래프는 fp16 가중치뿐 — int8 후보는 만들지 않는다(시간 절약)
+                q, s = quant8(w)
+                add(k, "q8B", q.tobytes())
+                add(k, "q8S", s.tobytes())
     print(f"[cand] 후보 해시 {len(cand)}개 ({time.time() - t0:.1f}s)")
 
     def resolve(name, hits):
@@ -212,25 +234,40 @@ def main():
                 shard_cache[path] = f.read()
         return shard_cache[path]
 
-    result = {"format": "anima2b-convert-map", "version": 1, "block": BLOCK, "stems": STEMS}
+    result = {"format": "anima2b-convert-map" + ("-webnn" if args.webnn else ""), "version": 1, "block": BLOCK, "stems": STEMS}
     used = {}  # key → set(kind)
 
     # ── 1) 샤드 배치 (베이스 _q8a4fns 기준, Turbo는 같은 배치인지 확인) ──
     layouts = {}
     for variant, stem in STEMS.items():
-        gpath = os.path.join(args.build, stem + "_q8a4fns.onnx")
-        b = open(gpath, "rb").read()
-        inits = graph_initializers(b)
-        layouts[variant] = [(t["name"], t["dtype"], tuple(t["dims"]), t["ext"]["location"].replace(stem, "{stem}"),
-                             t["ext"]["offset"], t["ext"]["length"]) for t in inits if t["ext"]]
+        lay, seen = [], set()
+        for suf in layout_list:
+            b = open(os.path.join(args.build, stem + suf + ".onnx"), "rb").read()
+            for t in graph_initializers(b):
+                if not t["ext"]:
+                    continue
+                loc = t["ext"]["location"].replace(stem, "{stem}")
+                if (loc, t["ext"]["offset"]) in seen:      # 같은 자리를 여러 그래프가 참조
+                    continue
+                seen.add((loc, t["ext"]["offset"]))
+                lay.append((t["name"], t["dtype"], tuple(t["dims"]), loc, t["ext"]["offset"], t["ext"]["length"]))
+        layouts[variant] = lay
     assert layouts["base"] == layouts["turbo"], "베이스·Turbo 샤드 배치가 다름"
     print(f"[layout] 외부 initializer {len(layouts['base'])}개 — 베이스·Turbo 배치 동일")
 
-    mani = json.load(open(os.path.join(args.build, STEMS["base"] + "_q8a4fns.onnx.manifest.json")))
+    mani = json.load(open(os.path.join(args.build, STEMS["base"] + layout_list[0] + ".onnx.manifest.json")))
     shard_names = [s.replace(STEMS["base"], "{stem}") for s in mani["shards"]]
-    shard_sizes = [os.path.getsize(os.path.join(args.build, s)) for s in mani["shards"]]
+    n_mani = len(shard_names)
+    for _, _, _, loc, _, _ in layouts["base"]:               # manifest 밖의 외부 데이터 파일(머리의 .data)
+        if loc not in shard_names:
+            shard_names.append(loc)
+    shard_sizes = [os.path.getsize(os.path.join(args.build, s.format(stem=STEMS["base"]))) for s in shard_names]
     result["shards"] = [{"name": n, "size": z} for n, z in zip(shard_names, shard_sizes)]
     sidx = {n: i for i, n in enumerate(shard_names)}
+    if args.webnn:
+        # 변환기가 쓸 부가 파일: 샤드 목록(manifest)은 그래프 이름마다, LoRA 슬롯 목록은 템플릿 것을 그대로 복사
+        result["manifests"] = [{"file": "{stem}" + g + ".onnx.manifest.json", "shards": list(range(n_mani))} for g in graphs_list[:2]]
+        result["copies"] = ["{stem}" + graphs_list[1] + ".onnx.lora_manifest.json"]
 
     entries, consts = [], []
     for name, dtype, dims, loc, off, ln in layouts["base"]:
@@ -249,21 +286,27 @@ def main():
             consts.append({"name": name, "shard": si, "offset": off, "length": ln, "dtype": dtype, "dims": list(dims),
                            "data": base64.b64encode(data_b).decode()})
     # q8B/q8S는 MatMulNBits 한 쌍 — 변환기는 B 항목에서 둘을 같이 만든다
-    byk = {}
+    # 같은 텐서가 같은 형식으로 여러 자리에 있을 수 있다(WebNN: 머리의 가중치는 샤드와 머리 .data 양쪽) → 첫 자리 + also
+    byk, also = {}, {}
     for e in entries:
-        byk.setdefault(e["key"], {})[e["kind"]] = e
+        d = byk.setdefault(e["key"], {})
+        if e["kind"] in d:
+            also.setdefault((e["key"], e["kind"]), []).append({"shard": e["shard"], "offset": e["offset"]})
+        else:
+            d[e["kind"]] = e
     ent_out = []
     for k, d in byk.items():
         w = sd[k]
         if "q8B" in d:
-            assert "q8S" in d and set(d) == {"q8B", "q8S"}, (k, list(d))
+            assert "q8S" in d and set(d) == {"q8B", "q8S"} and not any(kk[0] == k for kk in also), (k, list(d))
             N, K = w.shape
             ent_out.append({"key": k, "kind": "q8", "N": N, "K": K, "shard": d["q8B"]["shard"], "offset": d["q8B"]["offset"],
                             "sshard": d["q8S"]["shard"], "soffset": d["q8S"]["offset"]})
         else:
             assert len(d) == 1, (k, list(d))
             (kind, e), = d.items()
-            ent_out.append({"key": k, "kind": kind, "shape": list(w.shape), "shard": e["shard"], "offset": e["offset"]})
+            ent_out.append({"key": k, "kind": kind, "shape": list(w.shape), "shard": e["shard"], "offset": e["offset"],
+                            **({"also": also[(k, kind)]} if (k, kind) in also else {})})
     result["tensors"] = ent_out
     result["consts"] = consts
     cbytes = sum(c["length"] for c in consts)
@@ -274,7 +317,7 @@ def main():
     # ── 2) 그래프 인라인 initializer (12개 그래프 각각) ──
     graphs = {}
     for variant, stem in STEMS.items():
-        for g in GRAPHS:
+        for g in graphs_list:
             fname = stem + g + ".onnx"
             b = open(os.path.join(args.build, fname), "rb").read()
             patches = []
@@ -317,6 +360,10 @@ def tensor_bytes(w, kind):
         return w.astype(np.float16).tobytes()
     if kind == "f16T":
         return np.ascontiguousarray(w.T).astype(np.float16).tobytes()
+    if kind == "f32r16":
+        return w.astype(np.float16).astype(np.float32).tobytes()
+    if kind == "f32r16T":
+        return np.ascontiguousarray(w.T).astype(np.float16).astype(np.float32).tobytes()
     raise ValueError(kind)
 
 
@@ -332,7 +379,8 @@ def check(m, sd, build):
             shards[e["sshard"]][e["soffset"]:e["soffset"] + s.nbytes] = s.tobytes()
         else:
             d = tensor_bytes(w, e["kind"])
-            shards[e["shard"]][e["offset"]:e["offset"] + len(d)] = d
+            for dst in [e] + e.get("also", []):
+                shards[dst["shard"]][dst["offset"]:dst["offset"] + len(d)] = d
     for c in m["consts"]:
         shards[c["shard"]][c["offset"]:c["offset"] + c["length"]] = base64.b64decode(c["data"])
     ok = True

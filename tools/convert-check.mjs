@@ -1,6 +1,7 @@
 // 브라우저 변환기 코어(web/js/convert-core.js)를 Node에서 돌려 기존 빌드와 바이트 대조한다.
 //   node tools/convert-check.mjs --ckpt <anima-base-v1.0.safetensors> [--lora <turbo.safetensors>]
-//        [--ref out-local/dit] [--out <임시 폴더>] [--only base|turbo]
+//        [--ref out-local/dit] [--out <임시 폴더>] [--only base|turbo] [--map web/convert/anima2b.wnn.map.json]
+// --map: 다른 매핑표(기본은 운영 그래프용 anima2b.map.json). WebNN 그래프는 anima2b.wnn.map.json.
 // 템플릿 그래프는 --ref의 원본을 쓰되, 패치 자리를 먼저 0으로 지운 뒤 채워서 실제로 다시 쓰는지 확인한다.
 import { createHash } from "node:crypto";
 import { mkdirSync, openSync, closeSync, readFileSync, readSync, writeSync, ftruncateSync, existsSync } from "node:fs";
@@ -8,7 +9,7 @@ import { join } from "node:path";
 import { convertDit, patchGraph, shardManifest } from "../web/js/convert-core.js";
 
 const args = Object.fromEntries(process.argv.slice(2).reduce((a, x, i, arr) => (x.startsWith("--") ? [...a, [x.slice(2), arr[i + 1]]] : a), []));
-const map = JSON.parse(readFileSync(new URL("../web/convert/anima2b.map.json", import.meta.url)));
+const map = JSON.parse(readFileSync(args.map || new URL("../web/convert/anima2b.map.json", import.meta.url)));
 const ref = args.ref || "out-local/dit";
 const outDir = args.out || "out-local/convert-check";
 mkdirSync(outDir, { recursive: true });
@@ -81,12 +82,13 @@ for (const v of variants) {
     ok &&= same;
     console.log(`[graph] ${g.file}: ${same ? "동일" : "다름"} (패치 ${g.patches.length}개)`);
   }
-  const mani = shardManifest(map.shards.map((s) => s.name.replace("{stem}", stem)));
-  for (const slot of ["_q8a4fns", "_q8a4fnLs"]) {
-    const f = join(ref, `${stem}${slot}.onnx.manifest.json`);
-    const same = existsSync(f) && readFileSync(f, "utf8") === mani;
+  // 샤드 목록 파일: 매핑표가 적어 두었으면(WebNN) 그대로, 아니면 운영 그래프의 두 슬롯
+  const manis = map.manifests ?? ["_q8a4fns", "_q8a4fnLs"].map((slot) => ({ file: `{stem}${slot}.onnx.manifest.json`, shards: map.shards.map((_, i) => i) }));
+  for (const m of manis) {
+    const f = join(ref, m.file.replace("{stem}", stem));
+    const same = existsSync(f) && readFileSync(f, "utf8") === shardManifest(m.shards.map((i) => map.shards[i].name.replace("{stem}", stem)));
     ok &&= same;
-    console.log(`[manifest] ${stem}${slot}: ${same ? "동일" : "다름"}`);
+    console.log(`[manifest] ${m.file.replace("{stem}", stem)}: ${same ? "동일" : "다름"}`);
   }
 }
 console.log(ok ? "[check] 통과" : "[check] 실패");

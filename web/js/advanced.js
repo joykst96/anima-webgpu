@@ -2,6 +2,7 @@
 // 설정은 settings.js에 저장되고, 실제 반영은 모델 로드 시점(loader.js loadAll — 상주 DiT의 요청 모드와 다르면 다시 올림).
 import { $ } from "./dom.js";
 import { ditSessions, loadAll, loadState } from "./loader.js";
+import { HAS_WEBNN } from "./ort.js";
 import { queueBusy } from "./queue-state.js";
 import { PRECISION_LABEL, saveSettings, settings } from "./settings.js";
 
@@ -9,8 +10,11 @@ function refresh() {
   const dlg = $("advDialog");
   for (const r of dlg.querySelectorAll('input[name="precision"]')) {
     r.checked = r.value === settings.precision;
-    r.disabled = loadState.loading; // 로드 도중 바꾸면 요청 모드와 실제 그래프가 어긋난다
+    r.disabled = loadState.loading || (r.value === "webnn" && !HAS_WEBNN); // 로드 도중 바꾸면 요청 모드와 실제 그래프가 어긋난다
   }
+  if (!HAS_WEBNN)
+    $("advWebnnNote").textContent =
+      "이 브라우저에는 WebNN(navigator.ml)이 없습니다. Chrome은 chrome://flags에서 WebNN 플래그를 켜야 합니다.";
   const dit = ditSessions[$("modelSel").value];
   const btn = $("btnAdvApply");
   let status;
@@ -19,17 +23,22 @@ function refresh() {
     btn.hidden = true;
   } else {
     status = `로드된 모델: ${PRECISION_LABEL[dit.precision]}`;
-    if (dit.precision !== dit.requested) status += ` (${PRECISION_LABEL[dit.requested]} 그래프가 서버에 없음)`;
+    if (dit.precision !== dit.requested)
+      status += dit.requested === "webnn" ? " (WebNN을 쓸 수 없어 표준으로 로드됨 — 이유는 로그)" : ` (${PRECISION_LABEL[dit.requested]} 그래프가 서버에 없음)`;
     const pending = dit.requested !== settings.precision;
     if (pending) status += ` → 다음 로드부터 ${PRECISION_LABEL[settings.precision]}`;
     btn.hidden = !pending;
     btn.disabled = queueBusy() || loadState.loading;
   }
-  // 패딩 압축은 그래프가 xattn_index 입력을 가질 때만 동작 (tools/graph/xattn_compact.py로 만든 그래프)
+  // 패딩 압축은 그래프가 xattn_index 입력을 가질 때만 동작 (export/xattn_compact.py로 만든 그래프)
   $("advXattn").checked = settings.xattnCompact;
   if (dit && !dit.inputNames.includes("xattn_index"))
     status += " · 패딩 압축: 이 모델 그래프는 미지원 (서버 그래프 갱신 필요)";
   $("advEasyCache").checked = settings.easyCache;
+  // Spectrum은 본체(+특징 출력)·머리 그래프를 올린 WebNN 세션에서만 동작 (export/webnn/spectrum_split.py)
+  $("advSpectrum").checked = settings.spectrum;
+  if (settings.spectrum && dit && !dit.spectrum)
+    status += " · Spectrum: 지금 로드된 모델에서는 쓸 수 없음 (WebNN + Spectrum 그래프 필요)";
   $("advStatus").textContent = status;
 }
 
@@ -43,6 +52,7 @@ function initAdvanced() {
     if (e.target.name === "precision") settings.precision = e.target.value;
     else if (e.target.id === "advXattn") settings.xattnCompact = e.target.checked;
     else if (e.target.id === "advEasyCache") settings.easyCache = e.target.checked;
+    else if (e.target.id === "advSpectrum") settings.spectrum = e.target.checked;
     else return;
     saveSettings();
     refresh();

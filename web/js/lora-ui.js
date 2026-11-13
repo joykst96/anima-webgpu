@@ -17,12 +17,10 @@ function markLoraDirty() {
 function createLoraRow(item) {
   const row = document.createElement("div");
   row.dataset.loraId = item.id;
-  row.style.cssText =
-    "display:flex;gap:6px;align-items:center;margin-bottom:5px";
+  row.className = "lora-row";
   const file = document.createElement("input");
   file.type = "file";
   file.accept = ".safetensors";
-  file.style.cssText = "flex:1;min-width:0;font-size:12px";
   file.onchange = async (e) => {
     const f = e.target.files[0];
     if (!f) return;
@@ -42,8 +40,7 @@ function createLoraRow(item) {
     }
   };
   const wlabel = document.createElement("span");
-  wlabel.style.cssText =
-    "font-size:11px;color:var(--dim,#888);width:30px;text-align:right";
+  wlabel.className = "lora-weight";
   wlabel.textContent = item.weight.toFixed(2);
   const w = document.createElement("input");
   w.type = "range";
@@ -51,7 +48,6 @@ function createLoraRow(item) {
   w.max = "2";
   w.step = "0.05";
   w.value = item.weight;
-  w.style.cssText = "width:90px";
   w.oninput = () => {
     item.weight = +w.value;
     wlabel.textContent = item.weight.toFixed(2);
@@ -64,9 +60,7 @@ function createLoraRow(item) {
   };
   const del = document.createElement("button");
   del.textContent = "×";
-  del.style.cssText =
-    "width:auto;padding:0 9px;font-size:16px;line-height:1;height:28px;" +
-    "display:inline-flex;align-items:center;justify-content:center;flex:0 0 auto";
+  del.className = "lora-del";
   del.onclick = () => {
     const had = !!item.src;
     lora.items = lora.items.filter((x) => x.id !== item.id);

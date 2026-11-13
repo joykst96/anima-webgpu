@@ -2,7 +2,7 @@
 import { $, log } from "./dom.js";
 import { MODELS, PATHS } from "./config.js";
 import { loadTokenizer } from "./tokenizer.js";
-import { disposeRun, disposeTensor, makeF16Tensor, ort } from "./ort.js";
+import { HAS_WEBNN, disposeRun, disposeTensor, loadOrtWebnn, makeF16Tensor, ort } from "./ort.js";
 import { CTX_DIM, CTX_LEN, LAT_C } from "./constants.js";
 import { buildLoraBinAsync, lora } from "./lora.js";
 import { BUSY_MSG, queueBusy } from "./queue-state.js";
@@ -267,11 +267,191 @@ function customSource(slot) {
   return { graph: base, base, precision: "standard" };
 }
 
+// ── WebNN DiT (고급 옵션 'WebNN', 실험) ──
+// <dit>_wnn1024.onnx = 정적 1024² fp16 그래프(export/webnn/build_webnn.bat: export_dit.py --size 1024 → webnn_fix.py → shard_onnx_data.py).
+// 가중치가 fp16이라 샤드도 따로다(<그래프>.manifest.json). 이름이 <dit> 앞부분으로 시작해 pruneOldCache가 지우지 않는다.
+// LoRA를 붙였으면 호출부가 슬롯 그래프 주소(<ditLora> = …_q8a4fnLs.onnx)를 주므로 여기서도 …_q8a4fnLs_wnn1024.onnx(슬롯 그래프, 샤드 공유)를 쓴다.
+// 슬롯 레이아웃(lora_manifest)은 표준 슬롯 그래프와 같아 변환 워커·lora_scale 입력을 그대로 쓴다(export/add_lora_slots.py).
+// 쓸 수 없으면(브라우저 미지원·그래프 없음·생성 실패·시간 초과) null → 호출부가 표준 경로로 로드한다.
+// ORT Web 1.26은 브라우저가 그래프를 거부하면 create가 끝나지 않으므로 시간 제한을 둔다(ort.js loadOrtWebnn 주석).
+const WEBNN_CREATE_TIMEOUT_MS = 180000;
+
+// LoRA 슬롯 그래프의 외부 데이터(lora.bin): 장착된 LoRA를 manifest 레이아웃으로 변환한다(Worker). 없으면 0으로 채움(다운로드 0).
+// 표준(WebGPU)·WebNN 슬롯 그래프가 같은 레이아웃을 쓴다.
+async function buildLoraExternal(lman) {
+  const total = lman.entries.reduce((m, e) => Math.max(m, e.B.offset + lman.rank * e.N * 4), 0);
+  let bytes;
+  const active = lora.items.filter((i) => i.src);
+  if (active.length) {
+    log(`LoRA 병합 (Worker, ${active.length}개)...`, "dim");
+    const c = await buildLoraBinAsync(lman, active, (f) => {
+      $("loadBar").style.width = f * 100 + "%";
+      $("loadStat").textContent = `LoRA 병합 ${(f * 100) | 0}%`;
+    });
+    bytes = c.bytes;
+    lora.lastReport =
+      `${active.length}개 LoRA — ${c.report.applied}/${c.report.total} 슬롯 적용` +
+      (c.report.notes ? ` (${c.report.notes})` : "");
+    log(lora.lastReport, c.report.applied ? "ok" : "err");
+  } else {
+    bytes = new Uint8Array(total); // 제로 = LoRA 없음 (다운로드 0)
+  }
+  return { path: lman.bin, data: bytes };
+}
+
+// WebNN 로더가 파일을 얻는 곳. 서버 모델은 주소(URL)로 받아 OPFS에 캐시하고, 사용자 설정 모델은 고른 폴더의 파일을 이름으로 바로 읽는다
+// (변환 페이지가 'WebNN용 파일도 만들기'로 같은 폴더에 써 둔 것 — 파일 이름 규칙은 서버 모델과 같다).
+const serverIO = {
+  where: "서버에",
+  has: async (u) => {
+    const r = await fetch(u, { method: "HEAD" }).catch(() => null);
+    return !!(r && r.ok);
+  },
+  json: async (u) => {
+    const r = await fetch(u).catch(() => null);
+    return r && r.ok ? await r.json() : null;
+  },
+  bytes: (u, onProgress = () => {}) => cachedFetch(u, onProgress),
+};
+const customIO = {
+  where: "선택한 폴더에",
+  has: async (n) => customFiles.has(baseName(n)),
+  json: async (n) => (customFiles.has(baseName(n)) ? JSON.parse(new TextDecoder().decode(await readFileBytes(customFiles.get(baseName(n))))) : null),
+  bytes: async (n, onProgress = () => {}) => {
+    const b = await readFileBytes(customFiles.get(baseName(n)));
+    onProgress(1);
+    return b;
+  },
+};
+
+// Spectrum 머리 세션. DiT·VAE와 또 다른 ORT 인스턴스("head")에 올린다. releaseDit가 sess의 다른 세션과 함께 내린다.
+//   sess.ditHead  : 특징(fp32, CPU에서 예측해 올림), timesteps → v_pred
+//   sess.ditHeadK : feat0..K-1(fp16, 본체가 낸 GPU 텐서 그대로), coef[K], timesteps → v_pred — 가중합까지 GPU에서(<머리>k.onnx).
+//                   본체와 같은 MLContext(ctx)여야 텐서를 넘길 수 있다. 없거나 못 올리면 ditHead(CPU 경로)만 쓴다.
+// 돌려주는 값: false(Spectrum 불가) | { gpu: 가중합 머리를 쓸 수 있는지 }
+async function loadSpectrumHead(headUrl, ctx, io = serverIO) {
+  const create = async (ortW, graph, data, ep) => {
+    let timer;
+    return await Promise.race([
+      ortW.InferenceSession.create(graph, { executionProviders: [ep], externalData: [{ path: baseName(headUrl) + ".data", data }] }),
+      new Promise((_, rej) => {
+        timer = setTimeout(() => rej(new Error("세션 생성 시간 초과")), WEBNN_VAE_CREATE_TIMEOUT_MS);
+      }),
+    ]).finally(() => clearTimeout(timer));
+  };
+  const ep = { name: "webnn", deviceType: "gpu", powerPreference: "high-performance" };
+  try {
+    const [graph, data] = await Promise.all([io.bytes(headUrl), io.bytes(headUrl + ".data")]);
+    const ortW = await loadOrtWebnn("head");
+    sess.ditHead = await create(ortW, graph, data, ep);
+    sess.ditHeadK = null;
+    const kUrl = headUrl.replace(/\.onnx$/, "k.onnx");
+    if (ctx && (await io.has(kUrl))) {
+      try {
+        const hk = await create(ortW, await io.bytes(kUrl), data, { ...ep, context: ctx });
+        hk.slots = hk.inputNames.filter((n) => /^feat\d+$/.test(n)).length;
+        hk.wrap = (t) => ortW.Tensor.fromMLTensor(t.mlTensor, { dataType: t.type, dims: t.dims }); // 본체 인스턴스의 GPU 텐서를 이 인스턴스의 입력으로
+        sess.ditHeadK = hk;
+      } catch (e) {
+        console.error(e);
+        log(`Spectrum 가중합 머리를 올리지 못함 — ${e.message}. 특징을 CPU에서 합산`, "dim");
+      }
+    }
+    return { gpu: !!sess.ditHeadK };
+  } catch (e) {
+    console.error(e);
+    log(`Spectrum 머리 그래프를 올리지 못함 — ${e.message}. Spectrum 없이 진행`, "err");
+    sess.ditHead = sess.ditHeadK = null;
+    return false;
+  }
+}
+
+async function loadWebnnDit(name, url, onProgress, io = serverIO) {
+  const fallback = (why) => {
+    log(`WebNN 사용 불가 — ${why}. ${PRECISION_LABEL.standard}으로 로드`, "err");
+    return null;
+  };
+  if (!HAS_WEBNN) return fallback("이 브라우저에 WebNN(navigator.ml)이 없음 (Chrome은 chrome://flags의 WebNN 플래그 필요)");
+  const isSlot = url.includes("_q8a4fnLs"); // LoRA 장착 → 슬롯 그래프
+  const gUrl = url.replace(/\.onnx$/, "_wnn1024.onnx");
+  if (!(await io.has(gUrl)))
+    return fallback(isSlot ? `이 모델의 WebNN LoRA 슬롯 그래프가 ${io.where} 없음` : `이 모델의 WebNN 그래프가 ${io.where} 없음`);
+  const mani = await io.json(gUrl + ".manifest.json");
+  if (!mani) return fallback("WebNN 그래프의 샤드 목록(manifest)이 없음");
+  const lman = isSlot ? await io.json(gUrl + ".lora_manifest.json") : null;
+  if (isSlot && !lman) return fallback("WebNN LoRA 슬롯 그래프의 슬롯 목록(lora_manifest)이 없음");
+  // Spectrum(spectrum.js): 본체 = 같은 그래프 + 특징 출력(<그래프>_sp.onnx, 샤드·manifest 공유), 머리 = 특징·timesteps → v_pred
+  // (<비슬롯 그래프>_head.onnx + .data, LoRA와 무관). 둘 다 있으면 본체를 _sp로 올린다 — 특징 출력을 안 읽으면 결과·시간은 같다.
+  const spUrl = gUrl.replace(/\.onnx$/, "_sp.onnx"),
+    headUrl = gUrl.replace("_q8a4fnLs", "_q8a4fns").replace(/\.onnx$/, "_head.onnx");
+  const useSp = (await io.has(spUrl)) && (await io.has(headUrl)) && (await io.has(headUrl + ".data"));
+  try {
+    log(`${name} WebNN 그래프 다운로드...`, "dim");
+    const graph = await io.bytes(useSp ? spUrl : gUrl, (f) => onProgress(f * 0.05));
+    const dir = gUrl.slice(0, gUrl.lastIndexOf("/") + 1);
+    const n = mani.shards.length,
+      ext = new Array(n),
+      frac = new Array(n).fill(0);
+    let next = 0;
+    const worker = async () => {
+      for (let i; (i = next++) < n; ) {
+        log(`${name} 샤드 ${i + 1}/${n} (${mani.shards[i]})...`, "dim");
+        ext[i] = {
+          path: mani.shards[i],
+          data: await io.bytes(dir + mani.shards[i], (f) => {
+            frac[i] = f;
+            onProgress(0.05 + (frac.reduce((a, b) => a + b, 0) / n) * 0.85);
+          }),
+        };
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(SHARD_PARALLEL, n) }, worker));
+    if (lman) ext.push(await buildLoraExternal(lman));
+    const ortW = await loadOrtWebnn();
+    log(`${name} 컴파일 (WebNN)...`, "dim");
+    // Spectrum용 본체는 MLContext를 직접 만들어 넘기고 특징(fp16)을 GPU 텐서로 내게 한다 — 같은 컨텍스트의 가중합 머리에 그대로 넣기 위해.
+    // (안 읽는 출력은 비용이 없다. 컨텍스트를 못 만들면 특징을 CPU로 읽는 경로만 쓴다.)
+    const ep = { name: "webnn", deviceType: "gpu", powerPreference: "high-performance" };
+    const ctx = useSp ? await navigator.ml.createContext({ deviceType: ep.deviceType, powerPreference: ep.powerPreference }).catch(() => null) : null;
+    let timer;
+    const s = await Promise.race([
+      ortW.InferenceSession.create(graph, {
+        executionProviders: [ctx ? { ...ep, context: ctx } : ep],
+        externalData: ext,
+        ...(ctx ? { preferredOutputLocation: { spectrum_feat16: "ml-tensor" } } : {}),
+      }),
+      new Promise((_, rej) => {
+        timer = setTimeout(() => rej(new Error("세션 생성 시간 초과 (브라우저가 그래프를 거부했을 수 있음)")), WEBNN_CREATE_TIMEOUT_MS);
+      }),
+    ]).finally(() => clearTimeout(timer));
+    const shape = s.inputMetadata?.find((m) => m.name === "latent")?.shape;
+    s.staticLat = { h: Number(shape?.[3] ?? 128), w: Number(shape?.[4] ?? 128) }; // 정적 그래프 — 이 latent 크기만 받는다
+    s.loraManifest = lman;
+    s.precision = "webnn";
+    s.spectrum = useSp ? await loadSpectrumHead(headUrl, ctx, io) : false; // 머리를 못 올리면 Spectrum만 못 쓴다
+    onProgress(1);
+    log(`${name} OK (WebNN · ${s.staticLat.w * 8}×${s.staticLat.h * 8} 전용${s.spectrum ? " · Spectrum 가능" : ""})`, "ok");
+    return s;
+  } catch (e) {
+    console.error(e);
+    return fallback(e.message);
+  }
+}
+
 async function loadSession(name, url, onProgress) {
   const opts = { executionProviders: ["webgpu"] };
 
   // 0) 사용자설정: 메모리 파일맵에서 직접 조립 (네트워크/OPFS 미사용). url = { custom: true, slot: LoRA 장착 여부 }
   if (url?.custom && name.startsWith("dit:")) {
+    // WebNN(실험): 변환 묶음에 WebNN용 파일이 있으면 그 세션을 쓴다. 없거나 안 되면 아래 표준 경로.
+    if (settings.precision === "webnn") {
+      const stem = customStem();
+      const s = stem ? await loadWebnnDit(name, `${stem}${url.slot ? "_q8a4fnLs" : "_q8a4fns"}.onnx`, onProgress, customIO) : null;
+      if (s) {
+        s.customVersion = customVersion;
+        return s;
+      }
+    }
     const files = customFiles;
     const src = customSource(url.slot);
     const onnxFile = src.graph;
@@ -348,8 +528,14 @@ async function loadSession(name, url, onProgress) {
     return s;
   }
 
+  // WebNN(실험): 되면 그 세션을 쓰고, 안 되면 아래 표준 경로를 그대로 탄다
+  if (name.startsWith("dit:") && settings.precision === "webnn") {
+    const s = await loadWebnnDit(name, url, onProgress);
+    if (s) return s;
+  }
+
   log(`${name} 그래프 다운로드...`, "dim");
-  // 같은 가중치(샤드·LoRA manifest 공유)를 쓰는 후처리 그래프 (tools/graph/make_fast_graphs.py):
+  // 같은 가중치(샤드·LoRA manifest 공유)를 쓰는 후처리 그래프 (export/make_fast_graphs.py):
   //   <dit>_f16.onnx : '빠르게' 모드 (블록 내부 fp16 + 패딩 압축 입력)
   //   <dit>_x.onnx   : 표준 + cross-attention 패딩 압축 입력 (압축을 끄면 원본과 같은 결과)
   // 서버가 .onnx를 1년 immutable로 캐시시키므로 바뀐 그래프는 반드시 새 이름이다. 없으면 다음 후보 → 원본.
@@ -431,30 +617,7 @@ async function loadSession(name, url, onProgress) {
     : null;
   if (lres && lres.ok) {
     lman = await lres.json();
-    const total = lman.entries.reduce(
-      (m, e) => Math.max(m, e.B.offset + lman.rank * e.N * 4),
-      0,
-    );
-    let bytes;
-    const active = lora.items.filter((i) => i.src);
-    if (active.length) {
-      log(`LoRA 병합 (Worker, ${active.length}개)...`, "dim");
-      const c = await buildLoraBinAsync(lman, active, (f) => {
-        $("loadBar").style.width = f * 100 + "%";
-        $("loadStat").textContent = `LoRA 병합 ${(f * 100) | 0}%`;
-      });
-      bytes = c.bytes;
-      lora.lastReport =
-        `${active.length}개 LoRA — ${c.report.applied}/${c.report.total} 슬롯 적용` +
-        (c.report.notes ? ` (${c.report.notes})` : "");
-      log(lora.lastReport, c.report.applied ? "ok" : "err");
-    } else {
-      bytes = new Uint8Array(total); // 제로 = LoRA 없음 (다운로드 0)
-    }
-    (opts.externalData = opts.externalData || []).push({
-      path: lman.bin,
-      data: bytes,
-    });
+    (opts.externalData = opts.externalData || []).push(await buildLoraExternal(lman));
   }
   log(`${name} 컴파일 (셰이더 빌드)...`, "dim");
   const s = await ort.InferenceSession.create(graph, opts);
@@ -497,8 +660,12 @@ async function warmup(label) {
     const lat = makeF16Tensor(new Float32Array(LAT_C * WARMUP_LAT * WARMUP_LAT), [1, LAT_C, 1, WARMUP_LAT, WARMUP_LAT]);
     tensors.push(lat);
     const names = sess.dit.inputNames;
+    // 정적 그래프(WebNN)는 자기 해상도만 받는다 — DiT 워밍업만 그 크기로 (VAE는 아래에서 종전대로 256²)
+    const sl = sess.dit.staticLat;
+    const ditLat = sl ? makeF16Tensor(new Float32Array(LAT_C * sl.h * sl.w), [1, LAT_C, 1, sl.h, sl.w]) : lat;
+    if (sl) tensors.push(ditLat);
     const feed = {
-      latent: lat,
+      latent: ditLat,
       timesteps: t("float32", Float32Array.of(1), [1]),
       context: makeF16Tensor(new Float32Array(CTX_LEN * CTX_DIM), [1, CTX_LEN, CTX_DIM]),
     };
@@ -513,6 +680,11 @@ async function warmup(label) {
       feed.xattn_bias_row = t("float32", new Float32Array(CTX_LEN), [1, 1, 1, CTX_LEN]);
     }
     outs.push(await sess.dit.run(feed));
+    if (sess.vaeWebnn) {
+      const wl = makeF16Tensor(new Float32Array(LAT_C * sess.vaeWebnn.lat.h * sess.vaeWebnn.lat.w), [1, LAT_C, 1, sess.vaeWebnn.lat.h, sess.vaeWebnn.lat.w]);
+      tensors.push(wl);
+      outs.push(await sess.vaeWebnn.run({ latent: wl }));
+    }
     if (sess.vaeHead) {
       const ho = await sess.vaeHead.run({ latent: lat });
       outs.push(ho);
@@ -527,6 +699,43 @@ async function warmup(label) {
   outs.forEach(disposeRun);
   tensors.forEach(disposeTensor);
   if (stat.textContent.endsWith("(셰이더 준비 중...)")) stat.textContent = `${label} 준비됨`;
+}
+
+// ── WebNN VAE (WebNN DiT와 함께 쓴다, 실험) ──
+// <vae>_wnn16.onnx = 같은 동적 그래프를 fp16 계산으로 바꾼 것(export/webnn/vae_fp16.py all latent — build_webnn.bat). 가중치는 원본 .data(fp32)를 그대로 쓰고
+// ORT가 세션 생성 때 fp16으로 접는다 → 추가 다운로드는 그래프 0.8MB뿐. WebNN은 정적 shape만 받아 freeDimensionOverrides로 크기를 고정한다.
+// 1024² 실측(2026-11-13, RTX 5070 Ti, Chrome 157 플래그): WebGPU fp32 742ms·일시 VRAM +7~8GB → WebNN fp16 111ms. fp32 대비 PSNR 67.7dB.
+// 실패하면 null → vae.js가 기존 WebGPU 경로로 디코드한다. DiT와 다른 ORT 인스턴스("vae")에 올린다(ort.js loadOrtWebnn 주석).
+const WEBNN_VAE_CREATE_TIMEOUT_MS = 60000;
+async function loadWebnnVae(url, lat) {
+  const gUrl = url.replace(/\.onnx$/, "_wnn16.onnx");
+  try {
+    const r = await fetch(gUrl, { method: "HEAD" }).catch(() => null);
+    if (!(r && r.ok)) {
+      log("vae WebNN 그래프가 서버에 없음 — VAE는 기존 경로(WebGPU)", "dim");
+      return null;
+    }
+    const [graph, data] = await Promise.all([cachedFetch(gUrl, () => {}), cachedFetch(url + ".data", () => {})]);
+    const ortW = await loadOrtWebnn("vae");
+    let timer;
+    const s = await Promise.race([
+      ortW.InferenceSession.create(graph, {
+        executionProviders: [{ name: "webnn", deviceType: "gpu", powerPreference: "high-performance" }],
+        externalData: [{ path: baseName(url) + ".data", data }],
+        freeDimensionOverrides: { lat_h: lat.h, lat_w: lat.w },
+      }),
+      new Promise((_, rej) => {
+        timer = setTimeout(() => rej(new Error("세션 생성 시간 초과")), WEBNN_VAE_CREATE_TIMEOUT_MS);
+      }),
+    ]).finally(() => clearTimeout(timer));
+    s.lat = { ...lat };
+    log(`vae OK (WebNN · fp16 · ${lat.w * 8}×${lat.h * 8} 전용)`, "ok");
+    return s;
+  } catch (e) {
+    console.error(e);
+    log(`vae WebNN 사용 불가 — ${e.message}. VAE는 기존 경로(WebGPU)`, "err");
+    return null;
+  }
 }
 
 // VAE 분할 그래프(<vae>_head.onnx / <vae>_tail.onnx, export/split_vae.py)가 서버에 있으면 둘을 올린다.
@@ -656,6 +865,8 @@ async function loadAll() {
     }
     sharedLoaded = true;
     sess.dit = ditSessions[key];
+    // WebNN DiT면 VAE도 WebNN으로(같은 크기 전용). releaseDit가 sess의 다른 세션과 함께 내리므로 DiT를 새로 올릴 때마다 다시 만든다.
+    if (sess.dit.staticLat && !sess.vaeWebnn) sess.vaeWebnn = await loadWebnnVae(PATHS.vae, sess.dit.staticLat);
     // LoRA 상태는 DiT를 새로 올렸을 때만 갱신한다. 이미 상주한 모델이면 LoRA 목록이 반영되지 않았으므로
     // 변경 표시(dirty)를 지우면 안 된다. LoRA를 전부 지운 경우도 여기서 '해제·컴파일...' 문구를 정리한다.
     if (ditReloaded) {
