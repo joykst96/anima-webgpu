@@ -11,6 +11,9 @@ REM                                     (+ .manifest.json, .lora_manifest.json)
 REM    -> ..._wnn1024_sp.onnx (both)    same graphs + the Spectrum feature output
 REM    -> ..._q8a4fns_wnn1024_head.onnx (+ .data)  Spectrum head: feature, timesteps -> v_pred
 REM    -> ..._q8a4fns_wnn1024_headk.onnx           head with the weighted sum of 16 features (shares the .data)
+REM    -> ..._q8a4fn{s,Ls}_wnn1024n.onnx (+ _sp)   the same four graphs with the NegPip input
+REM                                     (negpip_mask, add_negpip --graph-only before the LoRA slots;
+REM                                     same shards and head, + .manifest.json, .lora_manifest.json)
 REM  VAE  : vae_fp16 (all) on the existing dynamic decoder graph
 REM         -> <vae>_wnn16.onnx (graph only, shares the original <vae>.onnx.data)
 REM
@@ -97,6 +100,7 @@ echo    ..._q8a4fns_wnn%SIZE%.onnx       + .N.bin shards + .manifest.json
 echo    ..._q8a4fnLs_wnn%SIZE%.onnx      LoRA slot graph: + .manifest.json + .lora_manifest.json
 echo    ..._wnn%SIZE%_sp.onnx ^(both^)     Spectrum main graphs ^(use the manifests of the graphs above^)
 echo    ..._q8a4fns_wnn%SIZE%_head.onnx  + .data, ..._headk.onnx   Spectrum heads
+echo    ..._wnn%SIZE%n.onnx, ..._wnn%SIZE%n_sp.onnx ^(both^)  the same graphs with the NegPip input ^(+ their manifests^)
 echo    %VAE:~0,-5%_wnn16.onnx  ^(shares %VAE%.data^)
 echo  The zero .lora.bin files are not deployed ^(the page builds them^).
 echo  The intermediate export in %WORKDIR%\ ^(about 4GB per variant^) can be deleted.
@@ -116,32 +120,46 @@ set FIX=%WORKDIR%\%BASE%_s%SIZE%_f16w.onnx
 set OUT=%OUTDIR%\%BASE%_q8a4fns_wnn%SIZE%.onnx
 set OUTL=%OUTDIR%\%BASE%_q8a4fnLs_wnn%SIZE%.onnx
 set HEAD=%OUTDIR%\%BASE%_q8a4fns_wnn%SIZE%_head.onnx
+set OUTN=%OUTDIR%\%BASE%_q8a4fns_wnn%SIZE%n.onnx
+set OUTLN=%OUTDIR%\%BASE%_q8a4fnLs_wnn%SIZE%n.onnx
 
 echo.
-echo --- [1/5] export_dit (%BASE%, static %SIZE%, fp16 load) ---
+echo --- [1/6] export_dit (%BASE%, static %SIZE%, fp16 load) ---
 %PY% "%EX%\export_dit.py" --comfyui %COMFY% --ckpt "%CKPT%" %EXTRA% --size %SIZE% --out "%RAW%"
 if errorlevel 1 exit /b 1
 
 echo.
-echo --- [2/5] webnn_fix (5D MatMul, allowzero Reshape, fp16 LayerNorm) ---
+echo --- [2/6] webnn_fix (5D MatMul, allowzero Reshape, fp16 LayerNorm) ---
 %PY% -I "%WN%webnn_fix.py" "%RAW%" "%FIX%"
 if errorlevel 1 exit /b 1
 
 echo.
-echo --- [3/5] shard (--shard-mb 400) ---
+echo --- [3/6] shard (--shard-mb 400) ---
 %PY% "%EX%\shard_onnx_data.py" --src "%FIX%" --out "%OUT%" --shard-mb 400
 if errorlevel 1 exit /b 1
 
 echo.
-echo --- [4/5] add lora slots (rank 48, fp16 branches, same lora.bin layout as the WebGPU slot graph) ---
-%PY% "%EX%\add_lora_slots.py" --src "%OUT%" --out "%OUTL%" --rank 48
+echo --- [4/6] add negpip (graph only: negpip_mask input on the cross-attention v_proj, same shards) ---
+%PY% "%EX%\add_negpip.py" --graph-only --src "%OUT%" --out "%OUTN%"
 if errorlevel 1 exit /b 1
 
 echo.
-echo --- [5/5] spectrum split (main graphs with the feature output + head) ---
+echo --- [5/6] add lora slots (rank 48, fp16 branches, same lora.bin layout as the WebGPU slot graph) ---
+REM  The NegPip slot graph is made from the NegPip graph so the v_proj LoRA branch also gets the masked context
+%PY% "%EX%\add_lora_slots.py" --src "%OUT%" --out "%OUTL%" --rank 48
+if errorlevel 1 exit /b 1
+%PY% "%EX%\add_lora_slots.py" --src "%OUTN%" --out "%OUTLN%" --rank 48
+if errorlevel 1 exit /b 1
+
+echo.
+echo --- [6/6] spectrum split (main graphs with the feature output + head) ---
 %PY% -I "%WN%spectrum_split.py" "%OUT%" --head "%HEAD%"
 if errorlevel 1 exit /b 1
 %PY% -I "%WN%spectrum_split.py" "%OUTL%"
+if errorlevel 1 exit /b 1
+%PY% -I "%WN%spectrum_split.py" "%OUTN%"
+if errorlevel 1 exit /b 1
+%PY% -I "%WN%spectrum_split.py" "%OUTLN%"
 if errorlevel 1 exit /b 1
 
 echo --- %BASE% done ---

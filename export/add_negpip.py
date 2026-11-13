@@ -22,17 +22,21 @@ NegPip (참조: pamparamm/ComfyUI-ppm anima_negpip.py):
 
 파이프라인 위치: quantize_dit.py 다음, shard_onnx_data.py 이전.
   export → quantize(--accuracy-level 4) → add_negpip → shard
+  WebNN 그래프(export/webnn/build_webnn.bat)는 샤딩이 끝난 그래프에 --graph-only로 건다:
+  가중치를 읽지 않고 그래프만 고쳐 저장한다(같은 샤드를 그대로 참조, 샤드 manifest는 새 이름으로 복사).
+  LoRA 슬롯은 그 다음에 붙인다 — v_proj 슬롯 브랜치도 마스크를 곱한 context를 받아야 하므로(표준 빌드와 같은 순서).
 
 사용 예 (한 줄):
   python export/add_negpip.py --src out/dit/anima_dit_dyn32_q8a4.onnx --out out/dit/anima_dit_dyn32_q8a4n.onnx
 """
 import argparse
 import os
+import shutil
 
 import onnx
 from onnx import TensorProto, helper
 
-SCRIPT_VERSION = "v2 (fuse-meta)"
+SCRIPT_VERSION = "v3 (fuse-meta, graph-only)"
 
 # 식별 시 "투과"하는 노드 (값을 변형해도 attention 구조를 바꾸지 않는 것들)
 WEIGHT_MATMULS = {"MatMulNBits", "MatMul", "Gemm"}
@@ -238,11 +242,14 @@ def main():
                    help="fuse_attention.py가 남긴 .fuse_meta.json 경로. "
                         "기본: <src>.fuse_meta.json. 있으면 메타 기반 식별, "
                         "없으면 Softmax 앵커 폴백(비-fuse 모델).")
+    p.add_argument("--graph-only", action="store_true", dest="graph_only",
+                   help="샤딩이 끝난 그래프용: 외부 가중치를 읽지 않고 그래프만 고쳐 저장한다 "
+                        "(가중치 참조는 그대로, <src>.manifest.json은 <out>.manifest.json으로 복사).")
     args = p.parse_args()
 
-    print(f"[add_negpip {SCRIPT_VERSION}]")
+    print(f"[add_negpip {SCRIPT_VERSION}]{' graph-only' if args.graph_only else ''}")
     print(f"[load] {args.src}")
-    model = onnx.load(args.src)
+    model = onnx.load(args.src, load_external_data=not args.graph_only)
     graph = model.graph
     init_names = {i.name for i in graph.initializer}
     init_names |= {n.output[0] for n in graph.node if n.op_type == "Constant"}
@@ -324,6 +331,16 @@ def main():
         graph.node.insert(first_v_idx + j, nn)
 
     print(f"[insert] 노드 {len(new_nodes)}개 추가, v_proj {len(v_nodes)}개 재배선")
+
+    if args.graph_only:
+        # 외부 가중치는 메모리에 없다(참조만) → 그래프만 저장. 같은 샤드를 쓰므로 샤드 목록도 새 이름으로 복사
+        onnx.save_model(model, args.out)
+        print(f"[save] 그래프만 저장: {args.out}")
+        src_man = args.src + ".manifest.json"
+        if os.path.exists(src_man):
+            shutil.copy(src_man, args.out + ".manifest.json")
+            print(f"[copy] 샤드 manifest → {os.path.basename(args.out)}.manifest.json")
+        return
 
     # ── 저장 (quantize_dit와 동일한 크기 기준) ──
     approx = sum(len(i.raw_data) for i in graph.initializer if i.HasField("raw_data"))

@@ -7,7 +7,7 @@ const $ = (id) => document.getElementById(id);
 const params = new URLSearchParams(location.search);
 const MAP_URL = new URL("./anima2b.map.json", import.meta.url).href;
 // WebNN용 그래프의 매핑표 (export/make_convert_map.py --webnn). 'WebNN용 파일도 만들기'를 켰을 때만 쓴다.
-// 템플릿은 같은 폴더의 WebNN 그래프 12개(<stem>_q8a4fn{s,Ls}_wnn1024{,_sp}.onnx, <stem>_q8a4fns_wnn1024_head{,k}.onnx)와 슬롯 그래프의 lora_manifest 2개.
+// 템플릿은 같은 폴더의 WebNN 그래프 20개(<stem>_q8a4fn{s,Ls}_wnn1024{,n}{,_sp}.onnx, <stem>_q8a4fns_wnn1024_head{,k}.onnx — n = NegPip 입력)와 슬롯 그래프의 lora_manifest 4개.
 const WEBNN_MAP_URL = new URL("./anima2b.wnn.map.json", import.meta.url).href;
 const TEMPLATE_DIR = new URL(params.get("templates") || "../out/dit/", location.href).href;
 // 폴더 저장(File System Access)이 없으면 OPFS에 쓰고 다운로드 링크를 준다. ?download=1이면 강제로 다운로드 방식.

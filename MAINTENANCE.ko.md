@@ -17,7 +17,7 @@
 - ORT는 `WebAssembly.Suspending`이 있으면(Chrome 137+) **JSPI 빌드**(네이티브 C++ WebGPU EP)를 씁니다. DP4A int8 matmul과 FlashAttention 커널은 이 빌드에만 있습니다. 없으면 JSEP 빌드로 폴백합니다. 버전은 1.26.0 고정(`?ort=x.y.z`로 다른 버전 시험 가능).
 - VAE는 head를 한 번 돌리고 tail을 가로 띠로 나눠(halo 16 latent) 돌립니다. 단일 호출과 비트 단위로 같으면서 정점 메모리가 띠 크기로 묶입니다. 1024²를 넘으면 head의 어텐션도 쿼리 청크별로 나눠 돌립니다.
 - DiT를 갈아 끼울 때(모델 전환·정밀도 변경·LoRA 반영)는 텍스트 인코더·어댑터·VAE도 함께 내렸다 올립니다. ORT WebGPU의 버퍼 캐시는 GPU 컨텍스트를 쓰는 세션이 전부 해제돼야 비워지기 때문입니다(함정 14).
-- **WebNN 경로(실험, 선택)**: 고급 옵션에서 고르면 DiT와 VAE만 ORT의 WebNN EP(`ort.all` 번들, 표준 경로와 다른 모듈 인스턴스)로 돕니다. 텍스트 인코더·어댑터·샘플러는 그대로입니다. DiT는 정적 1024² fp16 그래프(`<그래프>_wnn1024.onnx`), VAE는 fp16 계산 그래프(`<vae>_wnn16.onnx`)를 쓰고, LoRA는 표준과 같은 슬롯 방식입니다. Spectrum은 본체가 내놓은 특징을 GPU 텐서로 둔 채 머리 그래프(`…_head.onnx`·`…_headk.onnx`)만 돌려 예측 스텝을 만듭니다. `navigator.ml`이 없거나 파일이 없거나 세션 생성이 실패하면 표준 경로로 로드합니다.
+- **WebNN 경로(실험, 선택)**: 고급 옵션에서 고르면 DiT와 VAE만 ORT의 WebNN EP(`ort.all` 번들, 표준 경로와 다른 모듈 인스턴스)로 돕니다. 텍스트 인코더·어댑터·샘플러는 그대로입니다. DiT는 정적 1024² fp16 그래프(`<그래프>_wnn1024.onnx`), VAE는 fp16 계산 그래프(`<vae>_wnn16.onnx`)를 쓰고, LoRA는 표준과 같은 슬롯 방식입니다. NegPip은 같은 그래프에 `negpip_mask` 입력을 넣은 그래프(`<그래프>_wnn1024n.onnx`, 샤드 공유)로 씁니다. 이 입력이 없는 이전 그래프만 있는 모델은 그 그래프로 로드하고 NegPip을 무시합니다. Spectrum은 본체가 내놓은 특징을 GPU 텐서로 둔 채 머리 그래프(`…_head.onnx`·`…_headk.onnx`)만 돌려 예측 스텝을 만듭니다. `navigator.ml`이 없거나 파일이 없거나 세션 생성이 실패하면 표준 경로로 로드합니다.
 
 ## 정확도 (ComfyUI 대비)
 
@@ -69,7 +69,7 @@ export\build_dit.bat ComfyUI\models\diffusion_models\anima-base-v1.0.safetensors
 1. `export_dit.py --dynamic --fp32-act` — 동적 해상도 ONNX(fp32 활성, fp16 입출력)
 2. `quantize_dit.py --bits 8 --no-exclude --accuracy-level 4 --fp32-t-embed` — int8 가중치 + DP4A, t_embedder 2개 층만 활성 fp32
 3. `fuse_attention.py` — 분해된 SDPA → `MultiHeadAttention`(FlashAttention). `.fuse_meta.json` 생성
-4. `add_negpip.py` — `negpip_mask` 입력 추가(mask=1이면 출력 불변)
+4. `add_negpip.py` — `negpip_mask` 입력 추가(mask=1이면 출력 불변). WebNN 빌드는 샤딩이 끝난 그래프에 `--graph-only`로, LoRA 슬롯보다 먼저 건다
 5. `shard_onnx_data.py --shard-mb 400` — 가중치를 400MB 샤드로
 6. `add_lora_slots.py --rank 48` — LoRA 슬롯 그래프(샤드는 공유)
 
@@ -88,7 +88,7 @@ python -I export/fp16_zones.py <그래프>_x.onnx <그래프>_f16.onnx --fast
 
 ### WebNN 그래프 (선택)
 
-고급 옵션 'WebNN (실험)'이 쓰는 그래프는 따로 만듭니다. ComfyUI portable 루트에서 `<repo>\export\webnn\build_webnn.bat <ckpt> <prefix>`를 실행하면 베이스·Turbo DiT(정적 1024² fp16, LoRA 슬롯 그래프와 Spectrum용 본체·머리 그래프 포함)와 VAE(fp16 계산) 그래프가 나옵니다. 없으면 페이지는 표준 경로로 로드합니다. 자세한 것은 [export/webnn/README.md](export/webnn/README.md).
+고급 옵션 'WebNN (실험)'이 쓰는 그래프는 따로 만듭니다. ComfyUI portable 루트에서 `<repo>\export\webnn\build_webnn.bat <ckpt> <prefix>`를 실행하면 베이스·Turbo DiT(정적 1024² fp16, NegPip·LoRA 슬롯 그래프와 Spectrum용 본체·머리 그래프 포함)와 VAE(fp16 계산) 그래프가 나옵니다. 없으면 페이지는 표준 경로로 로드합니다. 자세한 것은 [export/webnn/README.md](export/webnn/README.md).
 
 ### 텍스트 인코더·어댑터·VAE
 
@@ -121,7 +121,7 @@ Qwen3와 T5 토크나이저를 transformers.js용 `tokenizer.json`으로 저장�
 - 그래프 구조는 모든 Anima 2B 체크포인트가 같으므로, 위 파이프라인으로 만든 그래프 12개를 **템플릿**으로 두고 가중치 바이트만 다시 만듭니다(bf16 → fp32 → int8 블록 양자화를 ORT 양자화기와 같은 방식으로, Turbo는 ComfyUI와 같은 fp16 경로로 LoRA 병합). 같은 체크포인트면 파이프라인 산출물과 **바이트 단위로 같습니다**(베이스와 파인튠 두 종으로 확인).
 - 템플릿: `out/dit/` 아래 베이스·Turbo 그래프 12개(`<stem>_q8a4fn{s,Ls}{,_x,_f16}.onnx`)와 `<stem>_q8a4fnLs.onnx.lora_manifest.json` 2개. 페이지 기준 `../out/dit/`에서 찾고, `?templates=<URL>`로 바꿀 수 있습니다. 샤드·TE·VAE는 필요 없습니다.
 - 매핑표 `web/convert/anima2b.map.json`은 `export/make_convert_map.py`가 빌드 폴더와 원본 체크포인트로 만듭니다(`--prefix` = 빌드 접두사, 변환 결과 파일 이름도 이것을 따름. 템플릿을 해시로 확인하므로 그래프를 다시 빌드하면 함께 다시 만드세요).
-- **WebNN용 파일(선택)**: 변환 페이지의 'WebNN용 파일도 만들기'를 켜면 같은 폴더에 fp16 그래프 6개(일반·슬롯, 각각의 `_sp`, Spectrum 머리 2종)와 샤드 10개, 머리의 `.data`를 더 씁니다(변형당 약 3.7GB). 매핑표는 `web/convert/anima2b.wnn.map.json`(`make_convert_map.py --webnn`으로 WebNN 빌드 폴더에서 생성), 템플릿은 `out/dit/`의 WebNN 그래프 12개(`<stem>_q8a4fn{s,Ls}_wnn1024{,_sp}.onnx`, `<stem>_q8a4fns_wnn1024_head{,k}.onnx`)와 `<stem>_q8a4fnLs_wnn1024.onnx.lora_manifest.json` 2개입니다. 이것도 `build_webnn.bat` 산출물과 바이트 단위로 같습니다. 생성 페이지는 '사용자 설정' 모델에서도 고급 옵션 'WebNN (실험)'을 고르면 이 파일들로 로드합니다(LoRA·Spectrum 포함).
+- **WebNN용 파일(선택)**: 변환 페이지의 'WebNN용 파일도 만들기'를 켜면 같은 폴더에 fp16 그래프 10개(일반·슬롯 × NegPip 유무, 각각의 `_sp`, Spectrum 머리 2종)와 샤드 10개, 머리의 `.data`를 더 씁니다(변형당 약 3.7GB). 매핑표는 `web/convert/anima2b.wnn.map.json`(`make_convert_map.py --webnn`으로 WebNN 빌드 폴더에서 생성), 템플릿은 `out/dit/`의 WebNN 그래프 20개(`<stem>_q8a4fn{s,Ls}_wnn1024{,n}{,_sp}.onnx`, `<stem>_q8a4fns_wnn1024_head{,k}.onnx`)와 `<stem>_q8a4fnLs_wnn1024{,n}.onnx.lora_manifest.json` 4개입니다. 이것도 `build_webnn.bat` 산출물과 바이트 단위로 같습니다. 생성 페이지는 '사용자 설정' 모델에서도 고급 옵션 'WebNN (실험)'을 고르면 이 파일들로 로드합니다(LoRA·Spectrum 포함).
 - 어댑터(`llm_adapter`)는 변환하지 않습니다. 페이지는 모든 모델에 공용 어댑터를 씁니다.
 - 다른 서브도메인에 따로 둘 수 있습니다: `convert/` + `js/convert-core.js` + `workers/convert-*.js` + `css/tokens.css` + `css/app.css` + 템플릿. 생성 페이지의 링크 주소는 모델 목록의 `convert_url`로 정합니다.
 
@@ -155,7 +155,7 @@ index.html  css/  js/  workers/  convert/   ← web/ 그대로 (js/config.js가 
 tokenizers/{qwen3,t5}/
 out/
 ├── dit/           그래프별 .onnx + _x + _f16, 샤드 .N.bin + .manifest.json, 슬롯 그래프는 .lora_manifest.json (.lora.bin은 페이지가 만듦)
-│                  (선택) WebNN: 그래프별 _wnn1024.onnx + _wnn1024_sp.onnx, 샤드 .N.bin + .manifest.json(+ 슬롯은 .lora_manifest.json), 변형별 _wnn1024_head.onnx + .data, _wnn1024_headk.onnx
+│                  (선택) WebNN: 그래프별 _wnn1024{,n}.onnx + _wnn1024{,n}_sp.onnx(n = NegPip 입력), 샤드 .N.bin + .manifest.json(+ 슬롯은 .lora_manifest.json), 변형별 _wnn1024_head.onnx + .data, _wnn1024_headk.onnx
 ├── adapter/       anima_llm_adapter.onnx (+ .data)
 ├── text_encoder/  qwen3_06b_s.onnx + 샤드 + manifest
 ├── vae/           qwen_image_vae_decoder_dyn32_2dc.onnx + _head/_tail/_head_a/_attn/_head_b (+ .data), (선택) WebNN: _2dc_wnn16.onnx

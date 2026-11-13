@@ -373,8 +373,12 @@ async function loadWebnnDit(name, url, onProgress, io = serverIO) {
   };
   if (!HAS_WEBNN) return fallback("이 브라우저에 WebNN(navigator.ml)이 없음 (Chrome은 chrome://flags의 WebNN 플래그 필요)");
   const isSlot = url.includes("_q8a4fnLs"); // LoRA 장착 → 슬롯 그래프
-  const gUrl = url.replace(/\.onnx$/, "_wnn1024.onnx");
-  if (!(await io.has(gUrl)))
+  // <그래프>_wnn1024n.onnx = 같은 그래프 + NegPip 입력(negpip_mask, export/add_negpip.py --graph-only — 샤드·머리 공유, manifest는 자기 이름으로).
+  // 서버가 .onnx를 immutable로 캐시시키므로 새 이름이다. 없으면(이전 빌드·이전 변환 묶음) NegPip 없는 그래프로 — 마스크가 1이면 두 그래프의 결과는 같다.
+  const baseG = url.replace(/\.onnx$/, "_wnn1024.onnx"),
+    negG = url.replace(/\.onnx$/, "_wnn1024n.onnx");
+  const gUrl = (await io.has(negG)) ? negG : baseG;
+  if (gUrl === baseG && !(await io.has(gUrl)))
     return fallback(isSlot ? `이 모델의 WebNN LoRA 슬롯 그래프가 ${io.where} 없음` : `이 모델의 WebNN 그래프가 ${io.where} 없음`);
   const mani = await io.json(gUrl + ".manifest.json");
   if (!mani) return fallback("WebNN 그래프의 샤드 목록(manifest)이 없음");
@@ -383,7 +387,7 @@ async function loadWebnnDit(name, url, onProgress, io = serverIO) {
   // Spectrum(spectrum.js): 본체 = 같은 그래프 + 특징 출력(<그래프>_sp.onnx, 샤드·manifest 공유), 머리 = 특징·timesteps → v_pred
   // (<비슬롯 그래프>_head.onnx + .data, LoRA와 무관). 둘 다 있으면 본체를 _sp로 올린다 — 특징 출력을 안 읽으면 결과·시간은 같다.
   const spUrl = gUrl.replace(/\.onnx$/, "_sp.onnx"),
-    headUrl = gUrl.replace("_q8a4fnLs", "_q8a4fns").replace(/\.onnx$/, "_head.onnx");
+    headUrl = baseG.replace("_q8a4fnLs", "_q8a4fns").replace(/\.onnx$/, "_head.onnx");
   const useSp = (await io.has(spUrl)) && (await io.has(headUrl)) && (await io.has(headUrl + ".data"));
   try {
     log(`${name} WebNN 그래프 다운로드...`, "dim");

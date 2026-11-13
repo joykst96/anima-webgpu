@@ -17,7 +17,7 @@ The [README](README.md) only introduces the features. This document is what you 
 - When `WebAssembly.Suspending` exists (Chrome 137+), ORT uses the **JSPI build** (native C++ WebGPU EP). The DP4A int8 matmul and FlashAttention kernels exist only there; otherwise it falls back to the JSEP build. Pinned to 1.26.0 (`?ort=x.y.z` loads another version for testing).
 - The VAE runs the head once and the tail in horizontal strips (16-latent halo) — bit-identical to a single call, with peak memory bounded by the strip size. Above 1024² the head's attention also runs per query chunk.
 - When the DiT is swapped (model change, precision change, applying LoRAs), the text encoder, adapter and VAE are unloaded and reloaded with it, because ORT WebGPU's buffer cache is only freed once every session on the GPU context is released (pitfall 14).
-- **WebNN path (experimental, optional)**: when selected in the advanced options, only the DiT and the VAE run on ORT's WebNN EP (the `ort.all` bundle, loaded as module instances separate from the standard path). The text encoder, adapter and samplers are unchanged. The DiT uses a static 1024² fp16 graph (`<graph>_wnn1024.onnx`), the VAE an fp16 graph (`<vae>_wnn16.onnx`), and LoRAs use the same slot scheme as the standard path. Spectrum keeps the feature emitted by the main graph as a GPU tensor and runs only the head graphs (`…_head.onnx`, `…_headk.onnx`) for forecast steps. Without `navigator.ml`, without the files, or if session creation fails, the page loads the standard path.
+- **WebNN path (experimental, optional)**: when selected in the advanced options, only the DiT and the VAE run on ORT's WebNN EP (the `ort.all` bundle, loaded as module instances separate from the standard path). The text encoder, adapter and samplers are unchanged. The DiT uses a static 1024² fp16 graph (`<graph>_wnn1024.onnx`), the VAE an fp16 graph (`<vae>_wnn16.onnx`), and LoRAs use the same slot scheme as the standard path. NegPip uses the same graphs with the `negpip_mask` input (`<graph>_wnn1024n.onnx`, same shards); if a model has only the older graphs without it, the page loads those and ignores NegPip. Spectrum keeps the feature emitted by the main graph as a GPU tensor and runs only the head graphs (`…_head.onnx`, `…_headk.onnx`) for forecast steps. Without `navigator.ml`, without the files, or if session creation fails, the page loads the standard path.
 
 ## Accuracy (vs ComfyUI)
 
@@ -69,7 +69,7 @@ For Base and for Turbo (merging `TURBO_LORA` from the top of the script) it runs
 1. `export_dit.py --dynamic --fp32-act` — dynamic-resolution ONNX (fp32 activations, fp16 I/O)
 2. `quantize_dit.py --bits 8 --no-exclude --accuracy-level 4 --fp32-t-embed` — int8 weights + DP4A, with only the two t_embedder layers on fp32 activations
 3. `fuse_attention.py` — decomposed SDPA → `MultiHeadAttention` (FlashAttention); writes `.fuse_meta.json`
-4. `add_negpip.py` — adds the `negpip_mask` input (output unchanged when mask = 1)
+4. `add_negpip.py` — adds the `negpip_mask` input (output unchanged when mask = 1). The WebNN build runs it with `--graph-only` on the sharded graph, before the LoRA slots
 5. `shard_onnx_data.py --shard-mb 400` — splits the weights into 400 MB shards
 6. `add_lora_slots.py --rank 48` — LoRA slot graph (shares the shards)
 
@@ -88,7 +88,7 @@ Only the graph changes; the original shards are referenced as they are. To apply
 
 ### WebNN graphs (optional)
 
-The graphs used by the advanced option "WebNN (experimental)" are built separately. From the ComfyUI portable root, `<repo>\export\webnn\build_webnn.bat <ckpt> <prefix>` produces the Base and Turbo DiT graphs (static 1024², fp16, plus the LoRA slot graphs and the main/head graphs for Spectrum) and the VAE graph (fp16 compute). Without them the page loads the Standard path. Details (Korean): [export/webnn/README.md](export/webnn/README.md).
+The graphs used by the advanced option "WebNN (experimental)" are built separately. From the ComfyUI portable root, `<repo>\export\webnn\build_webnn.bat <ckpt> <prefix>` produces the Base and Turbo DiT graphs (static 1024², fp16, plus the NegPip and LoRA slot graphs and the main/head graphs for Spectrum) and the VAE graph (fp16 compute). Without them the page loads the Standard path. Details (Korean): [export/webnn/README.md](export/webnn/README.md).
 
 ### Text encoder, adapter, VAE
 
@@ -121,7 +121,7 @@ Saves the Qwen3 and T5 tokenizers as `tokenizer.json` for transformers.js. The p
 - Every Anima 2B checkpoint has the same graph structure, so the 12 graphs built by the pipeline above serve as **templates** and only the weight bytes are rebuilt (bf16 → fp32 → int8 block quantization exactly as the ORT quantizer does it; Turbo merges the LoRA through the same fp16 path as ComfyUI). For the same checkpoint the output is **byte-identical** to the pipeline's (checked on the base model and two fine-tunes).
 - Templates: the 12 base/Turbo graphs under `out/dit/` (`<stem>_q8a4fn{s,Ls}{,_x,_f16}.onnx`) and the two `<stem>_q8a4fnLs.onnx.lora_manifest.json`. The page looks in `../out/dit/`; `?templates=<URL>` overrides it. No shards, text encoder or VAE are needed.
 - The map `web/convert/anima2b.map.json` is generated by `export/make_convert_map.py` from a build folder and the source checkpoint (`--prefix` = the build's prefix, which also names the converter's output files; regenerate it whenever you rebuild the graphs, since it checks the templates by hash).
-- **WebNN files (optional)**: with "also make the WebNN files" checked, the converter adds six fp16 graphs (plain and slot, their `_sp` variants, two Spectrum heads), ten shards and the head's `.data` to the same folder (about 3.7 GB per variant). The map is `web/convert/anima2b.wnn.map.json` (generated from a WebNN build folder with `make_convert_map.py --webnn`), and the templates are the 12 WebNN graphs under `out/dit/` (`<stem>_q8a4fn{s,Ls}_wnn1024{,_sp}.onnx`, `<stem>_q8a4fns_wnn1024_head{,k}.onnx`) plus the two `<stem>_q8a4fnLs_wnn1024.onnx.lora_manifest.json`. The output is byte-identical to `build_webnn.bat` as well. For a custom model, the generation page loads these files when the advanced option "WebNN (experimental)" is selected (LoRA and Spectrum included).
+- **WebNN files (optional)**: with "also make the WebNN files" checked, the converter adds ten fp16 graphs (plain and slot, with and without NegPip, their `_sp` variants, two Spectrum heads), ten shards and the head's `.data` to the same folder (about 3.7 GB per variant). The map is `web/convert/anima2b.wnn.map.json` (generated from a WebNN build folder with `make_convert_map.py --webnn`), and the templates are the 20 WebNN graphs under `out/dit/` (`<stem>_q8a4fn{s,Ls}_wnn1024{,n}{,_sp}.onnx`, `<stem>_q8a4fns_wnn1024_head{,k}.onnx`) plus the four `<stem>_q8a4fnLs_wnn1024{,n}.onnx.lora_manifest.json`. The output is byte-identical to `build_webnn.bat` as well. For a custom model, the generation page loads these files when the advanced option "WebNN (experimental)" is selected (LoRA and Spectrum included).
 - The adapter (`llm_adapter`) is not converted; the page uses one shared adapter for every model.
 - It can live on its own subdomain: `convert/` + `js/convert-core.js` + `workers/convert-*.js` + `css/tokens.css` + `css/app.css` + the templates. The generation page links to it through `convert_url` in the model list.
 
@@ -155,7 +155,7 @@ index.html  css/  js/  workers/  convert/   ← web/ as is (js/config.js is the 
 tokenizers/{qwen3,t5}/
 out/
 ├── dit/           per graph: .onnx + _x + _f16, shards .N.bin + .manifest.json; slot graphs also .lora_manifest.json (the page builds .lora.bin itself)
-│                  (optional) WebNN: per graph _wnn1024.onnx + _wnn1024_sp.onnx, shards .N.bin + .manifest.json (+ .lora_manifest.json for slot graphs), per variant _wnn1024_head.onnx + .data, _wnn1024_headk.onnx
+│                  (optional) WebNN: per graph _wnn1024{,n}.onnx + _wnn1024{,n}_sp.onnx (n = NegPip input), shards .N.bin + .manifest.json (+ .lora_manifest.json for slot graphs), per variant _wnn1024_head.onnx + .data, _wnn1024_headk.onnx
 ├── adapter/       anima_llm_adapter.onnx (+ .data)
 ├── text_encoder/  qwen3_06b_s.onnx + shards + manifest
 ├── vae/           qwen_image_vae_decoder_dyn32_2dc.onnx + _head/_tail/_head_a/_attn/_head_b (+ .data), (optional) WebNN: _2dc_wnn16.onnx

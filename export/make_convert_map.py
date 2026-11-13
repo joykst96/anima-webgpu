@@ -40,7 +40,11 @@ GRAPHS = ["_q8a4fns", "_q8a4fns_x", "_q8a4fns_f16", "_q8a4fnLs", "_q8a4fnLs_x", 
 LAYOUT = ["_q8a4fns"]          # 외부 데이터 배치를 읽을 그래프 (샤드 목록은 첫 그래프의 manifest)
 # --webnn (export/webnn/build_webnn.bat 산출물)
 WNN = "_wnn1024"
-GRAPHS_WNN = [f"_q8a4fns{WNN}", f"_q8a4fnLs{WNN}", f"_q8a4fns{WNN}_sp", f"_q8a4fnLs{WNN}_sp", f"_q8a4fns{WNN}_head", f"_q8a4fns{WNN}_headk"]
+GRAPHS_WNN = [f"_q8a4fns{WNN}", f"_q8a4fnLs{WNN}", f"_q8a4fns{WNN}_sp", f"_q8a4fnLs{WNN}_sp", f"_q8a4fns{WNN}_head", f"_q8a4fns{WNN}_headk",
+              # NegPip 입력이 있는 같은 그래프(add_negpip.py --graph-only, 샤드·머리 공유)
+              f"_q8a4fns{WNN}n", f"_q8a4fnLs{WNN}n", f"_q8a4fns{WNN}n_sp", f"_q8a4fnLs{WNN}n_sp"]
+MANIFESTS_WNN = [f"_q8a4fns{WNN}", f"_q8a4fnLs{WNN}", f"_q8a4fns{WNN}n", f"_q8a4fnLs{WNN}n"]   # 샤드 목록을 둘 그래프
+COPIES_WNN = [f"_q8a4fnLs{WNN}", f"_q8a4fnLs{WNN}n"]                                         # lora_manifest를 템플릿에서 복사할 그래프
 LAYOUT_WNN = [f"_q8a4fns{WNN}", f"_q8a4fns{WNN}_head"]
 BLOCK = 32
 # ONNX TensorProto.DataType
@@ -266,8 +270,8 @@ def main():
     sidx = {n: i for i, n in enumerate(shard_names)}
     if args.webnn:
         # 변환기가 쓸 부가 파일: 샤드 목록(manifest)은 그래프 이름마다, LoRA 슬롯 목록은 템플릿 것을 그대로 복사
-        result["manifests"] = [{"file": "{stem}" + g + ".onnx.manifest.json", "shards": list(range(n_mani))} for g in graphs_list[:2]]
-        result["copies"] = ["{stem}" + graphs_list[1] + ".onnx.lora_manifest.json"]
+        result["manifests"] = [{"file": "{stem}" + g + ".onnx.manifest.json", "shards": list(range(n_mani))} for g in MANIFESTS_WNN]
+        result["copies"] = ["{stem}" + g + ".onnx.lora_manifest.json" for g in COPIES_WNN]
 
     entries, consts = [], []
     for name, dtype, dims, loc, off, ln in layouts["base"]:
