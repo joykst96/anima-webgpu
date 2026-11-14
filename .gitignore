@@ -22,7 +22,7 @@ out-local/
 *.fuse_meta.json
 *.lora.bin
 
-# 체크포인트·태그 데이터 (자동완성 danbooru_ko.csv 등)
+# 체크포인트·태그 데이터 (자동완성 danbooru_tags_kr.csv 등)
 diffusion_models/
 *.csv
 

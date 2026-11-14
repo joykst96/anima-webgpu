@@ -1,4 +1,4 @@
-// 태그 자동완성 워커: danbooru_ko.csv 파싱 + 한글 bigram 역인덱스 빌드 (main.js에서 1회 생성)
+// 태그 자동완성 워커: danbooru_tags_kr.csv 파싱 + 한글 bigram 역인덱스 빌드 (main.js에서 1회 생성)
 // tag,0,pc,"설명…키워드:<카테고리>,alias…"  — desc는 따옴표 포함, 내부 콤마 있음
 function parseLine(line) {
   const m = line.match(/^([^,]*),([^,]*),([^,]*),([\s\S]*)$/);

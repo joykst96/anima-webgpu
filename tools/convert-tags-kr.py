@@ -1,7 +1,7 @@
 # /// script
 # requires-python = ">=3.10"
 # ///
-"""태그 자동완성 데이터 변환: mengod-hf/danbooru-tags-kr → out/danbooru_ko.csv 형식.
+"""태그 자동완성 데이터 변환: mengod-hf/danbooru-tags-kr → out/danbooru_tags_kr.csv 형식.
 
 원본: https://huggingface.co/datasets/mengod-hf/danbooru-tags-kr
       (danbooru-tags-backslash-kr-<날짜>.csv — 소괄호 앞에 역슬래시가 붙은 변형. 지금 페이지 태그 표기와 같다)

@@ -42,7 +42,7 @@ This repo ships code only. The following are left out on purpose; the page still
 |---|---|---|
 | Model weights and graphs | `out/dit/`, `out/text_encoder/`, `out/adapter/`, `out/vae/` | Build them from the official releases with the steps under "Converting the models" (license terms apply). |
 | Tokenizers (optional) | `tokenizers/{qwen3,t5}/` | `export/prepare_tokenizers.py`. Without them the page loads the tokenizers from the Hugging Face Hub. |
-| Tag autocomplete data (optional) | `out/danbooru_ko.csv` | Not in the repo. Download `danbooru-tags-backslash-kr-<date>.csv` from [mengod-hf/danbooru-tags-kr](https://huggingface.co/datasets/mengod-hf/danbooru-tags-kr) (CC BY-SA 4.0) and run `uv run tools/convert-tags-kr.py <that.csv> out/danbooru_ko.csv`. After replacing the file, bump `AC_DB_VER` in `web/js/autocomplete.js` so browsers drop the IndexedDB index built from the old file, and upload the CSV before the page JS. Format: optional header `name,category,post_count,description`, then one tag per line; Korean aliases go after `키워드:` inside the quoted description, comma-separated. Without the file, autocomplete is just off. |
+| Tag autocomplete data (optional) | `out/danbooru_tags_kr.csv` | Not in the repo. Download `danbooru-tags-backslash-kr-<date>.csv` from [mengod-hf/danbooru-tags-kr](https://huggingface.co/datasets/mengod-hf/danbooru-tags-kr) (CC BY-SA 4.0) and run `uv run tools/convert-tags-kr.py <that.csv> out/danbooru_tags_kr.csv`. After replacing the file, bump `AC_DB_VER` in `web/js/autocomplete.js` so browsers drop the IndexedDB index built from the old file, and upload the CSV before the page JS. Format: optional header `name,category,post_count,description`, then one tag per line; Korean aliases go after `키워드:` inside the quoted description, comma-separated. Without the file, autocomplete is just off. |
 | Your model list | `web/js/config.js` | The committed file lists only Anima. Generate it from your own list (`export/model-list.yml`, or a separate deployment list) with `gen_models.py`. |
 | Converter map | `web/convert/anima2b.map.json`, `anima2b.wnn.map.json` (WebNN) | The shipped map matches the maintainer's template build, and the converter checks template hashes. Regenerate it from your own build with `export/make_convert_map.py` (`--webnn` for the WebNN map) and serve those graphs as templates. |
 | Golden baseline | `tools/golden.json` | Pixel hashes depend on the build, ORT version, GPU and driver. Create your own on the first run (see "Development and verification tools"). |
@@ -160,7 +160,7 @@ out/
 ├── adapter/       anima_llm_adapter.onnx (+ .data)
 ├── text_encoder/  qwen3_06b_s.onnx + shards + manifest
 ├── vae/           qwen_image_vae_decoder_dyn32_2dc.onnx + _head/_tail/_head_a/_attn/_head_b (+ .data), (optional) WebNN: _2dc_wnn16.onnx
-└── danbooru_ko.csv  tag-autocomplete data
+└── danbooru_tags_kr.csv  tag-autocomplete data
 ```
 
 - `deploy/` has a ready nginx config (`docker compose up -d`). Weights and graphs are served `immutable` for a year; the page and `js/`, `css/`, `workers/` are `no-cache`.
@@ -173,7 +173,7 @@ out/
 
 - `node tools/devserver.mjs --port 5173 --upstream <weights server> --local-out out-local` — serves `web/` and proxies `/out/` to the weights server (GET only; the `ANIMA_UPSTREAM` environment variable works instead of `--upstream`). If the same path exists under `--local-out`, that file is served instead (for testing graphs before deployment; supports HTTP Range). With `--config <file>`, requests for `/js/config.js` get that file (to run the page with your own deployment config). If `tokenizers/` exists at the repo root, tokenizers are served from it too.
 - `tools/harness.mjs` — golden harness. Compares pixel SHA-256 of 9 generation cases plus 8 autocomplete queries against `tools/golden.json`. Changes that alter numerics are judged by PSNR against reference images. The baseline is per environment and not in the repo: load the harness in the page console (`const h = await import("/__tools/harness.mjs")`), run `h.full()`, and once it finishes `await h.saveGolden()` writes `tools/golden.json` through the dev server; later runs use `await h.compareToGolden()`.
-- `tools/convert-tags-kr.py` — converts the Korean Danbooru tag CSV ([mengod-hf/danbooru-tags-kr](https://huggingface.co/datasets/mengod-hf/danbooru-tags-kr)) into the autocomplete format (`out/danbooru_ko.csv`). Standard library only: `uv run tools/convert-tags-kr.py <src.csv> <out.csv>`.
+- `tools/convert-tags-kr.py` — converts the Korean Danbooru tag CSV ([mengod-hf/danbooru-tags-kr](https://huggingface.co/datasets/mengod-hf/danbooru-tags-kr)) into the autocomplete format (`out/danbooru_tags_kr.csv`). Standard library only: `uv run tools/convert-tags-kr.py <src.csv> <out.csv>`.
 - `tools/profile.mjs` — per-kernel GPU time via session profiling.
 - `tools/graph/` — graph analysis and experiment scripts (`info.py`, and experiments such as `batch2.py`, `fuse_matmulnbits.py`, `split_context.py`, each with its results in the file header). Build steps, including the page post-processing (`xattn_compact.py`, `fp16_zones.py`), live in `export/`.
 - `tools/webnn/` — measurement tools for the WebNN path (bench page, a runner that launches Chrome with the WebNN flag).
