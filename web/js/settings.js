@@ -6,7 +6,9 @@ const KEY = "anima.settings.v1";
 // spectrum: 건너뛰는 스텝의 특징을 예측해 머리만 돌리기 (다음 생성부터. WebNN으로 로드했고 Spectrum 그래프가 있을 때만 — spectrum.js)
 // webnnWeights: "fp16" | "int8" — WebNN 가중치 (다음 로드부터). int8은 표준(WebGPU) 샤드를 그대로 쓰는 그래프(<dit>_wnn1024q*.onnx,
 //   export/webnn/webnn_stdq8.py)라 추가 다운로드가 없다. 그 그래프가 없으면 fp16으로 로드한다(loader.js loadWebnnDit).
-const DEFAULTS = { precision: "standard", xattnCompact: false, easyCache: false, spectrum: false, webnnWeights: "fp16" };
+// lowVram: VAE 직전에 세션을 전부 내렸다가 장이 끝나면 다시 올린다(VRAM 8GB급용, 다음 생성부터. 표준·빠르게에서만 — loader.js lowVramBeforeVae).
+//   LoRA를 쓴 모델은 켠 뒤 다시 로드해야 적용된다(병합한 LoRA 가중치를 켰을 때만 보관).
+const DEFAULTS = { precision: "standard", xattnCompact: false, easyCache: false, spectrum: false, webnnWeights: "fp16", lowVram: false };
 
 function load() {
   try {

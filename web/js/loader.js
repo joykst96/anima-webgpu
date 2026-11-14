@@ -76,7 +76,8 @@ async function getOpfs() {
 }
 const cacheName = (url) => url.replace(/[^a-zA-Z0-9._-]/g, "_");
 
-async function cachedFetch(url, onProgress) {
+// quiet: 캐시 히트 로그를 남기지 않는다(저VRAM 모드가 장마다 다시 읽을 때)
+async function cachedFetch(url, onProgress, quiet = false) {
   const dir = await getOpfs();
   if (!dir) return fetchWithProgress(url, onProgress);
 
@@ -96,7 +97,7 @@ async function cachedFetch(url, onProgress) {
       const buf = new Uint8Array(await file.arrayBuffer());
       onProgress(1);
       cacheStats.hit++;
-      log(`  (캐시 히트: ${(file.size / 2 ** 20).toFixed(0)}MB)`, "ok");
+      if (!quiet) log(`  (캐시 히트: ${(file.size / 2 ** 20).toFixed(0)}MB)`, "ok");
       return buf;
     }
   } catch {
@@ -295,6 +296,7 @@ async function buildLoraExternal(lman) {
     log(lora.lastReport, c.report.applied ? "ok" : "err");
   } else {
     bytes = new Uint8Array(total); // 제로 = LoRA 없음 (다운로드 0)
+    return { path: lman.bin, data: bytes, get: async () => new Uint8Array(total) };
   }
   return { path: lman.bin, data: bytes };
 }
@@ -455,8 +457,26 @@ async function loadWebnnDit(name, url, onProgress, io = serverIO) {
   }
 }
 
+// WebGPU 세션을 만들고, 같은 입력으로 다시 만들 재료(recipe)를 붙여 둔다(저VRAM 모드 — 아래 lowVramBeforeVae).
+// ext: [{ path, data, get }] — get()은 같은 바이트를 다시 읽는다(OPFS 캐시·고른 파일). get이 없는 것(병합한 LoRA)은
+// 저VRAM 모드가 켜져 있을 때만 바이트를 붙잡아 둔다. 못 붙잡으면 재료가 불완전해 저VRAM 모드를 건너뛴다.
+async function createSession(graph, opts, ext = []) {
+  const s = await ort.InferenceSession.create(graph, ext.length ? { ...opts, externalData: ext.map(({ path, data }) => ({ path, data })) } : opts);
+  s.recipe = { graph, opts, ext: ext.map(({ path, data, get }) => ({ path, get: get ?? (settings.lowVram ? () => data : null) })) };
+  return s;
+}
+const recipeComplete = (s) => !!(s && s.recipe && s.recipe.ext.every((e) => e.get));
+async function recreateSession(r) {
+  const ext = [];
+  for (const e of r.ext) ext.push({ path: e.path, data: await e.get(), get: e.get });
+  const s = await ort.InferenceSession.create(r.graph, ext.length ? { ...r.opts, externalData: ext.map(({ path, data }) => ({ path, data })) } : r.opts);
+  s.recipe = r;
+  return s;
+}
+
 async function loadSession(name, url, onProgress) {
   const opts = { executionProviders: ["webgpu"] };
+  const ext = []; // 외부 가중치 [{ path, data, get }] — createSession이 opts.externalData로 넘긴다
 
   // 0) 사용자설정: 메모리 파일맵에서 직접 조립 (네트워크/OPFS 미사용). url = { custom: true, slot: LoRA 장착 여부 }
   if (url?.custom && name.startsWith("dit:")) {
@@ -481,7 +501,6 @@ async function loadSession(name, url, onProgress) {
           await readFileBytes(files.get(maniName)),
         ),
       );
-      const ext = [];
       for (const sName of mani.shards) {
         const fh =
           files.get(sName) || files.get(baseName(sName));
@@ -492,16 +511,12 @@ async function loadSession(name, url, onProgress) {
         ext.push({
           path: baseName(sName),
           data: await readFileBytes(fh),
+          get: () => readFileBytes(fh),
         });
       }
-      opts.externalData = ext;
     } else if (files.has(onnxFile + ".data")) {
-      opts.externalData = [
-        {
-          path: onnxFile + ".data",
-          data: await readFileBytes(files.get(onnxFile + ".data")),
-        },
-      ];
+      const fh = files.get(onnxFile + ".data");
+      ext.push({ path: onnxFile + ".data", data: await readFileBytes(fh), get: () => readFileBytes(fh) });
     }
     // 사용자 모델의 LoRA manifest (선택)
     const lmanName = src.base + ".lora_manifest.json";
@@ -527,14 +542,11 @@ async function loadSession(name, url, onProgress) {
         });
         bytes = c.bytes;
         lora.lastReport = `${active.length}개 LoRA — ${c.report.applied}/${c.report.total} 슬롯`;
-      } else bytes = new Uint8Array(total);
-      (opts.externalData = opts.externalData || []).push({
-        path: lman.bin,
-        data: bytes,
-      });
+        ext.push({ path: lman.bin, data: bytes });
+      } else ext.push({ path: lman.bin, data: new Uint8Array(total), get: async () => new Uint8Array(total) });
     }
     log(`${name} 컴파일...`, "dim");
-    const s = await ort.InferenceSession.create(graph, opts);
+    const s = await createSession(graph, opts, ext);
     s.loraManifest = lman;
     s.precision = src.precision;
     s.customVersion = customVersion;
@@ -591,7 +603,6 @@ async function loadSession(name, url, onProgress) {
     const dir = url.slice(0, url.lastIndexOf("/") + 1);
     // 샤드는 SHARD_PARALLEL개씩 동시에 받는다(첫 방문 다운로드 단축). 진행률은 샤드별 진척의 평균.
     const n = mani.shards.length,
-      ext = new Array(n),
       frac = new Array(n).fill(0);
     const report = () => onProgress(0.05 + (frac.reduce((a, b) => a + b, 0) / n) * 0.85);
     let next = 0;
@@ -605,11 +616,10 @@ async function loadSession(name, url, onProgress) {
         });
         frac[i] = 1;
         report();
-        ext[i] = { path: sName, data };
+        ext[i] = { path: sName, data, get: () => cachedFetch(dir + sName, () => {}, true) };
       }
     };
     await Promise.all(Array.from({ length: Math.min(SHARD_PARALLEL, n) }, worker));
-    opts.externalData = ext;
   } else {
     // 2) 단일 .data 폴백 (dynamo exporter 기본 산출물 — te/adapter/vae)
     const dataUrl = url + ".data";
@@ -624,7 +634,7 @@ async function loadSession(name, url, onProgress) {
       const data = await cachedFetch(dataUrl, (f) =>
         onProgress(0.05 + f * 0.85),
       );
-      opts.externalData = [{ path: dataUrl.split("/").pop(), data }];
+      ext.push({ path: dataUrl.split("/").pop(), data, get: () => cachedFetch(dataUrl, () => {}, true) });
     }
   }
   // LoRA 슬롯 manifest는 슬롯 모델에만 있으므로 그때만 요청 (비슬롯 404 회피)
@@ -634,10 +644,10 @@ async function loadSession(name, url, onProgress) {
     : null;
   if (lres && lres.ok) {
     lman = await lres.json();
-    (opts.externalData = opts.externalData || []).push(await buildLoraExternal(lman));
+    ext.push(await buildLoraExternal(lman));
   }
   log(`${name} 컴파일 (셰이더 빌드)...`, "dim");
-  const s = await ort.InferenceSession.create(graph, opts);
+  const s = await createSession(graph, opts, ext);
   s.loraManifest = lman;
   s.precision = precision;
   onProgress(1);
@@ -764,18 +774,19 @@ async function loadVaeSplit(url, onProgress) {
   if (!probes.every((r) => r && r.ok)) return null;
   log("vae 분할 그래프(head/tail) 사용 — 고해상도는 띠 단위 디코드", "dim");
   const data = await cachedFetch(url + ".data", (f) => onProgress(f * 0.9));
-  const opts = { executionProviders: ["webgpu"], externalData: [{ path: baseName(url) + ".data", data }] };
+  const opts = { executionProviders: ["webgpu"] };
+  const ext = [{ path: baseName(url) + ".data", data, get: () => cachedFetch(url + ".data", () => {}, true) }];
   const out = [];
-  for (const u of urls) out.push(await ort.InferenceSession.create(await cachedFetch(u, () => {}), opts));
+  for (const u of urls) out.push(await createSession(await cachedFetch(u, () => {}), opts, ext));
   const split = { head: out[0], tail: out[1] };
   // head 어텐션 청크 분할 조각(_head_a/_attn/_head_b)이 있으면 1536² 이상에서 쓴다 (vae.js runHead)
   const aUrls = ["_head_a", "_attn", "_head_b"].map((s) => `${stem}${s}.onnx`);
   const aProbes = await Promise.all(aUrls.map((u) => fetch(u, { method: "HEAD" }).catch(() => null)));
   if (aProbes.every((r) => r && r.ok)) {
     const [ga, gattn, gb] = await Promise.all(aUrls.map((u) => cachedFetch(u, () => {})));
-    split.headA = await ort.InferenceSession.create(ga, { ...opts, preferredOutputLocation: "gpu-buffer" });
-    split.attn = await ort.InferenceSession.create(gattn, { executionProviders: ["webgpu"] });
-    split.headB = await ort.InferenceSession.create(gb, opts);
+    split.headA = await createSession(ga, { ...opts, preferredOutputLocation: "gpu-buffer" }, ext);
+    split.attn = await createSession(gattn, opts);
+    split.headB = await createSession(gb, opts, ext);
   }
   onProgress(1);
   log("vae OK", "ok");
@@ -928,4 +939,75 @@ async function loadAll() {
   $("btnLoad").disabled = false;
 }
 
-export { clearCache, customFiles, ditNeedsReload, ditSessions, loadAll, loadState, reloadDit, sess, setCustomFiles, tok };
+// ── 저VRAM 모드 (고급 옵션 settings.lowVram, 표준·빠르게 경로) ──
+// ORT WebGPU는 실행 중간 버퍼를 GPU 컨텍스트 캐시에 남기고, 그 캐시는 컨텍스트의 세션이 전부 풀려야 사라진다(releaseDit 주석).
+// VRAM 8GB급에서는 VAE 디코드 때 생긴 버퍼가 캐시에 남아, 다음 장부터 DiT 가중치가 시스템 메모리로 밀려나 2배 가까이 느려진다.
+// 띠를 더 잘게 나누면 VAE는 빨라져도 캐시에 남는 크기 종류가 늘어 DiT가 더 느려진다. 그래서 VAE 직전에 세션을 전부 내려
+// 캐시를 비우고 VAE만 다시 만들어 디코드한 뒤, 장이 끝나면(queue.js pumpQueue) 나머지를 재료(recipe)로 다시 만든다.
+// 8GB 흉내 실측(2026-11-14, Turbo 1024², 2장째부터): 35~38s → 약 19.4s(그림 14.8s + 다시 만들기 4.6s), 그림 비트 동일(LoRA 포함).
+// 16GB에서는 다시 만드는 시간(3.7~4.3s)과 그 뒤 첫 실행의 셰이더 준비(약 1s)만큼 느려진다(12.6 → 약 18s). 다시 읽은 가중치 사본 때문에 물리 RAM이 약 3GB 더 잡힌다(GC 전까지).
+// WebNN DiT에는 쓰지 않는다(별도 장치라 이 캐시와 무관하고, 8GB에서는 WebNN 자체가 맞지 않음).
+let lowVramParked = null; // 내린 상태: { key, dit: { recipe, meta }, items: [[sess 키, recipe]] }
+function lowVramReady() {
+  if (!settings.lowVram || lowVramParked || !sess.dit || sess.dit.staticLat) return false;
+  const warn = (msg) => {
+    if (lowVramReady.warned === msg) return false;
+    lowVramReady.warned = msg;
+    log(`저VRAM 모드 — ${msg}`, "dim");
+    return false;
+  };
+  // OPFS 캐시가 없으면(사생활 모드 등) 다시 올릴 때마다 가중치를 네트워크로 다시 받게 된다
+  if (opfsDir === false) return warn("이 브라우저는 모델 캐시(OPFS)를 쓸 수 없어 적용하지 않음 (장마다 다시 내려받게 됨)");
+  const all = [sess.dit, ...Object.values(sess).filter((s) => s && typeof s.release === "function")];
+  if (all.every(recipeComplete)) return true;
+  return warn("지금 올라간 모델에는 적용할 수 없음(LoRA 가중치를 보관하지 않음). 모델을 다시 로드하면 적용됩니다");
+}
+// VAE 디코드 직전: 세션을 전부 내리고 VAE만 다시 만든다.
+async function lowVramBeforeVae(key) {
+  const d = ditSessions[key];
+  const meta = {};
+  for (const k of ["loraManifest", "precision", "requested", "requestedWeights", "customVersion"]) meta[k] = d[k];
+  const parked = { key, dit: { recipe: d.recipe, meta }, items: [] };
+  lowVramParked = parked;
+  sess.dit = null;
+  delete ditSessions[key];
+  await d.release();
+  for (const k of Object.keys(sess)) {
+    if (!sess[k] || typeof sess[k].release !== "function") continue;
+    parked.items.push([k, sess[k].recipe]);
+    await sess[k].release();
+    sess[k] = null;
+  }
+  await new Promise((r) => setTimeout(r, 300)); // GPU 버퍼 반납 정리 시간 (releaseDit와 같게)
+  for (const [k, r] of parked.items) if (k.startsWith("vae")) sess[k] = await recreateSession(r);
+}
+// 장이 끝난 뒤(실패해도): 내린 세션을 다시 만든다. 실패하면 모델을 내린 상태로 두고 다시 로드를 안내한다.
+async function lowVramRestore() {
+  const p = lowVramParked;
+  if (!p) return;
+  const t0 = performance.now();
+  try {
+    for (const [k, r] of p.items) if (!sess[k]) sess[k] = await recreateSession(r);
+    const d = Object.assign(await recreateSession(p.dit.recipe), p.dit.meta);
+    ditSessions[p.key] = d;
+    sess.dit = d;
+    log(`저VRAM 모드 — 모델 다시 올림 (${((performance.now() - t0) / 1000).toFixed(1)}s)`, "dim");
+  } catch (e) {
+    console.error(e);
+    log(`저VRAM 모드 — 모델을 다시 올리지 못함: ${e.message}. 모델 로드를 다시 눌러 주세요`, "err");
+    for (const k of Object.keys(sess)) {
+      try {
+        if (sess[k] && typeof sess[k].release === "function") await sess[k].release();
+      } catch {}
+      sess[k] = null;
+    }
+    sharedLoaded = false;
+  }
+  lowVramParked = null;
+  // 내린 동안 다른 동작(LoRA 반영 시도 등)이 생성 버튼 상태를 바꿨을 수 있다 — 선택한 모델 기준으로 다시 맞춘다(model-ui onModelChange와 같은 기준)
+  const ready = !!ditSessions[$("modelSel").value];
+  $("btnGen").disabled = !ready;
+  $("btnGenTop").disabled = !ready;
+}
+
+export { clearCache, customFiles, ditNeedsReload, ditSessions, loadAll, loadState, lowVramBeforeVae, lowVramReady, lowVramRestore, reloadDit, sess, setCustomFiles, tok };

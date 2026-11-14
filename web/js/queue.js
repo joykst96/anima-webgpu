@@ -9,7 +9,7 @@ import { createEasyCache } from "./easycache.js";
 import { createSpectrum, predictedSteps } from "./spectrum.js";
 import { previewLatent } from "./preview.js";
 import { lora } from "./lora.js";
-import { ditSessions, loadState, sess } from "./loader.js";
+import { ditSessions, loadState, lowVramBeforeVae, lowVramReady, lowVramRestore, sess } from "./loader.js";
 import { encodePrompt, mergeNegPip } from "./prompt.js";
 import { decodeLatent } from "./vae.js";
 import { PRECISION_LABEL, settings } from "./settings.js";
@@ -115,6 +115,7 @@ async function pumpQueue() {
         log("GPU 컨텍스트가 손실됨 — 페이지를 새로고침해 주세요", "err");
       console.error(e);
     }
+    await lowVramRestore(); // 저VRAM 모드로 VAE 직전에 내린 세션을 다시 올린다(실패한 장도). 큐가 잠긴 채로 끝내야 다음 장이 안전하다
     jobState.cur = null;
     renderQueue();
   }
@@ -211,6 +212,7 @@ async function runJob(job) {
       LAT_N = LAT_C * H * W;
 
     const precision = sess.dit.precision; // 같은 시드라도 모드가 다르면 그림이 달라 메타데이터에 남긴다
+    const weights = sess.dit.weights; // 저VRAM 모드는 VAE 직전에 sess.dit를 내리므로 미리 읽어 둔다
     const steps = job.steps,
       cfg = job.cfg;
     let seed = job.seed;
@@ -454,7 +456,10 @@ async function runJob(job) {
         `Spectrum — ${steps}스텝 중 ${sp.stats.predicted.length}스텝 예측 (${sp.stats.predicted.join(", ")}번째)${hk ? "" : " · 특징 합산은 CPU"}`,
         "dim",
       );
-    log("VAE 디코드...", "dim");
+    if (lowVramReady()) {
+      log("저VRAM 모드 — 세션을 내리고 VAE 디코드...", "dim");
+      await lowVramBeforeVae(job.modelKey);
+    } else log("VAE 디코드...", "dim");
     const dec = await decodeLatent(xf, H, W);
     const img = dec.img; // fp32 (1,3,H,W) [-1,1]
 
@@ -494,7 +499,7 @@ async function runJob(job) {
     const metaTxt =
       `seed ${seed} · ${pxW}x${pxH} · ${steps}스텝 · CFG ${cfg}` +
       (precision !== "standard" ? ` · ${PRECISION_LABEL[precision]}` : "") +
-      (sess.dit.weights === "int8" ? " int8" : "") +
+      (weights === "int8" ? " int8" : "") +
       (xPos.compacted ? " · 패딩 압축" : "") +
       (ec ? " · EasyCache" : "") +
       (sp ? " · Spectrum" : "");

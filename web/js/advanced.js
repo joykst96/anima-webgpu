@@ -1,4 +1,4 @@
-// 고급 옵션 모달 (모델 행의 톱니바퀴). 연산 정밀도(표준/빠르게) + 속도 옵션(패딩 압축, EasyCache).
+// 고급 옵션 모달 (모델 행의 톱니바퀴). 연산 정밀도(표준/빠르게/WebNN) + 속도 옵션(패딩 압축, EasyCache, Spectrum) + 메모리(저VRAM 모드).
 // 설정은 settings.js에 저장되고, 실제 반영은 모델 로드 시점(loader.js loadAll — 상주 DiT의 요청 모드와 다르면 다시 올림).
 import { $ } from "./dom.js";
 import { ditNeedsReload, ditSessions, loadAll, loadState } from "./loader.js";
@@ -46,6 +46,9 @@ function refresh() {
   $("advSpectrum").checked = settings.spectrum;
   if (settings.spectrum && dit && !dit.spectrum)
     status += " · Spectrum: 지금 로드된 모델에서는 쓸 수 없음 (WebNN + Spectrum 그래프 필요)";
+  // 저VRAM 모드는 WebGPU 세션(표준·빠르게)에만 적용된다 (loader.js lowVramBeforeVae)
+  $("advLowVram").checked = settings.lowVram;
+  if (settings.lowVram && dit && dit.staticLat) status += " · 저VRAM 모드: WebNN으로 로드한 모델에는 적용되지 않음";
   $("advStatus").textContent = status;
 }
 
@@ -61,6 +64,7 @@ function initAdvanced() {
     else if (e.target.id === "advXattn") settings.xattnCompact = e.target.checked;
     else if (e.target.id === "advEasyCache") settings.easyCache = e.target.checked;
     else if (e.target.id === "advSpectrum") settings.spectrum = e.target.checked;
+    else if (e.target.id === "advLowVram") settings.lowVram = e.target.checked;
     else return;
     saveSettings();
     refresh();

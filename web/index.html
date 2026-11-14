@@ -443,6 +443,20 @@
           </span>
         </label>
       </fieldset>
+      <fieldset class="adv-group" id="advMemory">
+        <legend>메모리</legend>
+        <label class="adv-choice">
+          <input type="checkbox" id="advLowVram" />
+          <span>
+            <b>저VRAM 모드 (GPU 메모리 8GB급)</b>
+            <small id="advLowVramNote"
+              >이미지 변환(VAE) 직전에 모델을 GPU 메모리에서 내렸다가, 그림이 나온 뒤 다시 올립니다. GPU 메모리가 모자라
+              두 번째 그림부터 눈에 띄게 느려질 때 켜세요. 그림은 같고, 장마다 다시 올리는 몇 초가 더 듭니다. 표준·빠르게에서만
+              동작하고 WebNN에는 적용되지 않습니다. 다음 생성부터 적용됩니다.</small
+            >
+          </span>
+        </label>
+      </fieldset>
     </dialog>
 
     <script type="module" src="js/main.js"></script>

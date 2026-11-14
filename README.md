@@ -52,6 +52,7 @@ On an RTX 5070 Ti (16 GB):
 - Spectrum (WebNN only): on some steps the transformer blocks are skipped; the feature is forecast from earlier steps and only the output layer runs ([Han et al.](https://arxiv.org/abs/2603.01623)). With Base at 30 steps only 17 steps are computed in full, about 24 s → 15 s, and only fine details change. Works with the euler and er_sde samplers.
 - Cross-attention padding compaction: replaces the 512-token padding with "one pad token + score bias ln(m)" (mathematically equivalent). −5.6% per step.
 - EasyCache: skips DiT calls on steps with little change and extrapolates from the previous result (port of the ComfyUI node). −25–29% for Base, 0–11% for Turbo.
+- Low-VRAM mode (for 8 GB-class GPUs): unloads the models from GPU memory right before the VAE decode and loads them back once the image is out. Without it, on a GPU that is short of memory the VAE's leftover buffers push the DiT out to system memory and every image after the first gets slower. With 8 GB simulated on a 16 GB card, Turbo 1024² went from 35–38 s to about 19 s per image (the image is identical). With enough memory it only adds the reload, about 4–6 s per image. Standard and Fast only (not WebNN).
 
 **Results**
 - Gallery, lightbox, ZIP download. Each entry shows its generation settings (seed, size, time, options in use).
