@@ -2,29 +2,25 @@
 REM ============================================================================
 REM  Anima WebNN graphs (experimental "WebNN" precision option of the page)
 REM
-REM  DiT (base and turbo), per variant:
-REM    export_dit (static 1024x1024, fp16 load) -> webnn_fix -> shard
-REM      -> add_lora_slots -> spectrum_split
-REM    -> <prefix>_dit_{dyn32|turbo32}_q8a4fns_wnn1024.onnx   (+ .N.bin, .manifest.json)
-REM    -> ..._q8a4fnLs_wnn1024.onnx     LoRA slot graph, same shards
-REM                                     (+ .manifest.json, .lora_manifest.json)
-REM    -> ..._wnn1024_sp.onnx (both)    same graphs + the Spectrum feature output
-REM    -> ..._q8a4fns_wnn1024_head.onnx (+ .data)  Spectrum head: feature, timesteps -> v_pred
-REM    -> ..._q8a4fns_wnn1024_headk.onnx           head with the weighted sum of 16 features (shares the .data)
-REM    -> ..._q8a4fn{s,Ls}_wnn1024n.onnx (+ _sp)   the same four graphs with the NegPip input
-REM                                     (negpip_mask, add_negpip --graph-only before the LoRA slots;
-REM                                     same shards and head, + .manifest.json, .lora_manifest.json)
-REM    -> ..._wnn1024q{,n}.onnx (+ _sp, slot too)  int8 weights: the same eight graphs pointing at the
-REM                                     STANDARD (WebGPU) shards <prefix>_dit_*_q8a4fns.onnx.N.bin
-REM                                     (webnn_stdq8.py map/apply) + one small _wnn1024q.extra.bin.
-REM                                     Needs the standard graph in OUTDIR (build_dit.bat); skipped if absent.
+REM  DiT (base and turbo), per variant - DYNAMIC graphs: the page fixes the latent size with
+REM  freeDimensionOverrides when it creates the session and creates it again when the resolution changes.
+REM    export_dit --dynamic (fp16 load) -> webnn_fix -> shard -> add_negpip -> add_lora_slots
+REM      -> int8 ConvRot (webnn_q8) -> spectrum_split
+REM    -> <prefix>_dit_{dyn32|turbo32}_q8a4fns_wnnd.onnx   fp16 weights (+ .N.bin shards, .manifest.json)
+REM    -> ..._q8a4fns_wnndn.onnx                     + NegPip input (negpip_mask, add_negpip --graph-only, same shards)
+REM    -> ..._q8a4fnLs_wnnd.onnx, ..._q8a4fnLs_wnndn.onnx   LoRA slot graphs, same shards (+ .lora_manifest.json)
+REM    -> ..._q8a4fns_wnnd_head.onnx (+ .data), ..._headk.onnx   Spectrum heads (fp16, used by fp16 and int8)
+REM    -> ..._wnndr*.onnx (the same four graphs)     int8 weights with ConvRot (webnn_q8.py --dq-cast --rot 64):
+REM                                     own shards ..._q8a4fns_wnndr.onnx.N.bin (about 2 GB); the NegPip and
+REM                                     slot graphs are rewritten graph-only with --like to point at them
+REM    -> ..._sp.onnx (all eight)                    same graphs + the Spectrum feature output
 REM  VAE  : vae_fp16 (all) on the existing dynamic decoder graph
 REM         -> <vae>_wnn16.onnx (graph only, shares the original <vae>.onnx.data)
 REM
 REM  There is no WebNN-specific exporter. The DiT step runs the same
 REM  export\export_dit.py as the WebGPU build (build_dit.bat) with different
-REM  options: no --dynamic / --fp32-act, so the checkpoint is loaded as fp16
-REM  and the graph is static. Everything WebNN-specific lives in this folder.
+REM  options: --dynamic without --fp32-act, so the checkpoint is loaded as fp16.
+REM  Everything WebNN-specific lives in this folder.
 REM
 REM  Usage (run from ComfyUI portable root):
 REM    <repo>\export\webnn\build_webnn.bat <ckpt_path> <output_prefix> [vae_onnx] [base|turbo|both]
@@ -32,7 +28,7 @@ REM  Example:
 REM    C:\repo\export\webnn\build_webnn.bat ComfyUI\models\diffusion_models\anima-base-v1.0.safetensors animav10
 REM
 REM  The last argument picks the variants (default: both). Each variant is
-REM  about 3.6 GB of shards.
+REM  about 3.6 GB (fp16) + 2.0 GB (int8) of shards.
 REM ============================================================================
 
 setlocal enabledelayedexpansion
@@ -43,7 +39,7 @@ set COMFY=ComfyUI
 set TURBO_LORA=ComfyUI\models\loras\anima-turbo-lora-v0.2.safetensors
 set OUTDIR=out\dit
 set WORKDIR=out\webnn-work
-set SIZE=1024
+set ROT=64
 
 REM ---- Script locations (this file is <repo>\export\webnn\build_webnn.bat) ------
 set WN=%~dp0
@@ -100,14 +96,15 @@ if exist "%VAE%" (
 echo.
 echo ============================================================
 echo  Done. Outputs in %OUTDIR%\ per variant ^(dyn32 = base, turbo32 = turbo^):
-echo    ..._q8a4fns_wnn%SIZE%.onnx       + .N.bin shards + .manifest.json
-echo    ..._q8a4fnLs_wnn%SIZE%.onnx      LoRA slot graph: + .manifest.json + .lora_manifest.json
-echo    ..._wnn%SIZE%_sp.onnx ^(both^)     Spectrum main graphs ^(use the manifests of the graphs above^)
-echo    ..._q8a4fns_wnn%SIZE%_head.onnx  + .data, ..._headk.onnx   Spectrum heads
-echo    ..._wnn%SIZE%n.onnx, ..._wnn%SIZE%n_sp.onnx ^(both^)  the same graphs with the NegPip input ^(+ their manifests^)
+echo    ..._q8a4fns_wnnd.onnx       fp16 + .N.bin shards + .manifest.json
+echo    ..._q8a4fns_wnndr.onnx      int8 ConvRot + its own .N.bin shards + .manifest.json
+echo    ..._wnndn, ..._wnndrn       the same with the NegPip input ^(+ manifests^)
+echo    ..._q8a4fnLs_wnnd*.onnx     LoRA slot graphs ^(+ .manifest.json + .lora_manifest.json^)
+echo    ..._sp.onnx ^(all^)           Spectrum main graphs ^(use the manifests of the graphs above^)
+echo    ..._q8a4fns_wnnd_head.onnx  + .data, ..._headk.onnx   Spectrum heads
 echo    %VAE:~0,-5%_wnn16.onnx  ^(shares %VAE%.data^)
 echo  The zero .lora.bin files are not deployed ^(the page builds them^).
-echo  The intermediate export in %WORKDIR%\ ^(about 4GB per variant^) can be deleted.
+echo  The intermediate export in %WORKDIR%\ ^(about 8GB per variant^) can be deleted.
 echo ============================================================
 endlocal
 exit /b 0
@@ -119,36 +116,38 @@ REM ===========================================================================
 :pipeline
 set BASE=%~1
 set EXTRA=%~2
-set RAW=%WORKDIR%\%BASE%_s%SIZE%_f16.onnx
-set FIX=%WORKDIR%\%BASE%_s%SIZE%_f16w.onnx
-set OUT=%OUTDIR%\%BASE%_q8a4fns_wnn%SIZE%.onnx
-set OUTL=%OUTDIR%\%BASE%_q8a4fnLs_wnn%SIZE%.onnx
-set HEAD=%OUTDIR%\%BASE%_q8a4fns_wnn%SIZE%_head.onnx
-set OUTN=%OUTDIR%\%BASE%_q8a4fns_wnn%SIZE%n.onnx
-set OUTLN=%OUTDIR%\%BASE%_q8a4fnLs_wnn%SIZE%n.onnx
+set RAW=%WORKDIR%\%BASE%_dyn_f16.onnx
+set FIX=%WORKDIR%\%BASE%_dyn_f16w.onnx
+set Q8=%WORKDIR%\%BASE%_dyn_q8r.onnx
+set OUT=%OUTDIR%\%BASE%_q8a4fns_wnnd.onnx
+set OUTN=%OUTDIR%\%BASE%_q8a4fns_wnndn.onnx
+set OUTL=%OUTDIR%\%BASE%_q8a4fnLs_wnnd.onnx
+set OUTLN=%OUTDIR%\%BASE%_q8a4fnLs_wnndn.onnx
+set HEAD=%OUTDIR%\%BASE%_q8a4fns_wnnd_head.onnx
+set OUTR=%OUTDIR%\%BASE%_q8a4fns_wnndr.onnx
 
 echo.
-echo --- [1/6] export_dit (%BASE%, static %SIZE%, fp16 load) ---
-%PY% "%EX%\export_dit.py" --comfyui %COMFY% --ckpt "%CKPT%" %EXTRA% --size %SIZE% --out "%RAW%"
+echo --- [1/7] export_dit (%BASE%, dynamic, fp16 load) ---
+%PY% "%EX%\export_dit.py" --comfyui %COMFY% --ckpt "%CKPT%" %EXTRA% --size 1024 --dynamic --out "%RAW%"
 if errorlevel 1 exit /b 1
 
 echo.
-echo --- [2/6] webnn_fix (5D MatMul, allowzero Reshape, fp16 LayerNorm) ---
+echo --- [2/7] webnn_fix (5D MatMul, allowzero Reshape, fp16 LayerNorm) ---
 %PY% -I "%WN%webnn_fix.py" "%RAW%" "%FIX%"
 if errorlevel 1 exit /b 1
 
 echo.
-echo --- [3/6] shard (--shard-mb 400) ---
+echo --- [3/7] shard fp16 (--shard-mb 400) ---
 %PY% "%EX%\shard_onnx_data.py" --src "%FIX%" --out "%OUT%" --shard-mb 400
 if errorlevel 1 exit /b 1
 
 echo.
-echo --- [4/6] add negpip (graph only: negpip_mask input on the cross-attention v_proj, same shards) ---
+echo --- [4/7] add negpip (graph only: negpip_mask input on the cross-attention v_proj, same shards) ---
 %PY% "%EX%\add_negpip.py" --graph-only --src "%OUT%" --out "%OUTN%"
 if errorlevel 1 exit /b 1
 
 echo.
-echo --- [5/6] add lora slots (rank 48, fp16 branches, same lora.bin layout as the WebGPU slot graph) ---
+echo --- [5/7] add lora slots (rank 48, fp16 branches, same lora.bin layout as the WebGPU slot graph) ---
 REM  The NegPip slot graph is made from the NegPip graph so the v_proj LoRA branch also gets the masked context
 %PY% "%EX%\add_lora_slots.py" --src "%OUT%" --out "%OUTL%" --rank 48
 if errorlevel 1 exit /b 1
@@ -156,31 +155,28 @@ if errorlevel 1 exit /b 1
 if errorlevel 1 exit /b 1
 
 echo.
-echo --- [6/6] spectrum split (main graphs with the feature output + head) ---
-%PY% -I "%WN%spectrum_split.py" "%OUT%" --head "%HEAD%"
+echo --- [6/7] int8 ConvRot (webnn_q8 --dq-cast --rot %ROT%, own shards; NegPip and slot graphs graph-only with --like) ---
+%PY% -I "%WN%webnn_q8.py" "%OUT%" "%Q8%" --dq-cast --rot %ROT%
 if errorlevel 1 exit /b 1
-%PY% -I "%WN%spectrum_split.py" "%OUTL%"
+%PY% "%EX%\shard_onnx_data.py" --src "%Q8%" --out "%OUTR%" --shard-mb 400
 if errorlevel 1 exit /b 1
-%PY% -I "%WN%spectrum_split.py" "%OUTN%"
+del "%Q8%" "%Q8%.data"
+%PY% -I "%WN%webnn_q8.py" "%OUTN%" "%OUTDIR%\%BASE%_q8a4fns_wnndrn.onnx" --like "%OUTR%"
 if errorlevel 1 exit /b 1
-%PY% -I "%WN%spectrum_split.py" "%OUTLN%"
+%PY% -I "%WN%webnn_q8.py" "%OUTL%" "%OUTDIR%\%BASE%_q8a4fnLs_wnndr.onnx" --like "%OUTR%"
 if errorlevel 1 exit /b 1
+%PY% -I "%WN%webnn_q8.py" "%OUTLN%" "%OUTDIR%\%BASE%_q8a4fnLs_wnndrn.onnx" --like "%OUTR%"
+if errorlevel 1 exit /b 1
+copy /y "%OUTL%.lora_manifest.json" "%OUTDIR%\%BASE%_q8a4fnLs_wnndr.onnx.lora_manifest.json" >nul
+copy /y "%OUTLN%.lora_manifest.json" "%OUTDIR%\%BASE%_q8a4fnLs_wnndrn.onnx.lora_manifest.json" >nul
 
 echo.
-echo --- [7/7] int8 graphs on the standard shards (webnn_stdq8 map + apply) ---
-set STD=%OUTDIR%\%BASE%_q8a4fns.onnx
-if not exist "%STD%" (
-  echo [SKIP] standard graph not found: %STD% ^(run build_dit.bat first^)
-) else (
-  %PY% -I "%WN%webnn_stdq8.py" map "%OUT%" "%STD%" "%WORKDIR%\%BASE%_stdq8.map.json"
+echo --- [7/7] spectrum split (main graphs with the feature output + the fp16 head) ---
+%PY% -I "%WN%spectrum_split.py" "%OUT%" --head "%HEAD%"
+if errorlevel 1 exit /b 1
+for %%G in (%BASE%_q8a4fns_wnndn %BASE%_q8a4fnLs_wnnd %BASE%_q8a4fnLs_wnndn %BASE%_q8a4fns_wnndr %BASE%_q8a4fns_wnndrn %BASE%_q8a4fnLs_wnndr %BASE%_q8a4fnLs_wnndrn) do (
+  %PY% -I "%WN%spectrum_split.py" "%OUTDIR%\%%G.onnx"
   if errorlevel 1 exit /b 1
-  REM output name = input name with _wnn1024 -> _wnn1024q (e.g. _wnn1024n_sp -> _wnn1024qn_sp)
-  for %%G in (%BASE%_q8a4fns_wnn%SIZE% %BASE%_q8a4fns_wnn%SIZE%n %BASE%_q8a4fnLs_wnn%SIZE% %BASE%_q8a4fnLs_wnn%SIZE%n) do (
-    %PY% -I "%WN%webnn_stdq8.py" apply "%OUTDIR%\%%G.onnx" "%WORKDIR%\%BASE%_stdq8.map.json"
-    if errorlevel 1 exit /b 1
-    %PY% -I "%WN%webnn_stdq8.py" apply "%OUTDIR%\%%G_sp.onnx" "%WORKDIR%\%BASE%_stdq8.map.json"
-    if errorlevel 1 exit /b 1
-  )
 )
 
 echo --- %BASE% done ---

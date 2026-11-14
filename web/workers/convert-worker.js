@@ -1,7 +1,7 @@
 // 체크포인트 변환 Worker: safetensors → 지정한 폴더(FileSystemDirectoryHandle)에 변형별 하위 폴더로 페이지용 DiT 그래프·샤드·manifest.
 // 폴더는 사용자가 고른 실제 폴더(showDirectoryPicker) 또는 OPFS(다운로드용 임시) — 둘 다 createWritable로 같은 경로를 탄다.
 // 계산은 convert-compute.js 풀에 텐서 단위로 나누고, 이 Worker는 파일 쓰기와 템플릿 패치를 맡는다.
-// 메시지: {type:"start", dir, folder, ckpt, lora, strength, variants, mapUrl, webnnMapUrl(선택 — WebNN용 파일도 만든다), templateDir}
+// 메시지: {type:"start", dir, folder, ckpt, lora, strength, variants, mapUrl, webnnMapUrls(선택 — WebNN용 파일도 만든다: fp16·int8 ConvRot 매핑표), templateDir}
 //   ckpt/lora: File 또는 {url, size, name} (convert-core sourceReader), folder: 하위 폴더 이름 앞부분
 //   → {type:"progress", frac, stage} … {type:"done", meta, folders} | {type:"error", message}
 import { convertDit, patchGraph, shardManifest, sourceReader } from "../js/convert-core.js";
@@ -138,11 +138,11 @@ async function runMap(map, { subs, ckpt, lora, strength, variants, templateDir, 
 
 async function start(msg) {
   const t0 = performance.now();
-  const { dir, folder, ckpt, lora, strength, variants, mapUrl, webnnMapUrl, templateDir } = msg;
+  const { dir, folder, ckpt, lora, strength, variants, mapUrl, webnnMapUrls = [], templateDir } = msg;
   post({ type: "progress", frac: 0, stage: "매핑표·템플릿 그래프 받는 중" });
-  // 매핑표: 운영(WebGPU) 그래프용은 항상, WebNN 그래프용은 요청했을 때만 (같은 폴더에 파일이 더해진다)
+  // 매핑표: 운영(WebGPU) 그래프용은 항상, WebNN 그래프용(fp16·int8 ConvRot)은 요청한 것만 (같은 폴더에 파일이 더해진다)
   const maps = [await (await fetch(mapUrl)).json()];
-  if (webnnMapUrl) maps.push(await (await fetch(webnnMapUrl)).json());
+  for (const u of webnnMapUrls) maps.push(await (await fetch(u)).json());
 
   // 변형마다 하위 폴더 하나 = 생성 페이지 '사용자 설정'에서 한 번에 고를 파일 묶음. 이미 있으면 덮어쓰지 않는다.
   const folders = Object.fromEntries(variants.map((v) => [v, `${folder}_${v}`]));
@@ -162,7 +162,8 @@ async function start(msg) {
   try {
     let res = null;
     for (let k = 0; k < maps.length; k++) {
-      const label = maps.length > 1 ? (k === 0 ? "[1/2 기본] " : "[2/2 WebNN] ") : "";
+      const kind = k === 0 ? "기본" : maps[k].format.endsWith("-int8") ? "WebNN int8" : "WebNN fp16";
+      const label = maps.length > 1 ? `[${k + 1}/${maps.length} ${kind}] ` : "";
       const r = await runMap(maps[k], {
         subs, ckpt, lora, strength, variants, templateDir, files,
         progress: (f, stage) => post({ type: "progress", frac: (k + f) / maps.length, stage: label + stage }),
@@ -173,7 +174,7 @@ async function start(msg) {
     const meta = {
       format: maps[0].format,
       mapVersion: maps[0].version,
-      webnn: maps.length > 1 ? { format: maps[1].format, mapVersion: maps[1].version } : null,
+      webnn: maps.length > 1 ? maps.slice(1).map((m) => ({ format: m.format, mapVersion: m.version })) : null,
       source: { name: ckpt.name, size: ckpt.size, lastModified: ckpt.lastModified ?? null, url: ckpt.url ?? null },
       lora: lora ? { name: lora.name, size: lora.size, strength, modules: res.loraModules } : null,
       created: new Date().toISOString(),

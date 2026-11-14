@@ -19,10 +19,14 @@ Anima 2B(28블록) 계열은 그래프 구조가 같고, 그래프의 가중치�
     --build ..\\work\\animav10 --prefix animav10 --out <repo>\\web\\convert\\anima2b.map.json --check
   --prefix: 템플릿 빌드의 build_dit.bat 접두사(그래프 이름 <prefix>_dit_{dyn32,turbo32}_*). 변환 결과 파일 이름도 이것을 따른다.
 
-WebNN용 그래프(export/webnn/build_webnn.bat 산출물)의 매핑표는 --webnn으로 따로 만든다:
+WebNN용 그래프(export/webnn/build_webnn.bat 산출물 — 동적 그래프)의 매핑표는 따로 만든다:
   … --build <WebNN 그래프 폴더> --prefix animav10 --out <repo>\\web\\convert\\anima2b.wnn.map.json --webnn --check
-  가중치가 fp16이라 kind는 f16/f16T뿐이고, 그래프는 변형당 6개(일반·슬롯, 각각의 _sp, Spectrum 머리 2종),
-  외부 데이터는 샤드 10개 + 머리의 .data다. 슬롯 그래프의 lora.bin은 페이지가 만들므로 다루지 않는다.
+  … --build <WebNN 그래프 폴더> --prefix animav10 --out <repo>\\web\\convert\\anima2b.wnnr.map.json --webnn-int8 --check
+  --webnn: fp16 가중치(_wnnd). kind는 f16/f16T/f32r16뿐이고, 그래프는 변형당 10개(일반·NegPip × 일반·슬롯, 각각의 _sp, Spectrum 머리 2종),
+           외부 데이터는 샤드 10개 + 머리의 .data.
+  --webnn-int8: int8 ConvRot 가중치(_wnndr, webnn_q8.py --rot). 선형층은 kind q8r(회전 + 블록 32 int8 — webnn_q8.py와 같은 계산),
+           나머지는 fp16. 그래프는 같은 10개(머리는 fp16 머리 그대로 — int8만 고른 사용자도 Spectrum을 쓰도록), 외부 데이터는 int8 샤드 + 머리의 .data.
+  슬롯 그래프의 lora.bin은 페이지가 만들므로 다루지 않는다.
 """
 import argparse
 import base64
@@ -38,15 +42,24 @@ import numpy as np
 STEMS = {}  # main()에서 --prefix로 채운다: {"base": "<prefix>_dit_dyn32", "turbo": "<prefix>_dit_turbo32"}
 GRAPHS = ["_q8a4fns", "_q8a4fns_x", "_q8a4fns_f16", "_q8a4fnLs", "_q8a4fnLs_x", "_q8a4fnLs_f16"]
 LAYOUT = ["_q8a4fns"]          # 외부 데이터 배치를 읽을 그래프 (샤드 목록은 첫 그래프의 manifest)
-# --webnn (export/webnn/build_webnn.bat 산출물)
-WNN = "_wnn1024"
-GRAPHS_WNN = [f"_q8a4fns{WNN}", f"_q8a4fnLs{WNN}", f"_q8a4fns{WNN}_sp", f"_q8a4fnLs{WNN}_sp", f"_q8a4fns{WNN}_head", f"_q8a4fns{WNN}_headk",
+# --webnn / --webnn-int8 (export/webnn/build_webnn.bat 산출물, 동적 그래프)
+HEAD_WNN = "_wnnd"            # Spectrum 머리는 fp16 하나 — 두 매핑표가 같이 쓴다
+
+
+def wnn_sets(w):
+    """w = 그래프 접미사(_wnnd | _wnndr) → (그래프, manifest를 둘 그래프, lora_manifest를 복사할 그래프, 배치를 읽을 그래프)"""
+    graphs = [f"_q8a4fns{w}", f"_q8a4fnLs{w}", f"_q8a4fns{w}_sp", f"_q8a4fnLs{w}_sp",
               # NegPip 입력이 있는 같은 그래프(add_negpip.py --graph-only, 샤드·머리 공유)
-              f"_q8a4fns{WNN}n", f"_q8a4fnLs{WNN}n", f"_q8a4fns{WNN}n_sp", f"_q8a4fnLs{WNN}n_sp"]
-MANIFESTS_WNN = [f"_q8a4fns{WNN}", f"_q8a4fnLs{WNN}", f"_q8a4fns{WNN}n", f"_q8a4fnLs{WNN}n"]   # 샤드 목록을 둘 그래프
-COPIES_WNN = [f"_q8a4fnLs{WNN}", f"_q8a4fnLs{WNN}n"]                                         # lora_manifest를 템플릿에서 복사할 그래프
-LAYOUT_WNN = [f"_q8a4fns{WNN}", f"_q8a4fns{WNN}_head"]
+              f"_q8a4fns{w}n", f"_q8a4fnLs{w}n", f"_q8a4fns{w}n_sp", f"_q8a4fnLs{w}n_sp",
+              f"_q8a4fns{HEAD_WNN}_head", f"_q8a4fns{HEAD_WNN}_headk"]
+    manis = [f"_q8a4fns{w}", f"_q8a4fnLs{w}", f"_q8a4fns{w}n", f"_q8a4fnLs{w}n"]
+    copies = [f"_q8a4fnLs{w}", f"_q8a4fnLs{w}n"]
+    layout = [f"_q8a4fns{w}", f"_q8a4fns{HEAD_WNN}_head"]
+    return graphs, manis, copies, layout
+
+
 BLOCK = 32
+ROT = 64                      # webnn_q8.py --rot (build_webnn.bat)
 # ONNX TensorProto.DataType
 FLOAT, UINT8, FLOAT16 = 1, 2, 10
 
@@ -99,6 +112,37 @@ def quant8(w):
     if Kp != K:
         q[:, K:] = 0  # 패딩 칸은 양자화기가 쓰지 않아 0으로 남는다
     return q, scale
+
+
+# ───────── WebNN int8 ConvRot (export/webnn/webnn_q8.py --rot와 같은 계산) ─────────
+def hadamard_signs(G):
+    h4 = np.array([[1, 1, 1, -1], [1, 1, -1, 1], [1, -1, 1, 1], [-1, 1, 1, 1]], np.int8)
+    h = h4
+    while h.shape[0] < G:
+        h = np.kron(h, h4)
+    return h
+
+
+def quant8rot(w16t, G):
+    """w16t: MatMul B [K, N] fp32(값은 fp16) → (q int8 [K/32,32,N], scale f32 [K/32,1,N]). K % G == 0이면 회전(H·W)부터."""
+    K, N = w16t.shape
+    W = w16t
+    if G and K % G == 0:
+        R = np.matmul(hadamard_signs(G).astype(np.float64), w16t.astype(np.float64).reshape(K // G, G, N)) * (1.0 / np.sqrt(G))
+        W = R.reshape(K, N).astype(np.float32)
+    W = W.reshape(K // BLOCK, BLOCK, N)
+    scale = (np.abs(W).max(axis=1, keepdims=True) / np.float32(127)).astype(np.float32)
+    scale[scale == 0] = 1.0
+    q = np.clip(np.rint(W / scale), -127, 127).astype(np.int8)
+    return q, scale
+
+
+def q8r_target(shape):
+    """webnn_q8.py가 양자화할 수 있는 MatMul B인가: [K, N] = 체크포인트 [N, K]의 전치, K % 32 == 0, 원소 64K 이상"""
+    if len(shape) != 2:
+        return False
+    N, K = shape
+    return K % BLOCK == 0 and N * K >= 1 << 16
 
 
 # ───────── ONNX protobuf 최소 파서 (initializer의 파일 내 바이트 위치) ─────────
@@ -185,9 +229,15 @@ def main():
     p.add_argument("--prefix", default="animav10", help="템플릿 빌드 접두사 (build_dit.bat의 prefix)")
     p.add_argument("--out", required=True, help="매핑표 JSON")
     p.add_argument("--check", action="store_true", help="매핑표만으로 베이스 샤드·그래프를 재조립해 바이트 대조")
-    p.add_argument("--webnn", action="store_true", help="WebNN용 그래프(build_webnn.bat 산출물)의 매핑표를 만든다")
+    p.add_argument("--webnn", action="store_true", help="WebNN fp16 동적 그래프(_wnnd, build_webnn.bat 산출물)의 매핑표를 만든다")
+    p.add_argument("--webnn-int8", action="store_true", help="WebNN int8 ConvRot 동적 그래프(_wnndr)의 매핑표를 만든다")
     args = p.parse_args()
-    graphs_list, layout_list = (GRAPHS_WNN, LAYOUT_WNN) if args.webnn else (GRAPHS, LAYOUT)
+    int8 = args.webnn_int8
+    args.webnn = args.webnn or int8
+    if args.webnn:
+        graphs_list, manis_wnn, copies_wnn, layout_list = wnn_sets("_wnndr" if int8 else "_wnnd")
+    else:
+        graphs_list, layout_list = GRAPHS, LAYOUT
     STEMS.update(base=f"{args.prefix}_dit_dyn32", turbo=f"{args.prefix}_dit_turbo32")
 
     t0 = time.time()
@@ -215,10 +265,14 @@ def main():
                 add(k, "f32r16T", np.ascontiguousarray(r16.T).tobytes())
             else:
                 add(k, "f32T", np.ascontiguousarray(w.T).tobytes())
-            if not args.webnn:                 # WebNN 그래프는 fp16 가중치뿐 — int8 후보는 만들지 않는다(시간 절약)
+            if not args.webnn:                 # WebNN fp16 그래프는 int8 후보가 필요 없다(시간 절약)
                 q, s = quant8(w)
                 add(k, "q8B", q.tobytes())
                 add(k, "q8S", s.tobytes())
+            elif int8 and q8r_target(w.shape):
+                q, s = quant8rot(np.ascontiguousarray(r16.T), ROT)
+                add(k, "q8rB", q.tobytes())
+                add(k, "q8rS", s.tobytes())
     print(f"[cand] 후보 해시 {len(cand)}개 ({time.time() - t0:.1f}s)")
 
     def resolve(name, hits):
@@ -238,7 +292,8 @@ def main():
                 shard_cache[path] = f.read()
         return shard_cache[path]
 
-    result = {"format": "anima2b-convert-map" + ("-webnn" if args.webnn else ""), "version": 1, "block": BLOCK, "stems": STEMS}
+    result = {"format": "anima2b-convert-map" + ("-webnn-int8" if int8 else "-webnn" if args.webnn else ""), "version": 2 if args.webnn else 1,
+              "block": BLOCK, "stems": STEMS, **({"rot": ROT} if int8 else {})}
     used = {}  # key → set(kind)
 
     # ── 1) 샤드 배치 (베이스 _q8a4fns 기준, Turbo는 같은 배치인지 확인) ──
@@ -270,8 +325,8 @@ def main():
     sidx = {n: i for i, n in enumerate(shard_names)}
     if args.webnn:
         # 변환기가 쓸 부가 파일: 샤드 목록(manifest)은 그래프 이름마다, LoRA 슬롯 목록은 템플릿 것을 그대로 복사
-        result["manifests"] = [{"file": "{stem}" + g + ".onnx.manifest.json", "shards": list(range(n_mani))} for g in MANIFESTS_WNN]
-        result["copies"] = ["{stem}" + g + ".onnx.lora_manifest.json" for g in COPIES_WNN]
+        result["manifests"] = [{"file": "{stem}" + g + ".onnx.manifest.json", "shards": list(range(n_mani))} for g in manis_wnn]
+        result["copies"] = ["{stem}" + g + ".onnx.lora_manifest.json" for g in copies_wnn]
 
     entries, consts = [], []
     for name, dtype, dims, loc, off, ln in layouts["base"]:
@@ -306,11 +361,21 @@ def main():
             N, K = w.shape
             ent_out.append({"key": k, "kind": "q8", "N": N, "K": K, "shard": d["q8B"]["shard"], "offset": d["q8B"]["offset"],
                             "sshard": d["q8S"]["shard"], "soffset": d["q8S"]["offset"]})
+        elif "q8rB" in d:
+            # int8 ConvRot 한 쌍. 같은 텐서의 fp16 사본이 머리 .data에 있을 수 있다(final_layer) → 그 자리는 별도 항목
+            assert "q8rS" in d and not any(kk[0] == k and kk[1].startswith("q8r") for kk in also), (k, list(d))
+            N, K = w.shape
+            ent_out.append({"key": k, "kind": "q8r", "N": N, "K": K, "G": ROT if K % ROT == 0 else 0,
+                            "shard": d["q8rB"]["shard"], "offset": d["q8rB"]["offset"], "sshard": d["q8rS"]["shard"], "soffset": d["q8rS"]["offset"]})
+            for kind, e in d.items():
+                if kind in ("q8rB", "q8rS"):
+                    continue
+                ent_out.append({"key": k, "kind": kind, "shape": list(w.shape), "shard": e["shard"], "offset": e["offset"],
+                                **({"also": also[(k, kind)]} if (k, kind) in also else {})})
         else:
-            assert len(d) == 1, (k, list(d))
-            (kind, e), = d.items()
-            ent_out.append({"key": k, "kind": kind, "shape": list(w.shape), "shard": e["shard"], "offset": e["offset"],
-                            **({"also": also[(k, kind)]} if (k, kind) in also else {})})
+            for kind, e in d.items():         # 보통 하나. 같은 텐서가 다른 형식으로 두 자리에 있을 수 있다(머리 .data 등)
+                ent_out.append({"key": k, "kind": kind, "shape": list(w.shape), "shard": e["shard"], "offset": e["offset"],
+                                **({"also": also[(k, kind)]} if (k, kind) in also else {})})
     result["tensors"] = ent_out
     result["consts"] = consts
     cbytes = sum(c["length"] for c in consts)
@@ -379,6 +444,10 @@ def check(m, sd, build):
         w = sd[e["key"]]
         if e["kind"] == "q8":
             q, s = quant8(w)
+            shards[e["shard"]][e["offset"]:e["offset"] + q.nbytes] = q.tobytes()
+            shards[e["sshard"]][e["soffset"]:e["soffset"] + s.nbytes] = s.tobytes()
+        elif e["kind"] == "q8r":
+            q, s = quant8rot(np.ascontiguousarray(w.astype(np.float16).astype(np.float32).T), e["G"])
             shards[e["shard"]][e["offset"]:e["offset"] + q.nbytes] = q.tobytes()
             shards[e["sshard"]][e["soffset"]:e["soffset"] + s.nbytes] = s.tobytes()
         else:

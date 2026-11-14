@@ -1,14 +1,15 @@
 // 독립 변환 페이지: 로컬 safetensors → (사용자가 고른 폴더 | OPFS 임시 후 다운로드) — 생성 페이지 '사용자 설정'에서 그 파일들을 고른다.
 // 다른 서브도메인에 따로 배포할 수 있다: 이 폴더(convert/) + js/convert-core.js + workers/convert-*.js + css/app.css +
-// 템플릿 out/dit/animav10_*.onnx(12개)·*.lora_manifest.json(2개). 템플릿 경로는 이 페이지 기준 ../out/dit/ (?templates=로 바꿀 수 있음).
+// 템플릿 out/dit/animav10_*.onnx·*.lora_manifest.json(매핑표의 graphs·copies). 템플릿 경로는 이 페이지 기준 ../out/dit/ (?templates=로 바꿀 수 있음).
 import { urlSource } from "../js/convert-core.js";
 
 const $ = (id) => document.getElementById(id);
 const params = new URLSearchParams(location.search);
 const MAP_URL = new URL("./anima2b.map.json", import.meta.url).href;
-// WebNN용 그래프의 매핑표 (export/make_convert_map.py --webnn). 'WebNN용 파일도 만들기'를 켰을 때만 쓴다.
-// 템플릿은 같은 폴더의 WebNN 그래프 20개(<stem>_q8a4fn{s,Ls}_wnn1024{,n}{,_sp}.onnx, <stem>_q8a4fns_wnn1024_head{,k}.onnx — n = NegPip 입력)와 슬롯 그래프의 lora_manifest 4개.
-const WEBNN_MAP_URL = new URL("./anima2b.wnn.map.json", import.meta.url).href;
+// WebNN용 동적 그래프의 매핑표 (export/make_convert_map.py --webnn / --webnn-int8). 해당 체크박스를 켰을 때만 쓴다.
+//   fp16: 템플릿 <stem>_q8a4fn{s,Ls}_wnnd{,n}{,_sp}.onnx 8개 + Spectrum 머리 <stem>_q8a4fns_wnnd_head{,k}.onnx + 슬롯 그래프의 lora_manifest 2개 (n = NegPip 입력)
+//   int8 ConvRot: <stem>_q8a4fn{s,Ls}_wnndr{,n}{,_sp}.onnx 8개 + 같은 fp16 머리 + lora_manifest 2개. 가중치는 이 브라우저에서 회전·양자화한다.
+const WEBNN_MAPS = { fp16: new URL("./anima2b.wnn.map.json", import.meta.url).href, int8: new URL("./anima2b.wnnr.map.json", import.meta.url).href };
 const TEMPLATE_DIR = new URL(params.get("templates") || "../out/dit/", location.href).href;
 // 폴더 저장(File System Access)이 없으면 OPFS에 쓰고 다운로드 링크를 준다. ?download=1이면 강제로 다운로드 방식.
 const PICK = typeof window.showDirectoryPicker === "function" && !params.has("download");
@@ -117,7 +118,8 @@ $("btnConvert").onclick = async () => {
       wk.onerror = (e) => reject(new Error(e.message || "Worker 오류"));
       wk.postMessage({
         type: "start", dir, folder, ckpt, lora, strength: 1.0, variants, mapUrl: MAP_URL,
-        webnnMapUrl: $("convWebnn").checked ? WEBNN_MAP_URL : null, templateDir: TEMPLATE_DIR,
+        webnnMapUrls: [...($("convWebnn").checked ? [WEBNN_MAPS.fp16] : []), ...($("convWebnn8").checked ? [WEBNN_MAPS.int8] : [])],
+        templateDir: TEMPLATE_DIR,
       });
     });
     window.__convertResult = { meta, folders }; // 확인용

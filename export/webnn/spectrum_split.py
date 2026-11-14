@@ -6,6 +6,8 @@
 # 를 만든다.
 #   python -I export/webnn/spectrum_split.py <src.onnx> [--head <head.onnx>]
 #   --head를 주면 머리도 쓴다(머리는 LoRA 슬롯과 무관하므로 비슬롯 그래프에서 한 번만 만든다).
+#   동적 그래프(export_dit.py --dynamic)도 받는다: 특징의 H/2·W/2는 이름 있는 차원(feat_h, feat_w)이 되고, 페이지가 세션을 만들 때
+#   freeDimensionOverrides로 고정한다. 머리 안에서 latent의 H·W를 읽던 Shape(latent)는 2 × 특징 H·W로 바꿔 latent 입력을 없앤다.
 #
 # Spectrum(Han et al., arXiv:2603.01623)은 건너뛰는 스텝에서 블록 전체를 생략하고, 저장해 둔 이 특징들로 그 스텝의 특징을 예측해
 # 머리만 돌린다(web/js/spectrum.js). 머리는 그 스텝의 timestep으로 돌려야 한다 — 같은 특징이라도 σ가 0.5 → 0.1이면 출력이 10% 달라진다.
@@ -42,7 +44,7 @@ feat32 = wrapped[0].input[0]                      # Cast(fp32)의 출력 = Layer
 out_name = g.output[0].name
 inf = shape_inference.infer_shapes(m)
 vi = {v.name: v for v in list(inf.graph.value_info) + list(inf.graph.input)}
-fshape = [d.dim_value for d in vi[prod[feat32].input[0]].type.tensor_type.shape.dim]   # Cast 입력(fp16)의 shape = 특징 shape
+fshape = [d.dim_value if d.HasField("dim_value") else ("feat_h", "feat_w")[k - 2] for k, d in enumerate(vi[prod[feat32].input[0]].type.tensor_type.shape.dim)]  # 동적판: H/2·W/2를 이름 있는 차원으로
 
 # ── 머리: (특징, timesteps) → v_pred ──
 if head_out:
@@ -50,7 +52,7 @@ if head_out:
     m_head = onnx.ModelProto()
     m_head.CopyFrom(m)
     m_head.graph.value_info.append(helper.make_tensor_value_info(feat32, TensorProto.FLOAT, fshape))
-    head = utils.Extractor(m_head).extract_model([feat32, "timesteps"], [out_name])
+    head = utils.Extractor(m_head).extract_model([feat32, "timesteps", "latent"], [out_name])
     names = {i.name for i in head.graph.input} | {t.name for t in head.graph.initializer} | {o for n in head.graph.node for o in n.output}
     dangling = sorted({i for n in head.graph.node for i in n.input if i} - names)
     if dangling:
@@ -62,6 +64,30 @@ if head_out:
     for i in head.graph.input:
         if i.name == feat32:
             i.CopyFrom(helper.make_tensor_value_info(FEAT, TensorProto.FLOAT, fshape))
+    # 동적판: 머리 안의 Shape(latent, start=3|4)(= latent H·W, unpatchify reshape·출력 자르기에 쓰임)를 2 × 특징 H·W로 바꾸고 latent 입력을 뺀다.
+    # 짝수 latent 전용(64px 배수 해상도는 모두 해당) — 홀수면 원래 그래프는 패딩 후 자르지만 여기선 2·ceil(H/2)가 된다.
+    from onnx import numpy_helper
+    import numpy as np
+    head.graph.initializer.append(numpy_helper.from_array(np.array([2], np.int64), "sp_two"))
+    new, n_sh = [], 0
+    for n in head.graph.node:
+        if n.op_type == "Shape" and n.input[0] == "latent":
+            st = {x.name: x.i for x in n.attribute}["start"]          # 3 → H, 4 → W
+            new.append(helper.make_node("Shape", [FEAT], [n.output[0] + "_fh"], start=st - 1, end=st, name=n.name + "_feat"))
+            new.append(helper.make_node("Mul", [n.output[0] + "_fh", "sp_two"], [n.output[0]], name=n.name + "_x2"))
+            n_sh += 1
+        else:
+            new.append(n)
+    del head.graph.node[:]
+    head.graph.node.extend(new)
+    keep = [i for i in head.graph.input if i.name != "latent"]
+    del head.graph.input[:]
+    head.graph.input.extend(keep)
+    left = [i for n in head.graph.node for i in n.input if i == "latent"]
+    if left:
+        sys.exit(f"머리에 latent 사용이 남음: {len(left)}")
+    if n_sh:
+        print(f"[spectrum_split] 동적 머리: Shape(latent) {n_sh}개 -> 2 × Shape({FEAT})")
     load_external_data_for_model(head, os.path.dirname(os.path.abspath(src)))   # 머리가 쓰는 초기값만 샤드에서 읽는다
     nbytes = sum(len(t.raw_data) for t in head.graph.initializer)
     data = os.path.basename(head_out) + ".data"

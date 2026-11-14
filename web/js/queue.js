@@ -193,14 +193,16 @@ async function runJob(job) {
     return;
   }
   // 정적 그래프(WebNN)는 한 해상도만 받는다. SPEED는 도중에 해상도가 바뀌어 쓸 수 없다.
-  // (실험) 동적 그래프(?wnndyn=1)면 해상도가 다를 때 세션을 그 크기로 다시 만든다.
+  // 동적 그래프(loader.js loadWebnnDit)면 해상도가 다를 때 세션을 그 크기로 다시 만든다(약 8초, 다운로드 없음).
   const sl0 = sess.dit.staticLat;
   if (sl0 && sess.dit.wnnDyn && !job.speed && (job.pxH / 8 !== sl0.h || job.pxW / 8 !== sl0.w)) await resizeWebnnDit(job.modelKey, job.pxH / 8, job.pxW / 8);
   const sl = sess.dit.staticLat;
   if (sl && (job.speed || job.pxH / 8 !== sl.h || job.pxW / 8 !== sl.w)) {
     log(
-      `건너뜀 — WebNN으로 로드한 모델은 ${sl.w * 8}×${sl.h * 8} 전용${job.speed ? "이고 SPEED를 쓸 수 없음" : ""}. ` +
-        "해상도를 맞추거나 고급 옵션에서 연산 정밀도를 바꾸세요",
+      sess.dit.wnnDyn
+        ? "건너뜀 — WebNN으로 로드한 모델에서는 SPEED를 쓸 수 없음. SPEED를 끄거나 고급 옵션에서 연산 정밀도를 바꾸세요"
+        : `건너뜀 — WebNN으로 로드한 모델은 ${sl.w * 8}×${sl.h * 8} 전용${job.speed ? "이고 SPEED를 쓸 수 없음" : ""}. ` +
+            "해상도를 맞추거나 고급 옵션에서 연산 정밀도를 바꾸세요",
       "err",
     );
     return;

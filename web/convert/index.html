@@ -57,9 +57,12 @@
         <input id="convCkpt" type="file" accept=".safetensors" />
         <label class="row-chk"><input id="convTurbo" type="checkbox" />Turbo 변형도 만들기 (Turbo LoRA 파일 선택)</label>
         <input id="convLora" type="file" accept=".safetensors" disabled />
-        <label class="row-chk"><input id="convWebnn" type="checkbox" />WebNN용 파일도 만들기 (변형당 3.7GB 추가)</label>
+        <label class="row-chk"><input id="convWebnn" type="checkbox" />WebNN fp16 파일도 만들기 (변형당 3.7GB 추가)</label>
+        <label class="row-chk"><input id="convWebnn8" type="checkbox" />WebNN int8 (ConvRot) 파일도 만들기 (변형당 2.1GB 추가)</label>
         <div class="note">
-          생성 페이지 고급 옵션의 연산 정밀도 'WebNN (실험)'에서 쓰는 fp16 그래프·가중치와 Spectrum용 그래프를 같은 폴더에 더합니다.
+          생성 페이지 고급 옵션의 연산 정밀도 'WebNN (실험)'에서 쓰는 그래프·가중치(NegPip·LoRA 슬롯·Spectrum용 포함)를 같은 폴더에 더합니다.
+          fp16과 int8은 같은 옵션 안의 'fp16 가중치'·'int8 가중치 (ConvRot)'에 대응하며, 둘 중 하나만 만들어도 됩니다.
+          int8은 가중치를 회전한 뒤 양자화하는 계산이 더해져 변환이 더 걸립니다.
         </div>
         <label for="convName">결과 폴더 이름</label>
         <input id="convName" type="text" placeholder="비우면 체크포인트 파일 이름" />
@@ -74,8 +77,8 @@
         <div class="note note-md">
           모델 → <b>사용자 설정 (직접 모델 지정)</b> → DiT 모델 파일에서 결과 폴더(<code>…_base</code> 또는
           <code>…_turbo</code>) 안의 파일을 <b>전부</b> 선택한 뒤 모델 로드. LoRA·'빠르게' 모드도 서버 모델과 똑같이 동작합니다.
-          크기는 변형당 2.3GB(Turbo 포함 4.6GB). WebNN용 파일을 함께 만들었으면 변형당 6.0GB이고, 고급 옵션에서
-          'WebNN (실험)'을 고르면 그 파일로 로드합니다(LoRA·Spectrum 포함).
+          크기는 변형당 2.3GB(Turbo 포함 4.6GB). WebNN용 파일을 함께 만들었으면 fp16은 3.7GB, int8은 2.1GB가 더해지고,
+          고급 옵션에서 'WebNN (실험)'을 고르면 그 파일로 로드합니다(해상도 자유, LoRA·NegPip·Spectrum 포함).
         </div>
       </div>
     </div>

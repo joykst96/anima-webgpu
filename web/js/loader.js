@@ -269,15 +269,18 @@ function customSource(slot) {
 }
 
 // ── WebNN DiT (고급 옵션 'WebNN', 실험) ──
-// <dit>_wnn1024.onnx = 정적 1024² fp16 그래프(export/webnn/build_webnn.bat: export_dit.py --size 1024 → webnn_fix.py → shard_onnx_data.py).
-// 가중치가 fp16이라 샤드도 따로다(<그래프>.manifest.json). 이름이 <dit> 앞부분으로 시작해 pruneOldCache가 지우지 않는다.
-// LoRA를 붙였으면 호출부가 슬롯 그래프 주소(<ditLora> = …_q8a4fnLs.onnx)를 주므로 여기서도 …_q8a4fnLs_wnn1024.onnx(슬롯 그래프, 샤드 공유)를 쓴다.
+// 그래프(export/webnn/build_webnn.bat): 동적 그래프가 기본이다 — 세션을 만들 때 latent 크기를 freeDimensionOverrides로 고정하고,
+// 다른 해상도 작업이 오면 resizeWebnnDit가 다시 만든다.
+//   <dit>_wnnd.onnx  = fp16 가중치(샤드 <그래프>.manifest.json, 약 3.7GB)
+//   <dit>_wnndr.onnx = int8 ConvRot 가중치(webnn_q8.py --rot 64, 자기 샤드 약 2.1GB) — 고급 옵션 'int8 가중치 (ConvRot)'
+//   이름 뒤 n = NegPip 입력(negpip_mask)이 있는 같은 그래프(샤드 공유). 없으면 NegPip 없는 그래프로 — 마스크가 1이면 결과는 같다.
+// 동적 그래프가 없는 모델(이전 빌드·이전 변환 묶음)은 정적 1024² fp16 그래프(<dit>_wnn1024{,n}.onnx)로 로드하고 1024×1024로만 생성한다.
+// 이름이 <dit> 앞부분으로 시작해 pruneOldCache가 지우지 않는다.
+// LoRA를 붙였으면 호출부가 슬롯 그래프 주소(<ditLora> = …_q8a4fnLs.onnx)를 주므로 여기서도 …_q8a4fnLs_<접미사>.onnx(슬롯 그래프, 샤드 공유)를 쓴다.
 // 슬롯 레이아웃(lora_manifest)은 표준 슬롯 그래프와 같아 변환 워커·lora_scale 입력을 그대로 쓴다(export/add_lora_slots.py).
 // 쓸 수 없으면(브라우저 미지원·그래프 없음·생성 실패·시간 초과) null → 호출부가 표준 경로로 로드한다.
 // ORT Web 1.26은 브라우저가 그래프를 거부하면 create가 끝나지 않으므로 시간 제한을 둔다(ort.js loadOrtWebnn 주석).
 const WEBNN_CREATE_TIMEOUT_MS = 180000;
-// (실험) ?wnndyn=1 이면 동적 WebNN 그래프(<그래프>_wnnd.onnx)를 쓴다. 2026-11-14 로컬 측정용 — 운영 미반영.
-const WNN_DYN = typeof location !== "undefined" && new URLSearchParams(location.search).has("wnndyn");
 
 // LoRA 슬롯 그래프의 외부 데이터(lora.bin): 장착된 LoRA를 manifest 레이아웃으로 변환한다(Worker). 없으면 0으로 채움(다운로드 0).
 // 표준(WebGPU)·WebNN 슬롯 그래프가 같은 레이아웃을 쓴다.
@@ -334,7 +337,7 @@ const customIO = {
 //                   본체와 같은 MLContext(ctx)여야 텐서를 넘길 수 있다. 없거나 못 올리면 ditHead(CPU 경로)만 쓴다.
 // 돌려주는 값: false(Spectrum 불가) | { gpu: 가중합 머리를 쓸 수 있는지 }
 async function loadSpectrumHead(headUrl, ctx, io = serverIO, dims = null) {
-  // dims: (실험) 동적 머리면 특징 차원 {feat_h, feat_w}를 고정한다
+  // dims: 동적 머리면 특징 차원 {feat_h, feat_w}(= latent의 절반)를 고정한다
   const create = async (ortW, graph, data, ep) => {
     let timer;
     return await Promise.race([
@@ -378,36 +381,33 @@ async function loadWebnnDit(name, url, onProgress, io = serverIO) {
   };
   if (!HAS_WEBNN) return fallback("이 브라우저에 WebNN(navigator.ml)이 없음 (Chrome은 chrome://flags의 WebNN 플래그 필요)");
   const isSlot = url.includes("_q8a4fnLs"); // LoRA 장착 → 슬롯 그래프
-  // <그래프>_wnn1024n.onnx = 같은 그래프 + NegPip 입력(negpip_mask, export/add_negpip.py --graph-only — 샤드·머리 공유, manifest는 자기 이름으로).
-  // 서버가 .onnx를 immutable로 캐시시키므로 새 이름이다. 없으면(이전 빌드·이전 변환 묶음) NegPip 없는 그래프로 — 마스크가 1이면 두 그래프의 결과는 같다.
-  // int8 가중치(settings.webnnWeights): <그래프>_wnn1024q{,n}.onnx — 표준(WebGPU) 그래프의 샤드(<dit>.onnx.N.bin)와 작은 extra 파일을 가리키는
-  // 같은 계산 그래프(export/webnn/webnn_stdq8.py). 표준으로 한 번이라도 받았으면 OPFS 캐시의 샤드를 그대로 써서 다운로드가 없다.
-  // 없으면(int8 그래프를 아직 안 만든 모델·사용자 설정 모델) fp16 그래프로.
-  const baseG = url.replace(/\.onnx$/, "_wnn1024.onnx"),
-    negG = url.replace(/\.onnx$/, "_wnn1024n.onnx");
+  // 그래프 고르기: 동적(int8을 골랐으면 _wnndr 먼저, 그다음 _wnnd) → 정적(_wnn1024). 각각 NegPip판(이름 뒤 n)이 있으면 그것을.
+  // 서버가 .onnx를 immutable로 캐시시키므로 바뀐 그래프는 새 이름이다.
+  const g = (sfx) => url.replace(/\.onnx$/, sfx + ".onnx");
+  const pick = async (sfx) => ((await io.has(g(sfx + "n"))) ? g(sfx + "n") : (await io.has(g(sfx))) ? g(sfx) : null);
   const wantInt8 = settings.webnnWeights === "int8";
-  const qG = url.replace(/\.onnx$/, "_wnn1024q.onnx"),
-    qnG = url.replace(/\.onnx$/, "_wnn1024qn.onnx");
-  // (실험, ?wnndyn=1) 동적 그래프 <그래프>_wnnd.onnx — 해상도는 세션 생성 때 freeDimensionOverrides로 고정하고, 바뀌면 resizeWebnnDit가 다시 만든다.
-  const dynG = url.replace(/\.onnx$/, "_wnnd.onnx");
-  const isDyn = WNN_DYN && (await io.has(dynG));
-  let gUrl = isDyn ? dynG : null;
-  if (!gUrl && wantInt8) {
-    gUrl = (await io.has(qnG)) ? qnG : (await io.has(qG)) ? qG : null;
-    if (!gUrl) log(`${name}: 이 모델의 WebNN int8 그래프가 ${io.where} 없음 — fp16 가중치로`, "dim");
+  let gUrl = wantInt8 ? await pick("_wnndr") : null,
+    weights = "int8",
+    isDyn = true;
+  if (!gUrl) {
+    if (wantInt8) log(`${name}: 이 모델의 WebNN int8 (ConvRot) 그래프가 ${io.where} 없음 — fp16 가중치로`, "dim");
+    weights = "fp16";
+    gUrl = await pick("_wnnd");
   }
-  const weights = gUrl && !isDyn ? "int8" : "fp16"; // 동적 그래프(_wnnd)는 fp16 가중치
-  if (!gUrl) gUrl = (await io.has(negG)) ? negG : baseG;
-  if (gUrl === baseG && !(await io.has(gUrl)))
-    return fallback(isSlot ? `이 모델의 WebNN LoRA 슬롯 그래프가 ${io.where} 없음` : `이 모델의 WebNN 그래프가 ${io.where} 없음`);
+  if (!gUrl) {
+    isDyn = false; // 동적 그래프가 없는 이전 빌드 — 정적 1024²
+    gUrl = await pick("_wnn1024");
+  }
+  if (!gUrl) return fallback(isSlot ? `이 모델의 WebNN LoRA 슬롯 그래프가 ${io.where} 없음` : `이 모델의 WebNN 그래프가 ${io.where} 없음`);
   const mani = await io.json(gUrl + ".manifest.json");
   if (!mani) return fallback("WebNN 그래프의 샤드 목록(manifest)이 없음");
   const lman = isSlot ? await io.json(gUrl + ".lora_manifest.json") : null;
   if (isSlot && !lman) return fallback("WebNN LoRA 슬롯 그래프의 슬롯 목록(lora_manifest)이 없음");
   // Spectrum(spectrum.js): 본체 = 같은 그래프 + 특징 출력(<그래프>_sp.onnx, 샤드·manifest 공유), 머리 = 특징·timesteps → v_pred
-  // (<비슬롯 그래프>_head.onnx + .data, LoRA와 무관). 둘 다 있으면 본체를 _sp로 올린다 — 특징 출력을 안 읽으면 결과·시간은 같다.
+  // (<비슬롯 그래프>_head.onnx + .data, LoRA와 무관 — 동적은 fp16·int8이 fp16 머리 <dit>_wnnd_head.onnx 하나를 같이 쓴다).
+  // 둘 다 있으면 본체를 _sp로 올린다 — 특징 출력을 안 읽으면 결과·시간은 같다.
   const spUrl = gUrl.replace(/\.onnx$/, "_sp.onnx"),
-    headUrl = (isDyn ? dynG : baseG).replace("_q8a4fnLs", "_q8a4fns").replace(/\.onnx$/, "_head.onnx");
+    headUrl = url.replace("_q8a4fnLs", "_q8a4fns").replace(/\.onnx$/, isDyn ? "_wnnd_head.onnx" : "_wnn1024_head.onnx");
   const useSp = (await io.has(spUrl)) && (await io.has(headUrl)) && (await io.has(headUrl + ".data"));
   try {
     log(`${name} WebNN 그래프 다운로드...`, "dim");
@@ -455,10 +455,10 @@ async function loadWebnnDit(name, url, onProgress, io = serverIO) {
     if (isDyn) s.wnnDyn = { graph, shards: mani.shards, dir, lman, ep, ctx, useSp, headUrl, io };
     s.loraManifest = lman;
     s.precision = "webnn";
-    s.weights = weights; // "fp16" | "int8" — 실제로 올린 가중치 (메타데이터·고급 옵션 표시)
+    s.weights = weights; // "fp16" | "int8"(ConvRot) — 실제로 올린 가중치 (메타데이터·고급 옵션 표시)
     s.spectrum = useSp ? await loadSpectrumHead(headUrl, ctx, io, isDyn ? { feat_h: 64, feat_w: 64 } : null) : false; // 머리를 못 올리면 Spectrum만 못 쓴다
     onProgress(1);
-    log(`${name} OK (WebNN · ${isDyn ? "동적 그래프(실험), 지금 " : weights + " · "}${s.staticLat.w * 8}×${s.staticLat.h * 8} 전용${s.spectrum ? " · Spectrum 가능" : ""})`, "ok");
+    log(`${name} OK (WebNN · ${weights === "int8" ? "int8 ConvRot" : "fp16"} · ${isDyn ? "해상도 자유, 지금 " : ""}${s.staticLat.w * 8}×${s.staticLat.h * 8}${isDyn ? "" : " 전용"}${s.spectrum ? " · Spectrum 가능" : ""})`, "ok");
     return s;
   } catch (e) {
     console.error(e);
@@ -1019,7 +1019,7 @@ async function lowVramRestore() {
   $("btnGenTop").disabled = !ready;
 }
 
-// (실험, ?wnndyn=1) 동적 WebNN DiT를 다른 해상도로 다시 만든다: 세션을 내리고, 같은 그래프에 가중치를 OPFS 캐시에서 다시 읽어 차원만 바꿔 생성한다.
+// 동적 WebNN DiT를 다른 해상도로 다시 만든다: 세션을 내리고, 같은 그래프에 가중치를 OPFS 캐시(사용자 설정 모델은 고른 파일)에서 다시 읽어 차원만 바꿔 생성한다.
 // 가중치를 JS에 들고 있지 않으므로 생성 중 RAM은 정적 그래프와 같다(2026-11-14 실측: Turbo fp16 6.7GB, 들고 있으면 10.4~11.4GB). 전환 비용은 다시 읽기만큼 +1s 안팎.
 // Spectrum 머리와 VAE(WebNN)도 그 크기로 다시 만든다.
 async function resizeWebnnDit(key, h, w) {

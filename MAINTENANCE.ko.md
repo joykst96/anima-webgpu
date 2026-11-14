@@ -18,8 +18,7 @@
 - VAE는 head를 한 번 돌리고 tail을 가로 띠로 나눠(halo 16 latent) 돌립니다. 단일 호출과 비트 단위로 같으면서 정점 메모리가 띠 크기로 묶입니다. 1024²를 넘으면 head의 어텐션도 쿼리 청크별로 나눠 돌립니다.
 - DiT를 갈아 끼울 때(모델 전환·정밀도 변경·LoRA 반영)는 텍스트 인코더·어댑터·VAE도 함께 내렸다 올립니다. ORT WebGPU의 버퍼 캐시는 GPU 컨텍스트를 쓰는 세션이 전부 해제돼야 비워지기 때문입니다(함정 14).
 - **저VRAM 모드**(고급 옵션, 표준·빠르게 전용): VAE 직전에 WebGPU 세션을 전부 내려 그 캐시를 비우고 VAE만 다시 만듭니다. 그림이 끝나면(실패한 장도) 큐가 다음 작업 전에 나머지를 다시 만듭니다. 이를 위해 세션마다 재료를 붙여 둡니다(`loader.js` `createSession`): 그래프 바이트와, 가중치를 OPFS 캐시나 고른 파일에서 다시 읽는 함수입니다. 병합한 LoRA 바이트는 이 모드가 켜져 있을 때만 보관하므로, 모드를 켜기 전에 LoRA를 넣어 로드한 모델은 다시 로드할 때까지 이 모드를 건너뜁니다. 이유: 8GB급 카드에서는 VAE가 남긴 버퍼가 두 번째 그림부터 DiT를 공유 메모리로 밀어내고, VAE 띠를 더 잘게 나누면 캐시에 남는 버퍼 크기가 늘어 오히려 나빠집니다.
-- **WebNN 경로(실험, 선택)**: 고급 옵션에서 고르면 DiT와 VAE만 ORT의 WebNN EP(`ort.all` 번들, 표준 경로와 다른 모듈 인스턴스)로 돕니다. 텍스트 인코더·어댑터·샘플러는 그대로입니다. DiT는 정적 1024² fp16 그래프(`<그래프>_wnn1024.onnx`), VAE는 fp16 계산 그래프(`<vae>_wnn16.onnx`)를 쓰고, LoRA는 표준과 같은 슬롯 방식입니다. NegPip은 같은 그래프에 `negpip_mask` 입력을 넣은 그래프(`<그래프>_wnn1024n.onnx`, 샤드 공유)로 씁니다. 이 입력이 없는 이전 그래프만 있는 모델은 그 그래프로 로드하고 NegPip을 무시합니다. Spectrum은 본체가 내놓은 특징을 GPU 텐서로 둔 채 머리 그래프(`…_head.onnx`·`…_headk.onnx`)만 돌려 예측 스텝을 만듭니다. `navigator.ml`이 없거나 파일이 없거나 세션 생성이 실패하면 표준 경로로 로드합니다.
-  - 실험, `?wnndyn=1`일 때만: 모델에 동적 그래프(`<그래프>_wnnd.onnx`, fp16)가 있으면 1024²로 올리고, 다른 해상도 작업이 오면 세션을 내린 뒤 `freeDimensionOverrides`를 바꿔 다시 만듭니다(Spectrum 머리·WebNN VAE도). 가중치는 JS에 들고 있지 않고 전환 때마다 OPFS 캐시에서 다시 읽으므로 생성 중 RAM은 정적 그래프 수준입니다. 전환은 약 8초(그중 OPFS 읽기 약 1.2초). 아직 이 그래프를 배포한 모델은 없습니다.
+- **WebNN 경로(실험, 선택)**: 고급 옵션에서 고르면 DiT와 VAE만 ORT의 WebNN EP(`ort.all` 번들, 표준 경로와 다른 모듈 인스턴스)로 돕니다. 텍스트 인코더·어댑터·샘플러는 그대로입니다. DiT는 동적 그래프입니다: 세션을 만들 때 latent 크기를 `freeDimensionOverrides`로 고정하고, 다른 해상도 작업이 오면 세션을 내린 뒤 다시 만듭니다(Spectrum 머리·WebNN VAE도). 가중치는 JS에 들고 있지 않고 전환 때마다 OPFS 캐시(또는 고른 파일)에서 다시 읽으므로 생성 중 RAM은 정적 그래프 수준이고, 전환은 약 8초입니다. 가중치는 두 벌: fp16(`<그래프>_wnnd.onnx`, 기본)과 ConvRot을 건 int8(`<그래프>_wnndr.onnx`, 고급 옵션의 'int8 가중치 (ConvRot)' — 자기 샤드 약 2.1GB). VAE는 fp16 계산 그래프(`<vae>_wnn16.onnx`)를 쓰고, LoRA는 표준과 같은 슬롯 방식입니다. NegPip은 같은 그래프에 `negpip_mask` 입력을 넣은 그래프(`…n.onnx`, 샤드 공유)로 씁니다. Spectrum은 본체가 내놓은 특징을 GPU 텐서로 둔 채 fp16 머리 그래프(`…_wnnd_head.onnx`·`…_headk.onnx`)만 돌려 예측 스텝을 만듭니다. 이전 정적 1024² 그래프(`<그래프>_wnn1024{,n}.onnx`)만 있는 모델도 로드합니다(1024×1024 전용). `navigator.ml`이 없거나 파일이 없거나 세션 생성이 실패하면 표준 경로로 로드합니다.
 
 ## 정확도 (ComfyUI 대비)
 
@@ -90,7 +89,7 @@ python -I export/fp16_zones.py <그래프>_x.onnx <그래프>_f16.onnx --fast
 
 ### WebNN 그래프 (선택)
 
-고급 옵션 'WebNN (실험)'이 쓰는 그래프는 따로 만듭니다. ComfyUI portable 루트에서 `<repo>\export\webnn\build_webnn.bat <ckpt> <prefix>`를 실행하면 베이스·Turbo DiT(정적 1024² fp16, NegPip·LoRA 슬롯 그래프와 Spectrum용 본체·머리 그래프 포함)와 VAE(fp16 계산) 그래프가 나옵니다. 표준 그래프(`build_dit.bat`)가 같은 폴더에 있으면 그 샤드를 그대로 쓰는 int8 그래프(`_wnn1024q*`, 고급 옵션의 'int8 가중치')도 만듭니다. 없으면 페이지는 표준 경로로 로드합니다. 자세한 것은 [export/webnn/README.md](export/webnn/README.md).
+고급 옵션 'WebNN (실험)'이 쓰는 그래프는 따로 만듭니다. ComfyUI portable 루트에서 `<repo>\export\webnn\build_webnn.bat <ckpt> <prefix>`를 실행하면 베이스·Turbo DiT(동적, fp16과 int8 ConvRot 가중치 각각에 NegPip·LoRA 슬롯 그래프와 Spectrum 본체 그래프, fp16 Spectrum 머리)와 VAE(fp16 계산) 그래프가 나옵니다. int8 가중치는 `export/webnn/webnn_q8.py --rot 64`가 입력 채널 64개씩 Hadamard로 회전(float64로 정확히 계산)한 뒤 블록 32로 양자화하고, NegPip·슬롯 그래프는 `--like`로 그래프만 바꿔 같은 샤드를 씁니다. 파일이 없으면 페이지는 표준 경로로 로드합니다. 자세한 것은 [export/webnn/README.md](export/webnn/README.md).
 
 ### 텍스트 인코더·어댑터·VAE
 
@@ -123,7 +122,7 @@ Qwen3와 T5 토크나이저를 transformers.js용 `tokenizer.json`으로 저장�
 - 그래프 구조는 모든 Anima 2B 체크포인트가 같으므로, 위 파이프라인으로 만든 그래프 12개를 **템플릿**으로 두고 가중치 바이트만 다시 만듭니다(bf16 → fp32 → int8 블록 양자화를 ORT 양자화기와 같은 방식으로, Turbo는 ComfyUI와 같은 fp16 경로로 LoRA 병합). 같은 체크포인트면 파이프라인 산출물과 **바이트 단위로 같습니다**(베이스와 파인튠 두 종으로 확인).
 - 템플릿: `out/dit/` 아래 베이스·Turbo 그래프 12개(`<stem>_q8a4fn{s,Ls}{,_x,_f16}.onnx`)와 `<stem>_q8a4fnLs.onnx.lora_manifest.json` 2개. 페이지 기준 `../out/dit/`에서 찾고, `?templates=<URL>`로 바꿀 수 있습니다. 샤드·TE·VAE는 필요 없습니다.
 - 매핑표 `web/convert/anima2b.map.json`은 `export/make_convert_map.py`가 빌드 폴더와 원본 체크포인트로 만듭니다(`--prefix` = 빌드 접두사, 변환 결과 파일 이름도 이것을 따름. 템플릿을 해시로 확인하므로 그래프를 다시 빌드하면 함께 다시 만드세요).
-- **WebNN용 파일(선택)**: 변환 페이지의 'WebNN용 파일도 만들기'를 켜면 같은 폴더에 fp16 그래프 10개(일반·슬롯 × NegPip 유무, 각각의 `_sp`, Spectrum 머리 2종)와 샤드 10개, 머리의 `.data`를 더 씁니다(변형당 약 3.7GB). 매핑표는 `web/convert/anima2b.wnn.map.json`(`make_convert_map.py --webnn`으로 WebNN 빌드 폴더에서 생성), 템플릿은 `out/dit/`의 WebNN 그래프 20개(`<stem>_q8a4fn{s,Ls}_wnn1024{,n}{,_sp}.onnx`, `<stem>_q8a4fns_wnn1024_head{,k}.onnx`)와 `<stem>_q8a4fnLs_wnn1024{,n}.onnx.lora_manifest.json` 4개입니다. 이것도 `build_webnn.bat` 산출물과 바이트 단위로 같습니다. 생성 페이지는 '사용자 설정' 모델에서도 고급 옵션 'WebNN (실험)'을 고르면 이 파일들로 로드합니다(LoRA·Spectrum 포함).
+- **WebNN용 파일(선택)**: 변환 페이지의 'WebNN fp16 파일도 만들기'와 'WebNN int8 (ConvRot) 파일도 만들기'는 각각 그래프 10개(일반·슬롯 × NegPip 유무, 각각의 `_sp`, fp16 Spectrum 머리 2종)와 그 샤드, 머리의 `.data`를 같은 폴더에 더 씁니다(변형당 약 3.7GB / 2.1GB). 매핑표는 `web/convert/anima2b.wnn.map.json`·`anima2b.wnnr.map.json`(`make_convert_map.py --webnn` / `--webnn-int8`으로 WebNN 빌드 폴더에서 생성), 템플릿은 `out/dit/`의 그 그래프들(`<stem>_q8a4fn{s,Ls}_{wnnd,wnndr}{,n}{,_sp}.onnx`, `<stem>_q8a4fns_wnnd_head{,k}.onnx`)과 `<stem>_q8a4fnLs_{wnnd,wnndr}{,n}.onnx.lora_manifest.json`입니다. int8 가중치는 브라우저에서 회전·양자화합니다(`convert-core.js` `quant8rot`). 둘 다 `build_webnn.bat` 산출물과 바이트 단위로 같습니다. 생성 페이지는 '사용자 설정' 모델에서도 고급 옵션 'WebNN (실험)'을 고르면 이 파일들로 로드합니다(LoRA·NegPip·Spectrum 포함).
 - 어댑터(`llm_adapter`)는 변환하지 않습니다. 페이지는 모든 모델에 공용 어댑터를 씁니다.
 - 다른 서브도메인에 따로 둘 수 있습니다: `convert/` + `js/convert-core.js` + `workers/convert-*.js` + `css/tokens.css` + `css/app.css` + 템플릿. 생성 페이지의 링크 주소는 모델 목록의 `convert_url`로 정합니다.
 
@@ -157,7 +156,7 @@ index.html  css/  js/  workers/  convert/   ← web/ 그대로 (js/config.js가 
 tokenizers/{qwen3,t5}/
 out/
 ├── dit/           그래프별 .onnx + _x + _f16, 샤드 .N.bin + .manifest.json, 슬롯 그래프는 .lora_manifest.json (.lora.bin은 페이지가 만듦)
-│                  (선택) WebNN: 그래프별 _wnn1024{,n}.onnx + _wnn1024{,n}_sp.onnx(n = NegPip 입력), int8은 _wnn1024q{,n}{,_sp}.onnx(표준 샤드 + _wnn1024q.extra.bin), 샤드 .N.bin + .manifest.json(+ 슬롯은 .lora_manifest.json), 변형별 _wnn1024_head.onnx + .data, _wnn1024_headk.onnx
+│                  (선택) WebNN: 그래프별 _wnnd{,n}.onnx(fp16)·_wnndr{,n}.onnx(int8 ConvRot, 자기 샤드) + 각 _sp.onnx(n = NegPip 입력), 샤드 .N.bin + .manifest.json(+ 슬롯은 .lora_manifest.json), 변형별 _wnnd_head.onnx + .data, _wnnd_headk.onnx. 이전 빌드는 정적 _wnn1024*
 ├── adapter/       anima_llm_adapter.onnx (+ .data)
 ├── text_encoder/  qwen3_06b_s.onnx + 샤드 + manifest
 ├── vae/           qwen_image_vae_decoder_dyn32_2dc.onnx + _head/_tail/_head_a/_attn/_head_b (+ .data), (선택) WebNN: _2dc_wnn16.onnx

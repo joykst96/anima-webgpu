@@ -5,6 +5,7 @@
 // 결과가 ComfyUI 파이프라인(export_dit → quantize_dit → … → shard)과 바이트 단위로 같도록 각 단계를 그대로 재현한다:
 //   - bf16 → fp32: 정확 (상위 16비트)
 //   - int8: ORT MatMulNBitsQuantizer(8bit 대칭, block 32) = MLAS MlasQuantizeBlockwise<float,8>
+//   - WebNN int8 ConvRot: export/webnn/webnn_q8.py --rot (회전은 float64로 정확히 → float32 한 번 반올림, 블록 32 대칭 RTN)
 //   - Turbo LoRA 병합: ComfyUI ModelPatcher가 이 GPU에서 쓰는 lora_compute_dtype=fp16 경로
 //     (w16 = fp16(w), d = fp32 순차합 B·A, w' = fp16(w16 + fp16(d)) → fp32 저장)
 
@@ -225,6 +226,58 @@ export function quant8(w, N, K, block = 32) {
   return { q, s };
 }
 
+// ───────── WebNN int8 ConvRot (export/webnn/webnn_q8.py --rot G와 같은 바이트) ─────────
+// w: Linear weight [N,K] fp32. 그래프의 가중치는 MatMul B = fp16(w)ᵀ [K,N]이고, K를 G개씩 묶어 정규 Hadamard H(h4의 크로네커 곱, 1/√G)로
+// 돌린 H·B를 블록 32(K 방향)로 양자화한다(scale = max|v|/127, 0이면 1, q = rint(v/scale) 짝수 쪽 반올림, ±127로 자름).
+// 회전 합은 float64에서 오차가 없다(fp16 값 64개의 ±합 — 필요한 유효 비트 46 < 53) → 계산 순서와 무관하게 파이썬(np.matmul float64)과 같은 값.
+// → q int8 [K/32, 32, N] (바이트), scale fp32 [K/32, 1, N]
+const H4 = [1, 1, 1, -1, 1, 1, -1, 1, 1, -1, 1, 1, -1, 1, 1, 1];
+function rintEven(x) {
+  const f = Math.floor(x),
+    d = x - f;
+  return d > 0.5 ? f + 1 : d < 0.5 ? f : f % 2 === 0 ? f : f + 1;
+}
+export function quant8rot(w, N, K, G, block = 32) {
+  const nb = K / block;
+  const q = new Uint8Array(K * N),
+    s = new Float32Array(nb * N);
+  const row = new Float64Array(K),
+    tmp = new Float64Array(4);
+  let L = 0;
+  for (let g = G; g > 1; g /= 4) L++;
+  const inv = G ? 2 ** -L : 1; // 1/√G (G = 4^L)
+  const rot = G && K % G === 0;
+  const v32 = new Float32Array(K);
+  for (let n = 0; n < N; n++) {
+    const o = n * K;
+    for (let k = 0; k < K; k++) row[k] = f16toF32(f16bits(w[o + k]));
+    if (rot) {
+      // kron(h4, …, h4) 적용: 자릿수(4진)마다 h4를 곱한다. 자릿수 l의 보폭 = 4^(L-1-l)
+      for (let k0 = 0; k0 < K; k0 += G)
+        for (let stride = G / 4; stride >= 1; stride /= 4)
+          for (let base = 0; base < G; base += stride * 4)
+            for (let r = 0; r < stride; r++) {
+              const i0 = k0 + base + r;
+              for (let a = 0; a < 4; a++) tmp[a] = row[i0 + a * stride];
+              for (let a = 0; a < 4; a++) row[i0 + a * stride] = H4[a * 4] * tmp[0] + H4[a * 4 + 1] * tmp[1] + H4[a * 4 + 2] * tmp[2] + H4[a * 4 + 3] * tmp[3];
+            }
+      for (let k = 0; k < K; k++) v32[k] = row[k] * inv; // 2의 거듭제곱 곱은 정확, Float32Array 저장이 한 번 반올림
+    } else for (let k = 0; k < K; k++) v32[k] = row[k];
+    for (let b = 0; b < nb; b++) {
+      let m = 0;
+      for (let k = b * block; k < (b + 1) * block; k++) m = Math.max(m, Math.abs(v32[k]));
+      const sc = m ? Math.fround(m / 127) : 1;
+      s[b * N + n] = sc;
+      for (let k = b * block; k < (b + 1) * block; k++) {
+        let r = rintEven(Math.fround(v32[k] / sc));
+        r = r < -127 ? -127 : r > 127 ? 127 : r;
+        q[k * N + n] = r & 0xff;
+      }
+    }
+  }
+  return { q, s };
+}
+
 export function transpose(w, rows, cols) {
   const out = new Float32Array(rows * cols);
   for (let i = 0; i < rows; i++) for (let j = 0; j < cols; j++) out[j * rows + i] = w[i * cols + j];
@@ -276,7 +329,7 @@ export function shardManifest(names) {
 }
 
 // 변환 작업 계획: 텐서 하나 = 작업 하나 (체크포인트 파일 순서 — 디스크 순차 읽기).
-//   job = { key, shape, t(체크포인트 위치), e(샤드 항목|null), inline(그래프 인라인 패치에 필요), lora({up,down,alpha,r}|null) }
+//   job = { key, shape, t(체크포인트 위치), es(샤드 항목들), inline(그래프 인라인 패치에 필요), lora({up,down,alpha,r}|null) }
 export async function planConvert(map, read, loraRead) {
   const tensors = await readSafetensorsHeader(read);
   const prefix = ckptPrefix(tensors);
@@ -295,14 +348,16 @@ export async function planConvert(map, read, loraRead) {
   }
   const inlineKeys = new Set();
   for (const g of Object.values(map.graphs)) for (const p of g.patches) inlineKeys.add(p.key);
-  const entry = new Map(map.tensors.map((e) => [e.key, e]));
+  // 같은 텐서가 다른 형식으로 여러 자리에 있을 수 있다(WebNN int8: 블록은 int8, 머리 .data는 fp16) → 키마다 항목 목록
+  const entry = new Map();
+  for (const e of map.tensors) entry.set(e.key, [...(entry.get(e.key) || []), e]);
   const jobs = [...new Set([...entry.keys(), ...inlineKeys])].map((key) => {
     const m = mods?.get(key);
     return {
       key,
       shape: map.keys[key],
       t: ck(key),
-      e: entry.get(key) || null,
+      es: entry.get(key) || [],
       inline: inlineKeys.has(key),
       lora: m ? { up: m.up, down: m.down, alpha: m.alpha || null, r: m.down.shape[0] } : null,
     };
@@ -330,20 +385,20 @@ export async function computeJob(job, { read, loraRead, variants, strength = 1.0
   for (const v of variants) {
     const wv = vals[v];
     if (job.inline) inline[v] = wv;
-    const e = job.e;
-    if (!e) continue;
-    if (e.kind === "q8") {
-      // LoRA가 안 건드린 층은 베이스 결과를 그대로 쓴다
-      let r = qcache.get(wv);
-      if (!r) qcache.set(wv, (r = quant8(wv, e.N, e.K, block)));
-      writes[v] = [
-        [e.shard, e.offset, r.q],
-        [e.sshard, e.soffset, new Uint8Array(r.s.buffer)],
-      ];
-    } else {
-      const bytes = tensorBytes(wv, e.shape, e.kind);
-      // also: 같은 바이트가 들어가는 다른 자리 (WebNN 매핑표 — 머리의 가중치는 샤드와 머리 .data 양쪽에 있다)
-      writes[v] = [[e.shard, e.offset, bytes], ...(e.also || []).map((d) => [d.shard, d.offset, bytes])];
+    writes[v] = [];
+    for (const e of job.es) {
+      if (e.kind === "q8" || e.kind === "q8r") {
+        // LoRA가 안 건드린 층은 베이스 결과를 그대로 쓴다
+        const ck = qcache.get(wv) || new Map();
+        qcache.set(wv, ck);
+        let r = ck.get(e.kind);
+        if (!r) ck.set(e.kind, (r = e.kind === "q8" ? quant8(wv, e.N, e.K, block) : quant8rot(wv, e.N, e.K, e.G, block)));
+        writes[v].push([e.shard, e.offset, r.q], [e.sshard, e.soffset, new Uint8Array(r.s.buffer)]);
+      } else {
+        const bytes = tensorBytes(wv, e.shape, e.kind);
+        // also: 같은 바이트가 들어가는 다른 자리 (WebNN 매핑표 — 머리의 가중치는 샤드와 머리 .data 양쪽에 있다)
+        writes[v].push([e.shard, e.offset, bytes], ...(e.also || []).map((d) => [d.shard, d.offset, bytes]));
+      }
     }
   }
   return { writes, inline };
