@@ -14,6 +14,10 @@ REM    -> ..._q8a4fns_wnn1024_headk.onnx           head with the weighted sum of
 REM    -> ..._q8a4fn{s,Ls}_wnn1024n.onnx (+ _sp)   the same four graphs with the NegPip input
 REM                                     (negpip_mask, add_negpip --graph-only before the LoRA slots;
 REM                                     same shards and head, + .manifest.json, .lora_manifest.json)
+REM    -> ..._wnn1024q{,n}.onnx (+ _sp, slot too)  int8 weights: the same eight graphs pointing at the
+REM                                     STANDARD (WebGPU) shards <prefix>_dit_*_q8a4fns.onnx.N.bin
+REM                                     (webnn_stdq8.py map/apply) + one small _wnn1024q.extra.bin.
+REM                                     Needs the standard graph in OUTDIR (build_dit.bat); skipped if absent.
 REM  VAE  : vae_fp16 (all) on the existing dynamic decoder graph
 REM         -> <vae>_wnn16.onnx (graph only, shares the original <vae>.onnx.data)
 REM
@@ -161,6 +165,23 @@ if errorlevel 1 exit /b 1
 if errorlevel 1 exit /b 1
 %PY% -I "%WN%spectrum_split.py" "%OUTLN%"
 if errorlevel 1 exit /b 1
+
+echo.
+echo --- [7/7] int8 graphs on the standard shards (webnn_stdq8 map + apply) ---
+set STD=%OUTDIR%\%BASE%_q8a4fns.onnx
+if not exist "%STD%" (
+  echo [SKIP] standard graph not found: %STD% ^(run build_dit.bat first^)
+) else (
+  %PY% -I "%WN%webnn_stdq8.py" map "%OUT%" "%STD%" "%WORKDIR%\%BASE%_stdq8.map.json"
+  if errorlevel 1 exit /b 1
+  REM output name = input name with _wnn1024 -> _wnn1024q (e.g. _wnn1024n_sp -> _wnn1024qn_sp)
+  for %%G in (%BASE%_q8a4fns_wnn%SIZE% %BASE%_q8a4fns_wnn%SIZE%n %BASE%_q8a4fnLs_wnn%SIZE% %BASE%_q8a4fnLs_wnn%SIZE%n) do (
+    %PY% -I "%WN%webnn_stdq8.py" apply "%OUTDIR%\%%G.onnx" "%WORKDIR%\%BASE%_stdq8.map.json"
+    if errorlevel 1 exit /b 1
+    %PY% -I "%WN%webnn_stdq8.py" apply "%OUTDIR%\%%G_sp.onnx" "%WORKDIR%\%BASE%_stdq8.map.json"
+    if errorlevel 1 exit /b 1
+  )
+)
 
 echo --- %BASE% done ---
 exit /b 0

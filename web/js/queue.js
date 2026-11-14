@@ -494,6 +494,7 @@ async function runJob(job) {
     const metaTxt =
       `seed ${seed} · ${pxW}x${pxH} · ${steps}스텝 · CFG ${cfg}` +
       (precision !== "standard" ? ` · ${PRECISION_LABEL[precision]}` : "") +
+      (sess.dit.weights === "int8" ? " int8" : "") +
       (xPos.compacted ? " · 패딩 압축" : "") +
       (ec ? " · EasyCache" : "") +
       (sp ? " · Spectrum" : "");

@@ -176,5 +176,114 @@ window.benchVae = async ({ graph, ep, bundle, ver = "1.26.0", warm = 2, runs = 5
   return { graph, ep, bundle, ver, create_ms: Math.round(create), times, median_ms: median(times), nonfinite: nan, n: y.length,
            head: Array.from(y.subarray(0, 6), (v) => +v.toFixed(4)), logs, ...(returnOut ? { out_b64: b64(new Uint8Array(y.buffer, y.byteOffset, y.byteLength)) } : {}) };
 };
+// ── 동적 DiT 그래프: 해상도마다 세션을 다시 만든다 (freeDimensionOverrides) ──
+// graph = <dir><graph>.onnx, 샤드는 <graph>.onnx.manifest.json, 슬롯 그래프면 <graph>.onnx.lora_manifest.json + lora(safetensors 주소)를
+// 페이지와 같은 워커(web/workers/lora-worker.js)로 lora.bin에 펼친다. 가중치는 한 번만 받고,
+// reload = "memory"(JS 메모리에 들고 있다가 재사용) | "opfs"(OPFS에 써 두고 해상도마다 다시 읽음 — 페이지가 캐시에서 다시 올리는 경우).
+// feeds[`${h}x${w}`] = latent 파일, refs[`${h}x${w}`][σ] = 기준 출력 파일(있으면 상대 L2). marks는 실행기 --mon이 구간별 VRAM/RAM 최댓값으로 바꾼다.
+window.benchDyn = async ({ graph, dir = "/out/webnn-bench/dyn/", ver = "1.26.0", bundle = "ort.all.bundle.min.mjs",
+                           res = [[128, 128]], sigmas = [1.0, 0.5, 0.1], warm = 2, reps = 2, lora = null, loraScale = 1,
+                           reload = "memory", feeds = {}, refs = {}, context = "feed_context.f32", saveSigma = 0.5, sessOpts = {}, staticGraph = false, ep: epName = "webnn" }) => {
+  const marks = [], mark = (label) => marks.push({ t: Date.now(), label });
+  window.__diag = { stage: "import" };
+  const ort = await import(base(ver) + bundle);
+  ort.env.wasm.wasmPaths = base(ver);
+  ort.env.wasm.proxy = false;
+  const getBuf = async (u) => { const r = await fetch(u); if (!r.ok) throw new Error(`${u}: ${r.status}`); return new Uint8Array(await r.arrayBuffer()); };
+  const getJson = async (u) => { const r = await fetch(u); return r.ok ? r.json() : null; };
+  mark("download");
+  const t0 = performance.now();
+  const gBytes = await getBuf(`${dir}${graph}.onnx`);
+  const mani = await getJson(`${dir}${graph}.onnx.manifest.json`);
+  const lman = await getJson(`${dir}${graph}.onnx.lora_manifest.json`);
+  const shards = mani ? mani.shards : [graph + ".onnx.data"];
+  let blobs = await Promise.all(shards.map((p) => getBuf(dir + p)));
+  const download_ms = Math.round(performance.now() - t0), weight_gib = +(blobs.reduce((a, b) => a + b.length, 0) / 2 ** 30).toFixed(2);
+  let opfs = null, opfs_write_ms = null;
+  if (reload === "opfs") {
+    mark("opfs write");
+    const tw = performance.now();
+    opfs = await (await navigator.storage.getDirectory()).getDirectoryHandle("dynbench", { create: true });
+    for (let i = 0; i < shards.length; i++) { const w = await (await opfs.getFileHandle(shards[i], { create: true })).createWritable(); await w.write(blobs[i]); await w.close(); }
+    opfs_write_ms = Math.round(performance.now() - tw);
+    blobs = null; // 메모리에서 내린다
+  }
+  let loraExt = null, lora_ms = null, lora_report = null;
+  if (lman) {
+    mark("lora build");
+    const tl = performance.now();
+    const total = lman.entries.reduce((m, e) => Math.max(m, e.B.offset + lman.rank * e.N * 4), 0);
+    let bytes = new Uint8Array(total);
+    if (lora) {
+      const buf = (await getBuf(lora.url)).buffer;
+      const wk = new Worker("/workers/lora-worker.js", { type: "module" });
+      const done = await new Promise((resolve, reject) => {
+        wk.onmessage = (ev) => { const m = ev.data; if (m.type === "done") resolve(m); else if (m.type === "error") reject(new Error(m.message)); };
+        wk.postMessage({ manifest: lman, loras: [{ fileName: lora.url.split("/").pop(), weight: lora.weight ?? 1, buffer: buf }] });
+      });
+      wk.terminate();
+      bytes = done.bytes; lora_report = done.report;
+    }
+    loraExt = { path: lman.bin, data: bytes };
+    lora_ms = Math.round(performance.now() - tl);
+  }
+  const ctxF32 = new Float32Array((await getBuf(`/out/webnn-bench/${context}`)).buffer);
+  const f16t = (f32, dims) => new ort.Tensor("float16", new Float16Array(f32), dims);
+  // ep: "webnn"(기본) | "webgpu"(표준 경로 비교용 — bundle은 ort.jspi.bundle.min.mjs를 넘긴다)
+  const ep = epName === "webgpu" ? ["webgpu"] : [{ name: "webnn", deviceType: "gpu", powerPreference: "high-performance" }];
+  const results = [], outs = {};
+  for (const [h, w] of res) {
+    const key = `${h}x${w}`;
+    window.__diag.stage = "create " + key;
+    let read_ms = null, data = blobs;
+    if (opfs) {
+      mark(`opfs read ${key}`);
+      const tr = performance.now();
+      data = await Promise.all(shards.map(async (p) => new Uint8Array(await (await (await opfs.getFileHandle(p)).getFile()).arrayBuffer())));
+      read_ms = Math.round(performance.now() - tr);
+    }
+    mark(`create ${key}`);
+    const tc = performance.now();
+    let sess = await ort.InferenceSession.create(gBytes, {
+      executionProviders: ep, externalData: [...shards.map((p, i) => ({ path: p, data: data[i] })), ...(loraExt ? [loraExt] : [])],
+      ...(staticGraph ? {} : { freeDimensionOverrides: { lat_h: h, lat_w: w } }), ...sessOpts, // staticGraph: 정적 그래프는 차원 고정 없이
+    });
+    const create_ms = Math.round(performance.now() - tc);
+    if (opfs) data = null;
+    const lat = feeds[key] ? new Float32Array((await getBuf(`/out/webnn-bench/${feeds[key]}`)).buffer) : randn(16 * h * w, 1234);
+    const feed = (s) => ({ latent: f16t(lat, [1, 16, 1, h, w]), timesteps: new ort.Tensor("float32", new Float32Array([s]), [1]), context: f16t(ctxF32, [1, 512, 1024]),
+      ...(lman ? { lora_scale: new ort.Tensor("float32", new Float32Array([loraScale]), [1]) } : {}),
+      ...(sess.inputNames.includes("negpip_mask") ? { negpip_mask: f16t(new Float32Array(512).fill(1), [1, 512, 1]) } : {}) }); // mask=1이면 출력 불변
+    mark(`run ${key}`);
+    window.__diag.stage = "run " + key;
+    for (let i = 0; i < warm; i++) { const o = await sess.run(feed(0.5)); await o.v_pred.getData(); o.v_pred.dispose?.(); }
+    const times = [], err = {}, stat = {};
+    for (const s of sigmas) {
+      let y = null;
+      for (let i = 0; i < reps; i++) {
+        const t = performance.now();
+        const o = await sess.run(feed(s));
+        const d = o.v_pred.data ?? (await o.v_pred.getData());
+        times.push(+(performance.now() - t).toFixed(1));
+        y = d instanceof Float32Array ? d : Float32Array.from(d);
+        o.v_pred.dispose?.();
+      }
+      let nan = 0, ss = 0; for (const v of y) { if (!Number.isFinite(v)) nan++; else ss += v * v; }
+      stat[s] = { rms: +Math.sqrt(ss / y.length).toFixed(4), nonfinite: nan };
+      const rf = refs[key]?.[s];
+      if (rf) {
+        const r = new Float32Array((await getBuf(`/out/webnn-bench/${rf}`)).buffer);
+        let num = 0, den = 0; for (let i = 0; i < r.length; i++) { const dd = y[i] - r[i]; num += dd * dd; den += r[i] * r[i]; }
+        err[s] = +(100 * Math.sqrt(num / den)).toFixed(3);
+      }
+      if (s === saveSigma) outs[key] = b64(new Uint8Array(y.buffer, y.byteOffset, y.byteLength));
+    }
+    mark(`release ${key}`);
+    const tr = performance.now(); await sess.release(); sess = null;
+    results.push({ res: `${w * 8}x${h * 8}`, read_ms, create_ms, release_ms: Math.round(performance.now() - tr), step_ms: median(times), times, err_pct: err, stat });
+  }
+  mark("end");
+  return { graph, reload, download_ms, weight_gib, opfs_write_ms, lora_ms, lora_report, results, marks, outs };
+};
 window.ready = true;
 </script>

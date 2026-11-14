@@ -814,6 +814,10 @@ label.adv-choice small {
   color: var(--color-fg-muted);
   font-size: var(--font-size-sm);
 }
+/* WebNN 가중치 선택: WebNN 항목의 글자 줄에 맞춰 들여쓴다(라디오 폭 + 간격) */
+.adv-sub {
+  padding-inline-start: var(--space-6);
+}
 .adv-tag {
   font-size: var(--font-size-xs);
   color: var(--color-fg-muted);

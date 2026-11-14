@@ -88,7 +88,7 @@ Only the graph changes; the original shards are referenced as they are. To apply
 
 ### WebNN graphs (optional)
 
-The graphs used by the advanced option "WebNN (experimental)" are built separately. From the ComfyUI portable root, `<repo>\export\webnn\build_webnn.bat <ckpt> <prefix>` produces the Base and Turbo DiT graphs (static 1024², fp16, plus the NegPip and LoRA slot graphs and the main/head graphs for Spectrum) and the VAE graph (fp16 compute). Without them the page loads the Standard path. Details (Korean): [export/webnn/README.md](export/webnn/README.md).
+The graphs used by the advanced option "WebNN (experimental)" are built separately. From the ComfyUI portable root, `<repo>\export\webnn\build_webnn.bat <ckpt> <prefix>` produces the Base and Turbo DiT graphs (static 1024², fp16, plus the NegPip and LoRA slot graphs and the main/head graphs for Spectrum) and the VAE graph (fp16 compute). When the Standard graph (`build_dit.bat`) is in the same folder it also writes int8 graphs (`_wnn1024q*`, "int8 weights" in the advanced options) that use the Standard shards as they are. Without them the page loads the Standard path. Details (Korean): [export/webnn/README.md](export/webnn/README.md).
 
 ### Text encoder, adapter, VAE
 
@@ -155,7 +155,7 @@ index.html  css/  js/  workers/  convert/   ← web/ as is (js/config.js is the 
 tokenizers/{qwen3,t5}/
 out/
 ├── dit/           per graph: .onnx + _x + _f16, shards .N.bin + .manifest.json; slot graphs also .lora_manifest.json (the page builds .lora.bin itself)
-│                  (optional) WebNN: per graph _wnn1024{,n}.onnx + _wnn1024{,n}_sp.onnx (n = NegPip input), shards .N.bin + .manifest.json (+ .lora_manifest.json for slot graphs), per variant _wnn1024_head.onnx + .data, _wnn1024_headk.onnx
+│                  (optional) WebNN: per graph _wnn1024{,n}.onnx + _wnn1024{,n}_sp.onnx (n = NegPip input), int8 as _wnn1024q{,n}{,_sp}.onnx (Standard shards + _wnn1024q.extra.bin), shards .N.bin + .manifest.json (+ .lora_manifest.json for slot graphs), per variant _wnn1024_head.onnx + .data, _wnn1024_headk.onnx
 ├── adapter/       anima_llm_adapter.onnx (+ .data)
 ├── text_encoder/  qwen3_06b_s.onnx + shards + manifest
 ├── vae/           qwen_image_vae_decoder_dyn32_2dc.onnx + _head/_tail/_head_a/_attn/_head_b (+ .data), (optional) WebNN: _2dc_wnn16.onnx

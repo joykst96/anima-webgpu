@@ -4,7 +4,9 @@ const KEY = "anima.settings.v1";
 // precision: "standard" | "fast" | "webnn" (다음 로드부터) · xattnCompact: cross-attention 패딩 압축 (다음 생성부터, 재로드 불필요)
 // easyCache: 변화가 작은 스텝의 DiT 호출 건너뛰기 (다음 생성부터)
 // spectrum: 건너뛰는 스텝의 특징을 예측해 머리만 돌리기 (다음 생성부터. WebNN으로 로드했고 Spectrum 그래프가 있을 때만 — spectrum.js)
-const DEFAULTS = { precision: "standard", xattnCompact: false, easyCache: false, spectrum: false };
+// webnnWeights: "fp16" | "int8" — WebNN 가중치 (다음 로드부터). int8은 표준(WebGPU) 샤드를 그대로 쓰는 그래프(<dit>_wnn1024q*.onnx,
+//   export/webnn/webnn_stdq8.py)라 추가 다운로드가 없다. 그 그래프가 없으면 fp16으로 로드한다(loader.js loadWebnnDit).
+const DEFAULTS = { precision: "standard", xattnCompact: false, easyCache: false, spectrum: false, webnnWeights: "fp16" };
 
 function load() {
   try {

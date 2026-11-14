@@ -25,6 +25,32 @@ const chrome = spawn(CHROME, [
 ], { stdio: "ignore" });
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// --mon: 측정 중 GPU 전체 사용량(nvidia-smi 200ms)과 이 Chrome(임시 프로필) 프로세스들의 private 메모리 합(1초)을 기록한다.
+// 결과에 marks([{t, label}], Date.now() 기준)가 있으면 구간별 최댓값을 함께 출력한다.
+const mon = { gpu: [], ram: [] };
+const monProcs = [];
+if (args.includes("--mon")) {
+  const smi = spawn("nvidia-smi", ["--query-gpu=memory.used", "--format=csv,noheader,nounits", "-lms", "200"]);
+  smi.stdout.on("data", (b) => { for (const l of String(b).split(/\r?\n/)) if (l.trim()) mon.gpu.push([Date.now(), +l.trim()]); });
+  const ps = spawn("powershell", ["-NoProfile", "-Command",
+    "while($true){ $p=Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | Where-Object { $_.CommandLine -like '*chrome-profile-*' }; $t=($p | Measure-Object PrivatePageCount -Sum).Sum; $g=($p | Where-Object { $_.CommandLine -like '*--type=gpu-process*' } | Measure-Object PrivatePageCount -Sum).Sum; $r=($p | Where-Object { $_.CommandLine -like '*--type=renderer*' } | Measure-Object PrivatePageCount -Sum).Sum; $tw=($p | Measure-Object WorkingSetSize -Sum).Sum; $gw=($p | Where-Object { $_.CommandLine -like '*--type=gpu-process*' } | Measure-Object WorkingSetSize -Sum).Sum; [Console]::Out.WriteLine(\"$t,$g,$r,$tw,$gw\"); [Console]::Out.Flush(); Start-Sleep -Milliseconds 1000 }"]);
+  // 한 줄 = 전체, GPU 프로세스, 렌더러(페이지) 프로세스의 private 메모리(커밋, 바이트) + 전체·GPU 프로세스의 working set(물리 RAM)
+  ps.stdout.on("data", (b) => { for (const l of String(b).split(/\r?\n/)) if (l.trim()) mon.ram.push([Date.now(), ...l.trim().split(",").map((x) => +x || 0)]); });
+  monProcs.push(smi, ps);
+}
+function monSummary(marks) {
+  const rows = [];
+  for (let i = 0; i < marks.length; i++) {
+    const t0 = marks[i].t, t1 = i + 1 < marks.length ? marks[i + 1].t : Infinity;
+    const g = mon.gpu.filter(([t]) => t >= t0 && t < t1).map(([, v]) => v), rr = mon.ram.filter(([t]) => t >= t0 && t < t1), r = rr.map(([, v]) => v);
+    const mx = (k) => (rr.length ? +(Math.max(...rr.map((x) => x[k])) / 2 ** 30).toFixed(2) : null);
+    rows.push({ label: marks[i].label, sec: +(((t1 === Infinity ? Date.now() : t1) - t0) / 1000).toFixed(1),
+      gpu_max_gb: g.length ? +(Math.max(...g) / 1024).toFixed(2) : null, gpu_end_gb: g.length ? +(g[g.length - 1] / 1024).toFixed(2) : null,
+      ram_max_gb: r.length ? +(Math.max(...r) / 2 ** 30).toFixed(2) : null, ram_gpu_proc_gb: mx(2), ram_renderer_gb: mx(3), ws_gb: mx(4), ws_gpu_proc_gb: mx(5) });
+  }
+  return rows;
+}
 async function target() {
   for (let i = 0; i < 60; i++) {
     try {
@@ -46,6 +72,7 @@ try {
   ws.onmessage = (m) => { const d = JSON.parse(m.data); if (d.id && pending.has(d.id)) { pending.get(d.id)(d); pending.delete(d.id); } };
   const send = (method, params = {}) => new Promise((res) => { const i = ++id; pending.set(i, res); ws.send(JSON.stringify({ id: i, method, params })); });
   await sleep(1500);
+  const idle = mon.gpu.length ? mon.gpu[mon.gpu.length - 1][1] : null; // 페이지가 아무것도 올리기 전
   const r = await Promise.race([
     send("Runtime.evaluate", { expression: expr, awaitPromise: true, returnByValue: true }),
     sleep(timeout).then(() => ({ error: "timeout" })),
@@ -59,10 +86,16 @@ try {
     const v = r.result.result.value;
     const save = opt("--save-out", null); // 결과의 out_b64(fp32 원시)를 파일로
     if (v && v.out_b64) { if (save) fs.writeFileSync(save, Buffer.from(v.out_b64, "base64")); delete v.out_b64; }
+    if (v && v.outs) { // 여러 출력: <save>_<이름>.f32
+      if (save) for (const [k, b] of Object.entries(v.outs)) fs.writeFileSync(`${save}_${k}.f32`, Buffer.from(b, "base64"));
+      delete v.outs;
+    }
+    if (v && v.marks && monProcs.length) { v.gpu_idle_gb = idle != null ? +(idle / 1024).toFixed(2) : null; v.mon = monSummary(v.marks); delete v.marks; }
     console.log(JSON.stringify(v, null, 1));
   }
   ws.close();
 } finally {
+  for (const p of monProcs) try { p.kill(); } catch {}
   if (!args.includes("--keep")) {
     const { execSync } = await import("node:child_process");
     try { execSync(`taskkill /PID ${chrome.pid} /T /F`, { stdio: "ignore" }); } catch {}

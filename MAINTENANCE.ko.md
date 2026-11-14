@@ -88,7 +88,7 @@ python -I export/fp16_zones.py <그래프>_x.onnx <그래프>_f16.onnx --fast
 
 ### WebNN 그래프 (선택)
 
-고급 옵션 'WebNN (실험)'이 쓰는 그래프는 따로 만듭니다. ComfyUI portable 루트에서 `<repo>\export\webnn\build_webnn.bat <ckpt> <prefix>`를 실행하면 베이스·Turbo DiT(정적 1024² fp16, NegPip·LoRA 슬롯 그래프와 Spectrum용 본체·머리 그래프 포함)와 VAE(fp16 계산) 그래프가 나옵니다. 없으면 페이지는 표준 경로로 로드합니다. 자세한 것은 [export/webnn/README.md](export/webnn/README.md).
+고급 옵션 'WebNN (실험)'이 쓰는 그래프는 따로 만듭니다. ComfyUI portable 루트에서 `<repo>\export\webnn\build_webnn.bat <ckpt> <prefix>`를 실행하면 베이스·Turbo DiT(정적 1024² fp16, NegPip·LoRA 슬롯 그래프와 Spectrum용 본체·머리 그래프 포함)와 VAE(fp16 계산) 그래프가 나옵니다. 표준 그래프(`build_dit.bat`)가 같은 폴더에 있으면 그 샤드를 그대로 쓰는 int8 그래프(`_wnn1024q*`, 고급 옵션의 'int8 가중치')도 만듭니다. 없으면 페이지는 표준 경로로 로드합니다. 자세한 것은 [export/webnn/README.md](export/webnn/README.md).
 
 ### 텍스트 인코더·어댑터·VAE
 
@@ -155,7 +155,7 @@ index.html  css/  js/  workers/  convert/   ← web/ 그대로 (js/config.js가 
 tokenizers/{qwen3,t5}/
 out/
 ├── dit/           그래프별 .onnx + _x + _f16, 샤드 .N.bin + .manifest.json, 슬롯 그래프는 .lora_manifest.json (.lora.bin은 페이지가 만듦)
-│                  (선택) WebNN: 그래프별 _wnn1024{,n}.onnx + _wnn1024{,n}_sp.onnx(n = NegPip 입력), 샤드 .N.bin + .manifest.json(+ 슬롯은 .lora_manifest.json), 변형별 _wnn1024_head.onnx + .data, _wnn1024_headk.onnx
+│                  (선택) WebNN: 그래프별 _wnn1024{,n}.onnx + _wnn1024{,n}_sp.onnx(n = NegPip 입력), int8은 _wnn1024q{,n}{,_sp}.onnx(표준 샤드 + _wnn1024q.extra.bin), 샤드 .N.bin + .manifest.json(+ 슬롯은 .lora_manifest.json), 변형별 _wnn1024_head.onnx + .data, _wnn1024_headk.onnx
 ├── adapter/       anima_llm_adapter.onnx (+ .data)
 ├── text_encoder/  qwen3_06b_s.onnx + 샤드 + manifest
 ├── vae/           qwen_image_vae_decoder_dyn32_2dc.onnx + _head/_tail/_head_a/_attn/_head_b (+ .data), (선택) WebNN: _2dc_wnn16.onnx

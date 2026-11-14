@@ -29,6 +29,7 @@ ComfyUI portable 루트에서(운영 빌드와 같은 환경):
 | `…_q8a4fns_wnn1024_sp.onnx`, `…_q8a4fnLs_wnn1024_sp.onnx` | 위 두 그래프 + Spectrum 특징 출력. 있으면 페이지가 이쪽을 올린다(샤드·manifest는 위 그래프 것) |
 | `…_q8a4fns_wnn1024_head.onnx` + `.data`, `…_headk.onnx` | Spectrum 머리와 가중합 머리(변형마다 하나씩, LoRA와 무관, `.data` 공유). 가중합 머리가 있으면 특징을 GPU에 둔 채 예측한다(없으면 CPU에서 합산 — 느리지만 동작) |
 | `…_q8a4fns_wnn1024n.onnx`, `…_q8a4fnLs_wnn1024n.onnx`(+ 각 `_sp`, `.manifest.json`, 슬롯은 `.lora_manifest.json`) | 위 네 그래프에 NegPip 입력(`negpip_mask`)을 넣은 것. 있으면 페이지가 이쪽을 먼저 쓴다(`<…>_wnn1024n.onnx`). 샤드·머리는 위와 공유 |
+| `…_wnn1024q.onnx`, `…_wnn1024qn.onnx`(+ 각 `_sp`, 슬롯 그래프도) + `.manifest.json`, `…_q8a4fns_wnn1024q.extra.bin` | 고급 옵션의 'int8 가중치'. 위 여덟 그래프와 같은 계산이지만 가중치는 **표준(WebGPU) 그래프의 샤드**(`<운영 DiT 그래프>.onnx.N.bin`)를 가리킨다(`webnn_stdq8.py`). WebNN 전용 다운로드는 그래프와 extra(75KB)뿐이고, 표준으로 받은 적이 있으면 캐시를 그대로 쓴다. 없으면 페이지는 fp16 그래프로 |
 | `out\vae\<vae>_wnn16.onnx` | `<운영 VAE 그래프>_wnn16.onnx` (`loader.js loadWebnnVae`) |
 
 - 베이스와 Turbo를 둘 다 만든다(변형당 샤드 약 3.6GB). 네 번째 인자 `base` / `turbo`로 하나만 고를 수 있다.
@@ -39,6 +40,10 @@ ComfyUI portable 루트에서(운영 빌드와 같은 환경):
   WebNN 그래프는 어텐션이 융합되지 않아 Softmax 앵커로 cross-attention v_proj 28개를 찾고, v_proj 입력이 fp16 `context` 그대로라 마스크 곱도 fp16이다(±1이라 정확).
   NegPip 슬롯 그래프는 NegPip 그래프에서 만든다 — v_proj의 LoRA 브랜치도 마스크를 곱한 context를 받아야 해서(운영 빌드와 같은 순서).
   `_wnn1024n` 그래프가 없으면 페이지는 `_wnn1024` 그래프로 로드하고 NegPip을 무시한다(로그 "이 모델엔 NegPip 입력이 없음").
+- int8 그래프(7단계)는 표준 그래프 `out\dit\<prefix>_dit_*_q8a4fns.onnx`와 그 샤드가 같은 폴더에 있어야 만든다(`build_dit.bat`를 먼저, 없으면 건너뜀).
+  `webnn_stdq8.py map`이 fp16 WebNN 그래프와 표준 그래프의 가중치를 값으로 짝짓고(변형마다 한 번, 약 1분), `apply`가 여덟 그래프에 그래프만 고쳐 적용한다.
+  매 실행 GPU에서 uint8 → fp16으로 풀어 쓰므로 fp16 그래프보다 약 20% 느리고, GPU 메모리는 약 1.6GB 덜 쓴다.
+  운영에 올릴 때는 운영 표준 샤드가 이 빌드와 바이트 동일해야 한다(같은 명령이면 같다 — 2026-11-14 anima 14파일 해시 일치).
 - 파일이 서버에 없으면 페이지는 표준(WebGPU) 경로로 로드한다.
 - 중간 산출물 `out\webnn-work\`(약 4GB)는 지워도 된다.
 - 브라우저 변환 페이지의 'WebNN용 파일도 만들기'는 이 빌드의 그래프 20개(+ 슬롯 그래프의 `lora_manifest` 4개)를 템플릿으로 쓴다. 그래프를 다시 빌드하면 매핑표도 다시 만든다:

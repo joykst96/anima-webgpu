@@ -375,9 +375,21 @@ async function loadWebnnDit(name, url, onProgress, io = serverIO) {
   const isSlot = url.includes("_q8a4fnLs"); // LoRA 장착 → 슬롯 그래프
   // <그래프>_wnn1024n.onnx = 같은 그래프 + NegPip 입력(negpip_mask, export/add_negpip.py --graph-only — 샤드·머리 공유, manifest는 자기 이름으로).
   // 서버가 .onnx를 immutable로 캐시시키므로 새 이름이다. 없으면(이전 빌드·이전 변환 묶음) NegPip 없는 그래프로 — 마스크가 1이면 두 그래프의 결과는 같다.
+  // int8 가중치(settings.webnnWeights): <그래프>_wnn1024q{,n}.onnx — 표준(WebGPU) 그래프의 샤드(<dit>.onnx.N.bin)와 작은 extra 파일을 가리키는
+  // 같은 계산 그래프(export/webnn/webnn_stdq8.py). 표준으로 한 번이라도 받았으면 OPFS 캐시의 샤드를 그대로 써서 다운로드가 없다.
+  // 없으면(int8 그래프를 아직 안 만든 모델·사용자 설정 모델) fp16 그래프로.
   const baseG = url.replace(/\.onnx$/, "_wnn1024.onnx"),
     negG = url.replace(/\.onnx$/, "_wnn1024n.onnx");
-  const gUrl = (await io.has(negG)) ? negG : baseG;
+  const wantInt8 = settings.webnnWeights === "int8";
+  const qG = url.replace(/\.onnx$/, "_wnn1024q.onnx"),
+    qnG = url.replace(/\.onnx$/, "_wnn1024qn.onnx");
+  let gUrl = null;
+  if (wantInt8) {
+    gUrl = (await io.has(qnG)) ? qnG : (await io.has(qG)) ? qG : null;
+    if (!gUrl) log(`${name}: 이 모델의 WebNN int8 그래프가 ${io.where} 없음 — fp16 가중치로`, "dim");
+  }
+  const weights = gUrl ? "int8" : "fp16";
+  if (!gUrl) gUrl = (await io.has(negG)) ? negG : baseG;
   if (gUrl === baseG && !(await io.has(gUrl)))
     return fallback(isSlot ? `이 모델의 WebNN LoRA 슬롯 그래프가 ${io.where} 없음` : `이 모델의 WebNN 그래프가 ${io.where} 없음`);
   const mani = await io.json(gUrl + ".manifest.json");
@@ -432,9 +444,10 @@ async function loadWebnnDit(name, url, onProgress, io = serverIO) {
     s.staticLat = { h: Number(shape?.[3] ?? 128), w: Number(shape?.[4] ?? 128) }; // 정적 그래프 — 이 latent 크기만 받는다
     s.loraManifest = lman;
     s.precision = "webnn";
+    s.weights = weights; // "fp16" | "int8" — 실제로 올린 가중치 (메타데이터·고급 옵션 표시)
     s.spectrum = useSp ? await loadSpectrumHead(headUrl, ctx, io) : false; // 머리를 못 올리면 Spectrum만 못 쓴다
     onProgress(1);
-    log(`${name} OK (WebNN · ${s.staticLat.w * 8}×${s.staticLat.h * 8} 전용${s.spectrum ? " · Spectrum 가능" : ""})`, "ok");
+    log(`${name} OK (WebNN · ${weights} · ${s.staticLat.w * 8}×${s.staticLat.h * 8} 전용${s.spectrum ? " · Spectrum 가능" : ""})`, "ok");
     return s;
   } catch (e) {
     console.error(e);
@@ -771,6 +784,11 @@ async function loadVaeSplit(url, onProgress) {
 
 let sharedLoaded = false;
 const ditSessions = {};
+// 상주 DiT를 고급 옵션의 지금 설정으로 다시 올려야 하는가: 정밀도 모드, 또는 WebNN이면 가중치(fp16/int8)가 만들 때와 다르면
+// (requested·requestedWeights = 요청했던 값. int8 그래프가 없어 fp16으로 폴백한 경우에도 반복 재로드하지 않도록 실제 값이 아니라 요청값과 비교)
+function ditNeedsReload(dit) {
+  return dit.requested !== settings.precision || (settings.precision === "webnn" && dit.requestedWeights !== settings.webnnWeights);
+}
 async function loadAll() {
   if (queueBusy()) {
     log(BUSY_MSG, "err");
@@ -813,8 +831,8 @@ async function loadAll() {
     }
     // 고급 옵션의 정밀도 모드가 상주 DiT를 만들 때와 다르면 다시 올린다
     // (requested = 요청한 모드. 서버에 '빠르게' 그래프가 없어 표준으로 폴백한 경우에도 반복 재로드하지 않도록)
-    if (ditSessions[key] && ditSessions[key].requested !== settings.precision) {
-      log(`정밀도 변경 (${PRECISION_LABEL[settings.precision]}) — DiT 다시 로드`, "dim");
+    if (ditSessions[key] && ditNeedsReload(ditSessions[key])) {
+      log(`정밀도 변경 (${PRECISION_LABEL[settings.precision]}${settings.precision === "webnn" ? " " + settings.webnnWeights : ""}) — DiT 다시 로드`, "dim");
       await releaseDit(key);
     }
     // 사용자설정 파일 선택이 바뀌었으면 다시 올린다
@@ -864,6 +882,7 @@ async function loadAll() {
       const s = await loadSession(name, url, prog);
       if (name.startsWith("dit:")) {
         s.requested = settings.precision;
+        s.requestedWeights = settings.webnnWeights;
         ditSessions[key] = s;
       } else sess[name] = s;
     }
@@ -909,4 +928,4 @@ async function loadAll() {
   $("btnLoad").disabled = false;
 }
 
-export { clearCache, customFiles, ditSessions, loadAll, loadState, reloadDit, sess, setCustomFiles, tok };
+export { clearCache, customFiles, ditNeedsReload, ditSessions, loadAll, loadState, reloadDit, sess, setCustomFiles, tok };
