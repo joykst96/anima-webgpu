@@ -39,7 +39,7 @@ RTX 5070 Ti(16GB) 기준:
 **프롬프트**
 - 가중치 문법은 ComfyUI 규칙 그대로: `(태그:1.2)`(숫자는 바깥 괄호 가중치를 덮어씀), `(태그)` = 바깥 ×1.1, `\(` `\)`는 리터럴 괄호. 토큰화도 ComfyUI처럼 가중치 구간마다 따로 합니다.
 - **NegPip**: CFG 1(Turbo)에서는 부정 프롬프트가 원래 무시됩니다. 체크하면 부정 프롬프트를 음수 가중치로 긍정 프롬프트에 합쳐, 그 개념을 빼냅니다.
-- 태그 자동완성: Danbooru 태그 + 한글 별칭(20만 행)을 브라우저 안에서 검색합니다(Web Worker, IndexedDB 캐시).
+- 태그 자동완성: Danbooru 태그 + 한글 별칭(약 15만 개, [mengod-hf/danbooru-tags-kr](https://huggingface.co/datasets/mengod-hf/danbooru-tags-kr))을 브라우저 안에서 검색합니다(Web Worker, IndexedDB 캐시). 영어 접두어(`long_h`, `school u`)나 한글(`긴 머리`, `교복`)로 찾을 수 있습니다.
 
 **LoRA**
 - `.safetensors` LoRA(kohya 또는 `diffusion_model.` 포맷)를 여러 개, 각자 강도로 붙입니다. 재변환 없이 랭크 48 슬롯 그래프에 주입합니다.
@@ -71,9 +71,10 @@ RTX 5070 Ti(16GB) 기준:
 - **이 레포의 코드**: MIT(`LICENSE`).
 - **Anima 모델과 그 변환·양자화·병합 파생물**: [CircleStone Labs Non-Commercial License](https://huggingface.co/circlestone-labs/Anima/blob/main/LICENSE.md). 비상업 용도만 가능하고, 파생물을 배포할 때는 지정 고지문 표시, "수정함" 명시, 공식 승인으로 오인되지 않게 할 의무가 있습니다(`web/index.html`에 필수 고지 포함). 생성 이미지는 라이선스에 따라 상업적으로 쓸 수 있습니다. Cosmos 파생 모델이므로 NVIDIA Open Model License도 적용됩니다("Built on NVIDIA Cosmos").
 - **Qwen3-0.6B-Base**: Apache 2.0.
+- **태그 자동완성 데이터**([mengod-hf/danbooru-tags-kr](https://huggingface.co/datasets/mengod-hf/danbooru-tags-kr)): 한글 번역·분류·키워드는 데이터셋 [LICENSE](https://huggingface.co/datasets/mengod-hf/danbooru-tags-kr/blob/main/LICENSE)에 따라 CC BY-SA 4.0입니다(데이터셋 카드에는 MIT로 표시). 안에 든 제3자 자료는 각자의 조건을 따릅니다. 페이지는 수정본을 씁니다: `tools/convert-tags-kr.py`가 키워드 표지(`<키워드>` → `키워드:`)만 바꾸고 끝의 마침표를 뗍니다. CSV는 이 레포에 들어 있지 않습니다.
 
 이 레포에는 모델 가중치가 **들어 있지 않습니다.** 공식 배포본에서 직접 변환하고, 결과물을 배포할 때 라이선스 의무를 지키세요.
 
 ## 감사
 
-CircleStone Labs & Comfy Org(Anima), NVIDIA(Cosmos-Predict2), Alibaba(Qwen3, Qwen-Image VAE), ComfyUI(샘플러·스케줄러·EasyCache 참조 구현), sorryhyun/ComfyUI-Spectrum-KSampler(SPEED·Spectrum), ONNX Runtime Web·transformers.js 팀.
+CircleStone Labs & Comfy Org(Anima), NVIDIA(Cosmos-Predict2), Alibaba(Qwen3, Qwen-Image VAE), ComfyUI(샘플러·스케줄러·EasyCache 참조 구현), sorryhyun/ComfyUI-Spectrum-KSampler(SPEED·Spectrum), [mengod-hf/danbooru-tags-kr](https://huggingface.co/datasets/mengod-hf/danbooru-tags-kr)(자동완성용 한글 Danbooru 태그), ONNX Runtime Web·transformers.js 팀.

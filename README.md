@@ -39,7 +39,7 @@ On an RTX 5070 Ti (16 GB):
 **Prompt**
 - Weighting follows ComfyUI's rules exactly: `(tag:1.2)` (an explicit number overrides the enclosing weight), `(tag)` = enclosing ×1.1, `\(` `\)` are literal parentheses. Tokenization also follows ComfyUI, one weighted span at a time.
 - **NegPip**: at CFG 1 (Turbo) the negative prompt is normally ignored. With NegPip checked, the negative prompt is merged into the positive one with negative weights, which subtracts the concept.
-- Tag autocomplete: Danbooru tags plus Korean aliases (200k rows), searched entirely in the browser (Web Worker, IndexedDB cache).
+- Tag autocomplete: Danbooru tags plus Korean aliases (about 150k tags, from [mengod-hf/danbooru-tags-kr](https://huggingface.co/datasets/mengod-hf/danbooru-tags-kr)), searched entirely in the browser (Web Worker, IndexedDB cache). Search by English prefix (`long_h`, `school u`) or by Korean (`긴 머리`, `교복`).
 
 **LoRA**
 - Attach several `.safetensors` LoRAs (kohya or `diffusion_model.` format), each with its own strength. They are injected into a rank-48 slot graph without re-exporting.
@@ -71,9 +71,10 @@ This repo contains code only, no model weights. To convert and host the models y
 - **Code in this repo**: MIT (`LICENSE`).
 - **The Anima model and every converted, quantized or merged derivative**: [CircleStone Labs Non-Commercial License](https://huggingface.co/circlestone-labs/Anima/blob/main/LICENSE.md). Non-commercial use only; distributing derivatives requires the specified notice, a "modified" statement, and not implying official endorsement (`web/index.html` includes the required notice). Generated images may be used commercially under the license. As a Cosmos derivative, the NVIDIA Open Model License also applies ("Built on NVIDIA Cosmos").
 - **Qwen3-0.6B-Base**: Apache 2.0.
+- **Tag autocomplete data** ([mengod-hf/danbooru-tags-kr](https://huggingface.co/datasets/mengod-hf/danbooru-tags-kr)): the Korean translations, classifications and keywords are CC BY-SA 4.0 per the dataset's [LICENSE](https://huggingface.co/datasets/mengod-hf/danbooru-tags-kr/blob/main/LICENSE) (the dataset card lists MIT); third-party material inside keeps its own terms. The page serves a modified copy: `tools/convert-tags-kr.py` only rewrites the keyword marker (`<키워드>` → `키워드:`) and drops the trailing period. The CSV is not in this repo.
 
 This repo **does not include** model weights. Convert them yourself from the official releases and keep the license obligations when you distribute the results.
 
 ## Acknowledgements
 
-CircleStone Labs & Comfy Org (Anima), NVIDIA (Cosmos-Predict2), Alibaba (Qwen3, Qwen-Image VAE), ComfyUI (sampler, scheduler and EasyCache reference implementations), sorryhyun/ComfyUI-Spectrum-KSampler (SPEED), and the ONNX Runtime Web and transformers.js teams.
+CircleStone Labs & Comfy Org (Anima), NVIDIA (Cosmos-Predict2), Alibaba (Qwen3, Qwen-Image VAE), ComfyUI (sampler, scheduler and EasyCache reference implementations), sorryhyun/ComfyUI-Spectrum-KSampler (SPEED), [mengod-hf/danbooru-tags-kr](https://huggingface.co/datasets/mengod-hf/danbooru-tags-kr) (Korean Danbooru tags for autocomplete), and the ONNX Runtime Web and transformers.js teams.

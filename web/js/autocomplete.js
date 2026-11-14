@@ -2,14 +2,14 @@
 import { $, log } from "./dom.js";
 
 // ═════════ 태그 자동완성 (Danbooru + 한글 alias, 전부 로컬) ═════════
-// 데이터: out/danbooru_ko.csv (205k행). 프롬프트는 서버로 안 나감 — 검색은
+// 데이터: out/danbooru_ko.csv (15.3만 행, mengod-hf/danbooru-tags-kr를 tools/convert-tags-kr.py로 변환). 프롬프트는 서버로 안 나감 — 검색은
 // 전부 브라우저 메모리에서 수행(이 페이지의 프롬프트 미전송 원칙 유지).
 // 파싱/인덱스 빌드는 Worker에서 1회 → IndexedDB 직렬화 → 재방문 시 즉시 로드.
-//   CSV 컬럼: [0]tag [1]무시(0) [2]post_count [3]"설명…키워드:<카테고리>,한글alias…"
+//   CSV 컬럼: [0]tag [1]카테고리 번호(무시) [2]post_count [3]"[분류] 설명… 키워드: 한글alias, …"
 //   영어: prefix 매칭. 한글: 2글자↑ bigram 역인덱스 → desc substring. pc 내림차순.
 const AC_CSV_URL = "out/danbooru_ko.csv";
 const AC_DB_NAME = "anima-tagac";
-const AC_DB_VER = 3; // 스키마 변경 시 올려서 캐시 무효화 (v3: type2 제거, tagNorm 추가, 신규 CSV)
+const AC_DB_VER = 4; // 스키마·CSV 변경 시 올려서 캐시 무효화 (v3: type2 제거, tagNorm 추가, 신규 CSV / v4: mengod-hf/danbooru-tags-kr로 교체)
 const AC_STORE = "index";
 
 // ── Worker: CSV 파싱 + 인덱스 빌드 (메인 비차단) ──

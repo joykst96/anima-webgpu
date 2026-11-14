@@ -43,7 +43,7 @@ ComfyUI v0.43 + anima-base-v1.0을 기준(PyTorch fp32)으로 직접 대조한 �
 |---|---|---|
 | 모델 가중치·그래프 | `out/dit/`, `out/text_encoder/`, `out/adapter/`, `out/vae/` | 공식 배포본에서 '모델 변환'의 절차로 만듭니다(라이선스 조건 적용). |
 | 토크나이저 (선택) | `tokenizers/{qwen3,t5}/` | `export/prepare_tokenizers.py`. 없으면 Hugging Face Hub에서 받습니다. |
-| 태그 자동완성 데이터 (선택) | `out/danbooru_ko.csv` | 배포하지 않습니다. 직접 준비한 Danbooru 태그 목록을 넣으세요. 형식: 헤더 `name,category,post_count,description` 다음 한 줄에 태그 하나, 한글 별칭은 따옴표 친 설명 안의 `키워드:` 뒤에 콤마로 구분. 없으면 자동완성만 꺼집니다. |
+| 태그 자동완성 데이터 (선택) | `out/danbooru_ko.csv` | 레포에 없습니다. [mengod-hf/danbooru-tags-kr](https://huggingface.co/datasets/mengod-hf/danbooru-tags-kr)(CC BY-SA 4.0)에서 `danbooru-tags-backslash-kr-<날짜>.csv`를 받아 `uv run tools/convert-tags-kr.py <받은.csv> out/danbooru_ko.csv`로 만듭니다. 파일을 바꾸면 `web/js/autocomplete.js`의 `AC_DB_VER`를 올려 브라우저가 옛 파일로 만든 IndexedDB 인덱스를 버리게 하고, CSV를 페이지 JS보다 먼저 올립니다. 형식: (선택) 헤더 `name,category,post_count,description` 다음 한 줄에 태그 하나, 한글 별칭은 따옴표 친 설명 안의 `키워드:` 뒤에 콤마로 구분. 없으면 자동완성만 꺼집니다. |
 | 내 모델 목록 | `web/js/config.js` | 들어 있는 파일은 Anima만 담고 있습니다. 자기 목록(`export/model-list.yml` 또는 따로 둔 배포 목록)으로 `gen_models.py`를 돌려 만드세요. |
 | 변환 매핑표 | `web/convert/anima2b.map.json`, `anima2b.wnn.map.json`(WebNN용) | 들어 있는 매핑표는 관리자의 템플릿 빌드에 맞춰져 있고, 변환기가 템플릿 해시를 확인합니다. 자기 빌드로 `export/make_convert_map.py`를 돌려 다시 만들고(WebNN용은 `--webnn`), 그 그래프를 템플릿으로 올리세요. |
 | 골든 기준 | `tools/golden.json` | 픽셀 해시는 빌드·ORT 버전·GPU·드라이버마다 다릅니다. 처음 실행할 때 직접 만드세요('개발·검증 도구' 참고). |
@@ -174,6 +174,7 @@ out/
 
 - `node tools/devserver.mjs --port 5173 --upstream <가중치 서버> --local-out out-local` — `web/`을 서빙하고 `/out/`은 가중치 서버로 프록시합니다(GET만, `--upstream` 대신 환경변수 `ANIMA_UPSTREAM`도 됨). `--local-out`에 같은 경로 파일이 있으면 그것을 줍니다(배포 전 그래프 검증용, HTTP Range 지원). `--config <파일>`을 주면 `/js/config.js` 요청에 그 파일을 줍니다(자기 배포 구성으로 띄울 때). 레포 루트에 `tokenizers/`가 있으면 토크나이저도 로컬 것을 줍니다.
 - `tools/harness.mjs` — 골든 하네스. 9개 생성 케이스 + 자동완성 8개 질의의 픽셀 SHA-256을 `tools/golden.json`과 비교합니다. 수치가 바뀌는 변경은 기준 이미지 대비 PSNR로 봅니다. 기준은 환경마다 달라 레포에 없습니다: 페이지 콘솔에서 하네스를 불러(`const h = await import("/__tools/harness.mjs")`) `h.full()`을 돌리고, 끝나면 `await h.saveGolden()`이 개발 서버를 통해 `tools/golden.json`을 씁니다. 이후로는 `await h.compareToGolden()`으로 비교합니다.
+- `tools/convert-tags-kr.py` — 한글 Danbooru 태그 CSV([mengod-hf/danbooru-tags-kr](https://huggingface.co/datasets/mengod-hf/danbooru-tags-kr))를 자동완성 형식(`out/danbooru_ko.csv`)으로 바꿉니다. 표준 라이브러리만 씁니다: `uv run tools/convert-tags-kr.py <원본.csv> <출력.csv>`.
 - `tools/profile.mjs` — 세션 프로파일링으로 커널별 GPU 시간.
 - `tools/graph/` — 그래프 분석·실험 스크립트(`info.py`, 실험용 `batch2.py`·`fuse_matmulnbits.py`·`split_context.py` 등, 각 파일 머리에 결과 기록). 페이지용 후처리(`xattn_compact.py`, `fp16_zones.py`)를 포함한 빌드 단계는 `export/`에 있습니다.
 - `tools/webnn/` — WebNN 경로 측정 도구(벤치 페이지, WebNN 플래그를 켠 Chrome 실행기).
