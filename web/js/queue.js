@@ -9,7 +9,7 @@ import { createEasyCache } from "./easycache.js";
 import { createSpectrum, predictedSteps } from "./spectrum.js";
 import { previewLatent } from "./preview.js";
 import { lora } from "./lora.js";
-import { ditSessions, loadState, lowVramBeforeVae, lowVramReady, lowVramRestore, sess } from "./loader.js";
+import { ditSessions, loadState, lowVramBeforeVae, lowVramReady, lowVramRestore, resizeWebnnDit, sess } from "./loader.js";
 import { encodePrompt, mergeNegPip } from "./prompt.js";
 import { decodeLatent } from "./vae.js";
 import { PRECISION_LABEL, settings } from "./settings.js";
@@ -193,6 +193,9 @@ async function runJob(job) {
     return;
   }
   // 정적 그래프(WebNN)는 한 해상도만 받는다. SPEED는 도중에 해상도가 바뀌어 쓸 수 없다.
+  // (실험) 동적 그래프(?wnndyn=1)면 해상도가 다를 때 세션을 그 크기로 다시 만든다.
+  const sl0 = sess.dit.staticLat;
+  if (sl0 && sess.dit.wnnDyn && !job.speed && (job.pxH / 8 !== sl0.h || job.pxW / 8 !== sl0.w)) await resizeWebnnDit(job.modelKey, job.pxH / 8, job.pxW / 8);
   const sl = sess.dit.staticLat;
   if (sl && (job.speed || job.pxH / 8 !== sl.h || job.pxW / 8 !== sl.w)) {
     log(
